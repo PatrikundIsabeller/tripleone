@@ -1,0 +1,40 @@
+{
+    "app": {
+        "title": "TripleOne - Phase 1",
+        "theme": "dark",
+        "auto_start_cameras": true,
+        "max_camera_scan": 10
+    },
+    "cameras": [
+        {
+            "name": "Kamera 1",
+            "device_id": 1,
+            "width": 1280,
+            "height": 720,
+            "fps": 30,
+            "rotation": 0,
+            "flip": false,
+            "enabled": true
+        },
+        {
+            "name": "Kamera 2",
+            "device_id": 2,
+            "width": 1280,
+            "height": 720,
+            "fps": 30,
+            "rotation": 0,
+            "flip": false,
+            "enabled": true
+        },
+        {
+            "name": "Kamera 3",
+            "device_id": 3,
+            "width": 1280,
+            "height": 720,
+            "fps": 30,
+            "rotation": 0,
+            "flip": false,
+            "enabled": true
+        }
+    ]
+}
