@@ -9,14 +9,23 @@
 # Phase 3.5:
 # - Klick -> Score
 # - visuelle Trefferanzeige
-# - Ergebnistext wird klarer ausgegeben
+#
+# Phase 4.0:
+# - Referenzbild vom leeren Board speichern
+# - Auto-Erkennung scharf schalten
+# - neuen Dart per Frame-Differenz erkennen
+# - Spitze schätzen
+# - Score automatisch berechnen
 
 from __future__ import annotations
 
 from copy import deepcopy
 from typing import Dict, List, Optional
 
+import cv2
+import numpy as np
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QImage
 from PyQt6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -32,6 +41,7 @@ from PyQt6.QtWidgets import (
 
 from vision.camera_manager import CameraWorker
 from vision.board_model import calculate_board_hit_from_image_point
+from vision.dart_detector import DartDetector, DartDetectionResult
 from app.widgets.calibration_preview import CalibrationPreview
 
 
@@ -62,12 +72,26 @@ class CalibrationCard(QFrame):
             QCheckBox {
                 color: #f2f2f2;
             }
+            QPushButton {
+                background-color: #2d6cdf;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 8px 12px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background-color: #3a78e8;
+            }
         """)
 
         self.worker: Optional[CameraWorker] = None
         self.camera_config: Dict = {}
         self._syncing_from_preview = False
         self._points: List[Dict[str, int]] = []
+
+        self.detector = DartDetector()
+        self.last_frame_bgr: Optional[np.ndarray] = None
 
         self.title_label = QLabel(title)
         self.title_label.setStyleSheet("font-size: 18px; font-weight: bold;")
@@ -83,7 +107,8 @@ class CalibrationCard(QFrame):
             "- P3 = Grenze 3|19\n"
             "- P4 = Grenze 11|14\n"
             "- C  = Bull-Mittelpunkt\n"
-            "- Rechtsklick ins Bild = Score-Test"
+            "- Rechtsklick ins Bild = Score-Test\n"
+            "- Phase 4.0: Referenz setzen -> Auto-Erkennung scharf -> Dart werfen"
         )
         self.help_label.setStyleSheet("font-size: 12px; color: #d8d8d8;")
 
@@ -106,13 +131,29 @@ class CalibrationCard(QFrame):
         self.reset_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.reset_button.clicked.connect(self.reset_points)
 
+        self.capture_reference_button = QPushButton("Leeres Board speichern")
+        self.capture_reference_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.capture_reference_button.clicked.connect(self.capture_reference_frame)
+
+        self.arm_detector_button = QPushButton("Auto-Erkennung scharf")
+        self.arm_detector_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.arm_detector_button.clicked.connect(self.arm_detector)
+
+        self.reset_detector_button = QPushButton("Auto-Erkennung zurücksetzen")
+        self.reset_detector_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.reset_detector_button.clicked.connect(self.reset_detector)
+
         self.point_info_label = QLabel("Punkte: P1 bis P4 + C noch nicht angepasst")
         self.point_info_label.setWordWrap(True)
         self.point_info_label.setStyleSheet("font-size: 12px; color: #8ee6ff; font-weight: 600;")
 
-        self.test_result_label = QLabel("Testpunkt: noch keiner gesetzt")
+        self.test_result_label = QLabel("Testpunkt / Auto-Treffer: noch keiner gesetzt")
         self.test_result_label.setWordWrap(True)
         self.test_result_label.setStyleSheet("font-size: 12px; color: #8effc9; font-weight: 700;")
+
+        self.detector_status_label = QLabel("Auto-Erkennung: keine Referenz")
+        self.detector_status_label.setWordWrap(True)
+        self.detector_status_label.setStyleSheet("font-size: 12px; color: #ffdb8a; font-weight: 700;")
 
         self.status_label = QLabel("Status: nicht gestartet")
         self.status_label.setWordWrap(True)
@@ -145,10 +186,18 @@ class CalibrationCard(QFrame):
         row_2.addStretch()
         row_2.addWidget(self.show_sector_lines_check)
 
+        row_3 = QHBoxLayout()
+        row_3.setSpacing(8)
+        row_3.addWidget(self.capture_reference_button)
+        row_3.addWidget(self.arm_detector_button)
+        row_3.addWidget(self.reset_detector_button)
+
         layout.addLayout(row_1)
         layout.addLayout(row_2)
+        layout.addLayout(row_3)
         layout.addWidget(self.point_info_label)
         layout.addWidget(self.test_result_label)
+        layout.addWidget(self.detector_status_label)
         layout.addWidget(self.status_label)
 
     def _connect_signals(self) -> None:
@@ -191,6 +240,19 @@ class CalibrationCard(QFrame):
 
         self.preview.set_test_point(x_px, y_px)
 
+    def _handle_auto_detection_result(self, result: DartDetectionResult) -> None:
+        self.preview.set_test_point(result.x_px, result.y_px)
+
+        self.test_result_label.setText(
+            f"Auto-Treffer: {result.score_label} = {result.score_value} | "
+            f"Ring: {result.ring_name} | "
+            f"Area: {result.contour_area:.1f} | "
+            f"Board=({result.board_x:.3f}, {result.board_y:.3f}) | "
+            f"Bild=({result.x_px}, {result.y_px})"
+        )
+
+        self.detector_status_label.setText("Auto-Erkennung: Treffer erkannt und gesperrt")
+
     def _update_point_info_label(self) -> None:
         points = self._points if self._points else self._default_points()
         labels = ["P1", "P2", "P3", "P4", "C"]
@@ -218,8 +280,31 @@ class CalibrationCard(QFrame):
         self._points = self._default_points()
         self.preview.set_overlay_config(self.get_calibration_config())
         self.preview.clear_test_point()
-        self.test_result_label.setText("Testpunkt: noch keiner gesetzt")
+        self.test_result_label.setText("Testpunkt / Auto-Treffer: noch keiner gesetzt")
         self._update_point_info_label()
+
+    def reset_detector(self) -> None:
+        self.detector.reset()
+        self.detector_status_label.setText(
+            "Auto-Erkennung: zurückgesetzt"
+            if self.detector.reference_gray is not None
+            else "Auto-Erkennung: keine Referenz"
+        )
+
+    def capture_reference_frame(self) -> None:
+        if self.last_frame_bgr is None:
+            self.detector_status_label.setText("Auto-Erkennung: kein Livebild für Referenz vorhanden")
+            return
+
+        self.detector.set_reference_frame(self.last_frame_bgr)
+        self.detector_status_label.setText("Auto-Erkennung: Referenz gespeichert (leeres Board)")
+
+    def arm_detector(self) -> None:
+        ok = self.detector.arm()
+        if ok:
+            self.detector_status_label.setText("Auto-Erkennung: scharf, warte auf neuen Dart")
+        else:
+            self.detector_status_label.setText("Auto-Erkennung: zuerst Referenzbild speichern")
 
     def set_status(self, text: str) -> None:
         self.status_label.setText(f"Status: {text}")
@@ -260,15 +345,40 @@ class CalibrationCard(QFrame):
             "points": points,
         }
 
-    def update_preview(self, image) -> None:
+    def _qimage_to_bgr(self, image: QImage) -> np.ndarray:
+        converted = image.convertToFormat(QImage.Format.Format_RGBA8888)
+        width = converted.width()
+        height = converted.height()
+
+        ptr = converted.bits()
+        ptr.setsize(height * width * 4)
+
+        arr = np.frombuffer(ptr, dtype=np.uint8).reshape((height, width, 4))
+        return cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
+
+    def update_preview(self, image: QImage) -> None:
         self.preview.set_frame(image)
+
+        try:
+            self.last_frame_bgr = self._qimage_to_bgr(image)
+        except Exception:
+            self.last_frame_bgr = None
+            return
+
+        if self.last_frame_bgr is None:
+            return
+
+        detection = self.detector.process_frame(self.last_frame_bgr, self.get_calibration_config())
+        if detection is not None:
+            self._handle_auto_detection_result(detection)
 
     def stop_worker(self) -> None:
         if self.worker is not None:
             self.worker.stop()
             self.worker = None
         self.preview.clear_frame()
-        self.test_result_label.setText("Testpunkt: noch keiner gesetzt")
+        self.last_frame_bgr = None
+        self.test_result_label.setText("Testpunkt / Auto-Treffer: noch keiner gesetzt")
         self.set_status("gestoppt")
 
     def start_worker(self) -> None:
@@ -315,13 +425,13 @@ class CalibrationPage(QWidget):
         self.calibration_config = deepcopy(calibration_config)
         self.save_callback = save_callback
 
-        self.title_label = QLabel("TripleOne – Kalibrierung")
+        self.title_label = QLabel("TripleOne – Kalibrierung / Phase 4.0")
         self.title_label.setStyleSheet("font-size: 26px; font-weight: bold;")
 
         self.info_label = QLabel(
-            "Phase 3.5:\n"
-            "Jetzt wird ein Rechtsklick direkt als Dart-Testpunkt ausgewertet.\n"
-            "Der Punkt wird per Homography ins Board gerechnet, bewertet und visuell markiert."
+            "Phase 4.0:\n"
+            "Erste automatische Dart-Erkennung per Referenzbild + Frame-Differenz.\n"
+            "Workflow: Leeres Board speichern -> Auto-Erkennung scharf -> einen Dart werfen."
         )
         self.info_label.setWordWrap(True)
         self.info_label.setStyleSheet("font-size: 13px; color: #cccccc;")
@@ -331,7 +441,7 @@ class CalibrationPage(QWidget):
         self.card_3 = CalibrationCard("Kamera 3")
         self.cards: List[CalibrationCard] = [self.card_1, self.card_2, self.card_3]
 
-        self.start_button = QPushButton("Kalibrierung starten / aktualisieren")
+        self.start_button = QPushButton("Livebilder starten / aktualisieren")
         self.start_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.start_button.clicked.connect(self.apply_preview)
 
