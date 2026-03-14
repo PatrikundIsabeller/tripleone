@@ -5,7 +5,11 @@
 # Phase 3.4b:
 # - 4 Boundary-Punkte + 1 Center-Punkt
 # - echte Homography
-# - Overlay und Testpunkt verwenden dieselbe Mathematik
+#
+# Phase 3.5:
+# - Klick -> Boardpunkt
+# - Boardpunkt -> Ring / Segment / Score
+# - Hilfsfunktionen für Visualisierung des Trefferpunkts
 
 from __future__ import annotations
 
@@ -19,11 +23,10 @@ import numpy as np
 
 SECTOR_ORDER = [20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 12, 5]
 
-# Offizielle Steeldart-Maße in mm, normiert auf Double Outer = 1.0
 BOARD_RADIUS_MM = 170.0
 
 RING_RADII = {
-    "double_outer": 170.0 / BOARD_RADIUS_MM,   # 1.0
+    "double_outer": 170.0 / BOARD_RADIUS_MM,
     "double_inner": 162.0 / BOARD_RADIUS_MM,
     "triple_outer": 107.0 / BOARD_RADIUS_MM,
     "triple_inner": 99.0 / BOARD_RADIUS_MM,
@@ -31,11 +34,6 @@ RING_RADII = {
     "inner_bull": 6.35 / BOARD_RADIUS_MM,
 }
 
-# Boundary-Winkel der vier Referenzpunkte
-# P1 = 20|1
-# P2 = 6|10
-# P3 = 3|19
-# P4 = 11|14
 BOUNDARY_ANGLES_DEG = [-81.0, 27.0, 117.0, 207.0]
 
 
@@ -67,13 +65,13 @@ def build_canonical_reference_points() -> np.ndarray:
         y = math.sin(angle_rad)
         points.append([x, y])
 
-    points.append([0.0, 0.0])  # Center
+    points.append([0.0, 0.0])
     return np.array(points, dtype=np.float32)
 
 
 def build_canonical_overlay_reference_points(canvas_size: int) -> np.ndarray:
     """
-    Dieselben 5 Referenzpunkte, aber im Pixelraum des kanonischen Overlay-Bildes.
+    Dieselben 5 Referenzpunkte im Pixelraum des kanonischen Overlay-Bildes.
     """
     cx = canvas_size / 2.0
     cy = canvas_size / 2.0
@@ -170,6 +168,37 @@ def project_image_point_to_board(x_px: int, y_px: int, calibration: Dict) -> Opt
         return None
 
     return float(transformed[0][0][0]), float(transformed[0][0][1])
+
+
+def project_board_point_to_image(x_board: float, y_board: float, calibration: Dict) -> Optional[Tuple[float, float]]:
+    """
+    Rechnet einen normierten Board-Punkt zurück ins Kamerabild.
+    """
+    h = build_board_to_image_homography(calibration)
+    if h is None:
+        return None
+
+    point = np.array([[[float(x_board), float(y_board)]]], dtype=np.float32)
+
+    try:
+        transformed = cv2.perspectiveTransform(point, h)
+    except cv2.error:
+        return None
+
+    return float(transformed[0][0][0]), float(transformed[0][0][1])
+
+
+def board_point_to_overlay_pixel(x_board: float, y_board: float, overlay_size: int) -> Tuple[int, int]:
+    """
+    Rechnet normierte Board-Koordinaten in Pixel auf dem kanonischen Overlay um.
+    """
+    cx = overlay_size / 2.0
+    cy = overlay_size / 2.0
+    r = overlay_size * 0.40
+
+    x_px = int(round(cx + x_board * r))
+    y_px = int(round(cy + y_board * r))
+    return x_px, y_px
 
 
 def _resolve_sector(angle_deg: float) -> int:

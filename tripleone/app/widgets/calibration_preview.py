@@ -6,8 +6,11 @@
 # Phase 3.4b:
 # - 4 Boundary-Punkte + 1 Center-Punkt
 # - echtes Homography-Overlay
-# - Zoom-Lupe für Hover / Drag
-# - konsistente Geometrie mit vision/board_model.py
+#
+# Phase 3.5:
+# - visuelle Trefferanzeige im Kamerabild
+# - Trefferanzeige im kanonischen Board
+# - Rechtsklick = Score-Test
 
 from __future__ import annotations
 
@@ -23,8 +26,9 @@ from PyQt6.QtWidgets import QWidget
 from vision.board_model import (
     SECTOR_ORDER,
     RING_RADII,
-    BOUNDARY_ANGLES_DEG,
     build_overlay_to_image_homography,
+    project_image_point_to_board,
+    board_point_to_overlay_pixel,
 )
 
 
@@ -62,6 +66,7 @@ class CalibrationPreview(QWidget):
         self._dragging_index: Optional[int] = None
         self._hover_index: Optional[int] = None
         self._test_point_px: Optional[Tuple[int, int]] = None
+        self._test_board_point: Optional[Tuple[float, float]] = None
         self._last_mouse_frame_pos: Optional[Tuple[int, int]] = None
 
         self._loupe_source_half_size = 28
@@ -79,6 +84,7 @@ class CalibrationPreview(QWidget):
     def clear_frame(self) -> None:
         self._image = None
         self._test_point_px = None
+        self._test_board_point = None
         self._last_mouse_frame_pos = None
         self.update()
 
@@ -88,10 +94,12 @@ class CalibrationPreview(QWidget):
 
     def set_test_point(self, x_px: int, y_px: int) -> None:
         self._test_point_px = (x_px, y_px)
+        self._test_board_point = project_image_point_to_board(x_px, y_px, self._overlay_config)
         self.update()
 
     def clear_test_point(self) -> None:
         self._test_point_px = None
+        self._test_board_point = None
         self.update()
 
     def _get_image_rect(self) -> Optional[QRectF]:
@@ -109,7 +117,6 @@ class CalibrationPreview(QWidget):
 
         x = (widget_w - draw_w) / 2.0
         y = (widget_h - draw_h) / 2.0
-
         return QRectF(x, y, draw_w, draw_h)
 
     def _frame_to_widget(self, image_rect: QRectF, x_px: float, y_px: float) -> Tuple[float, float]:
@@ -214,10 +221,22 @@ class CalibrationPreview(QWidget):
         cv2.circle(img, center, radius, shadow_bgra, shadow_thickness, lineType=cv2.LINE_AA)
         cv2.circle(img, center, radius, line_bgra, line_thickness, lineType=cv2.LINE_AA)
 
+    def _draw_hit_marker_on_overlay(self, img: np.ndarray, size: int) -> None:
+        """
+        Zeichnet den zuletzt geklickten Treffer im kanonischen Overlay.
+        """
+        if self._test_board_point is None:
+            return
+
+        x_board, y_board = self._test_board_point
+        hx, hy = board_point_to_overlay_pixel(x_board, y_board, size)
+
+        cv2.circle(img, (hx, hy), 10, (0, 0, 0, 255), 4, lineType=cv2.LINE_AA)
+        cv2.circle(img, (hx, hy), 10, (0, 255, 180, 255), 2, lineType=cv2.LINE_AA)
+        cv2.line(img, (hx - 14, hy), (hx + 14, hy), (0, 255, 180, 255), 2, lineType=cv2.LINE_AA)
+        cv2.line(img, (hx, hy - 14), (hx, hy + 14), (0, 255, 180, 255), 2, lineType=cv2.LINE_AA)
+
     def _create_canonical_overlay_rgba(self, size: int = 1600) -> np.ndarray:
-        """
-        Erstellt die perfekte Draufsicht des Boards.
-        """
         img = np.zeros((size, size, 4), dtype=np.uint8)
 
         alpha_factor = float(self._overlay_config.get("overlay_alpha", 0.90))
@@ -230,18 +249,17 @@ class CalibrationPreview(QWidget):
         cy = size // 2
         r = int(size * 0.40)
 
-        board_fill_blue = (255, 120, 40, int(alpha * 0.45))
-        sector_highlight = (255, 0, 110, int(alpha * 0.85))
+        board_fill = (255, 120, 40, int(alpha * 0.30))
+        sector_highlight = (255, 0, 110, int(alpha * 0.82))
         ring_white = (245, 245, 245, min(255, alpha))
         shadow = (10, 10, 10, min(220, alpha))
         text_fill = (255, 255, 255, 255)
         text_outline = (0, 0, 0, 255)
 
-        # Grundfläche
-        cv2.circle(img, (cx, cy), r, board_fill_blue, -1, lineType=cv2.LINE_AA)
+        cv2.circle(img, (cx, cy), r, board_fill, -1, lineType=cv2.LINE_AA)
 
-        # Demo-Segment links oben leicht hervorheben, ähnlich Autodarts-Screenshot
-        highlight_index = 0  # ungefähr links
+        # Highlight Segment 20
+        highlight_index = 0
         start_deg = -90.0 - 9.0 + highlight_index * 18.0
         end_deg = start_deg + 18.0
 
@@ -252,7 +270,6 @@ class CalibrationPreview(QWidget):
         pts_np = np.array(pts, dtype=np.int32)
         cv2.fillConvexPoly(img, pts_np, sector_highlight, lineType=cv2.LINE_AA)
 
-        # Ringe
         ring_order = [
             RING_RADII["inner_bull"],
             RING_RADII["outer_bull"],
@@ -266,28 +283,20 @@ class CalibrationPreview(QWidget):
             rr = int(round(r * rel_radius))
             self._draw_circle_with_shadow(img, (cx, cy), rr, ring_white, shadow, 3, 7)
 
-        # Sektorlinien
         if show_sector_lines:
-            line_start_radius = 0
-            line_end_radius = r
             start_angle_deg = -90.0 - 9.0
-
             for i in range(20):
                 angle_deg = start_angle_deg + i * 18.0
                 angle_rad = math.radians(angle_deg)
-                x1 = int(cx + math.cos(angle_rad) * line_start_radius)
-                y1 = int(cy + math.sin(angle_rad) * line_start_radius)
-                x2 = int(cx + math.cos(angle_rad) * line_end_radius)
-                y2 = int(cy + math.sin(angle_rad) * line_end_radius)
-                self._draw_line_with_shadow(img, (x1, y1), (x2, y2), ring_white, shadow, 2, 6)
+                x2 = int(cx + math.cos(angle_rad) * r)
+                y2 = int(cy + math.sin(angle_rad) * r)
+                self._draw_line_with_shadow(img, (cx, cy), (x2, y2), ring_white, shadow, 2, 6)
 
-        # Zahlen
         if show_numbers:
             number_radius = int(r * 1.19)
             for i, value in enumerate(SECTOR_ORDER):
                 angle_deg = -90.0 + i * 18.0
                 angle_rad = math.radians(angle_deg)
-
                 x = int(cx + math.cos(angle_rad) * number_radius)
                 y = int(cy + math.sin(angle_rad) * number_radius)
 
@@ -310,10 +319,10 @@ class CalibrationPreview(QWidget):
                     outline_thickness=7,
                 )
 
-        # Center-Marker
         cv2.circle(img, (cx, cy), 5, (0, 255, 255, 255), -1, lineType=cv2.LINE_AA)
         cv2.circle(img, (cx, cy), 12, (0, 255, 255, 220), 1, lineType=cv2.LINE_AA)
 
+        self._draw_hit_marker_on_overlay(img, size)
         return img
 
     def _warp_overlay_to_frame(self) -> Optional[np.ndarray]:
@@ -521,6 +530,7 @@ class CalibrationPreview(QWidget):
         if event.button() == Qt.MouseButton.RightButton:
             x_px, y_px = self._last_mouse_frame_pos
             self._test_point_px = (x_px, y_px)
+            self._test_board_point = project_image_point_to_board(x_px, y_px, self._overlay_config)
             self.test_point_selected.emit(x_px, y_px)
             self.update()
             event.accept()

@@ -5,7 +5,11 @@
 # Phase 3.4b:
 # - 4 Boundary-Punkte + 1 Center-Punkt
 # - echter Homography-Workflow
-# - Rechtsklick-Test benutzt dieselbe Mathematik wie das Overlay
+#
+# Phase 3.5:
+# - Klick -> Score
+# - visuelle Trefferanzeige
+# - Ergebnistext wird klarer ausgegeben
 
 from __future__ import annotations
 
@@ -79,7 +83,7 @@ class CalibrationCard(QFrame):
             "- P3 = Grenze 3|19\n"
             "- P4 = Grenze 11|14\n"
             "- C  = Bull-Mittelpunkt\n"
-            "- Rechtsklick ins Bild = Testpunkt + Score"
+            "- Rechtsklick ins Bild = Score-Test"
         )
         self.help_label.setStyleSheet("font-size: 12px; color: #d8d8d8;")
 
@@ -108,7 +112,7 @@ class CalibrationCard(QFrame):
 
         self.test_result_label = QLabel("Testpunkt: noch keiner gesetzt")
         self.test_result_label.setWordWrap(True)
-        self.test_result_label.setStyleSheet("font-size: 12px; color: #8effc9; font-weight: 600;")
+        self.test_result_label.setStyleSheet("font-size: 12px; color: #8effc9; font-weight: 700;")
 
         self.status_label = QLabel("Status: nicht gestartet")
         self.status_label.setWordWrap(True)
@@ -175,13 +179,17 @@ class CalibrationCard(QFrame):
             self.test_result_label.setText(f"Testpunkt: Fehler bei Rückprojektion | Punkt=({x_px}, {y_px})")
             return
 
+        score_text = f"{result.label} = {result.score}"
+
         self.test_result_label.setText(
-            f"Testpunkt: {result.label} = {result.score} | "
+            f"Testpunkt: {score_text} | "
             f"Ring: {result.ring_name} | "
-            f"r={result.radius:.3f} | "
+            f"Radius: {result.radius:.3f} | "
             f"Board=({result.board_x:.3f}, {result.board_y:.3f}) | "
             f"Bild=({result.image_x_px}, {result.image_y_px})"
         )
+
+        self.preview.set_test_point(x_px, y_px)
 
     def _update_point_info_label(self) -> None:
         points = self._points if self._points else self._default_points()
@@ -311,10 +319,9 @@ class CalibrationPage(QWidget):
         self.title_label.setStyleSheet("font-size: 26px; font-weight: bold;")
 
         self.info_label = QLabel(
-            "Phase 3.4b:\n"
-            "Jetzt werden 4 Boundary-Punkte plus 1 Center-Punkt gesetzt.\n"
-            "P1 = 20|1, P2 = 6|10, P3 = 3|19, P4 = 11|14, C = Bull-Mittelpunkt.\n"
-            "Overlay und Testpunkt laufen jetzt über echte Homography."
+            "Phase 3.5:\n"
+            "Jetzt wird ein Rechtsklick direkt als Dart-Testpunkt ausgewertet.\n"
+            "Der Punkt wird per Homography ins Board gerechnet, bewertet und visuell markiert."
         )
         self.info_label.setWordWrap(True)
         self.info_label.setStyleSheet("font-size: 13px; color: #cccccc;")
