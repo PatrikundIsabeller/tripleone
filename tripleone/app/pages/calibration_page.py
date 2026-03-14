@@ -10,12 +10,10 @@
 # - Klick -> Score
 # - visuelle Trefferanzeige
 #
-# Phase 4.0:
-# - Referenzbild vom leeren Board speichern
-# - Auto-Erkennung scharf schalten
-# - neuen Dart per Frame-Differenz erkennen
-# - Spitze schätzen
-# - Score automatisch berechnen
+# Phase 4.1:
+# - bis zu 3 Darts nacheinander erkennen
+# - inkrementelle Referenz
+# - aktuelle Trefferliste + Gesamtscore
 
 from __future__ import annotations
 
@@ -108,7 +106,7 @@ class CalibrationCard(QFrame):
             "- P4 = Grenze 11|14\n"
             "- C  = Bull-Mittelpunkt\n"
             "- Rechtsklick ins Bild = Score-Test\n"
-            "- Phase 4.0: Referenz setzen -> Auto-Erkennung scharf -> Dart werfen"
+            "- Phase 4.1: Leeres Board speichern -> Auto-Erkennung scharf -> 3 Darts werfen"
         )
         self.help_label.setStyleSheet("font-size: 12px; color: #d8d8d8;")
 
@@ -139,9 +137,9 @@ class CalibrationCard(QFrame):
         self.arm_detector_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.arm_detector_button.clicked.connect(self.arm_detector)
 
-        self.reset_detector_button = QPushButton("Auto-Erkennung zurücksetzen")
+        self.reset_detector_button = QPushButton("3-Dart-Runde zurücksetzen")
         self.reset_detector_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.reset_detector_button.clicked.connect(self.reset_detector)
+        self.reset_detector_button.clicked.connect(self.reset_detector_round)
 
         self.point_info_label = QLabel("Punkte: P1 bis P4 + C noch nicht angepasst")
         self.point_info_label.setWordWrap(True)
@@ -150,6 +148,10 @@ class CalibrationCard(QFrame):
         self.test_result_label = QLabel("Testpunkt / Auto-Treffer: noch keiner gesetzt")
         self.test_result_label.setWordWrap(True)
         self.test_result_label.setStyleSheet("font-size: 12px; color: #8effc9; font-weight: 700;")
+
+        self.throw_list_label = QLabel("Darts: - / - / -")
+        self.throw_list_label.setWordWrap(True)
+        self.throw_list_label.setStyleSheet("font-size: 12px; color: #ffdb8a; font-weight: 700;")
 
         self.detector_status_label = QLabel("Auto-Erkennung: keine Referenz")
         self.detector_status_label.setWordWrap(True)
@@ -197,6 +199,7 @@ class CalibrationCard(QFrame):
         layout.addLayout(row_3)
         layout.addWidget(self.point_info_label)
         layout.addWidget(self.test_result_label)
+        layout.addWidget(self.throw_list_label)
         layout.addWidget(self.detector_status_label)
         layout.addWidget(self.status_label)
 
@@ -240,6 +243,16 @@ class CalibrationCard(QFrame):
 
         self.preview.set_test_point(x_px, y_px)
 
+    def _update_throw_list_label(self) -> None:
+        labels = [dart.score_label for dart in self.detector.detected_darts]
+        while len(labels) < 3:
+            labels.append("-")
+
+        total = sum(d.score_value for d in self.detector.detected_darts)
+        self.throw_list_label.setText(
+            f"Darts: {labels[0]} / {labels[1]} / {labels[2]} | Gesamt: {total}"
+        )
+
     def _handle_auto_detection_result(self, result: DartDetectionResult) -> None:
         self.preview.set_test_point(result.x_px, result.y_px)
 
@@ -251,7 +264,15 @@ class CalibrationCard(QFrame):
             f"Bild=({result.x_px}, {result.y_px})"
         )
 
-        self.detector_status_label.setText("Auto-Erkennung: Treffer erkannt und gesperrt")
+        self._update_throw_list_label()
+
+        if len(self.detector.detected_darts) >= self.detector.max_darts_per_round:
+            self.detector_status_label.setText("Auto-Erkennung: 3 Darts erkannt, Runde beendet")
+        else:
+            remaining = self.detector.max_darts_per_round - len(self.detector.detected_darts)
+            self.detector_status_label.setText(
+                f"Auto-Erkennung: Treffer erkannt, warte auf nächsten Dart ({remaining} offen)"
+            )
 
     def _update_point_info_label(self) -> None:
         points = self._points if self._points else self._default_points()
@@ -283,13 +304,16 @@ class CalibrationCard(QFrame):
         self.test_result_label.setText("Testpunkt / Auto-Treffer: noch keiner gesetzt")
         self._update_point_info_label()
 
-    def reset_detector(self) -> None:
-        self.detector.reset()
-        self.detector_status_label.setText(
-            "Auto-Erkennung: zurückgesetzt"
-            if self.detector.reference_gray is not None
-            else "Auto-Erkennung: keine Referenz"
-        )
+    def reset_detector_round(self) -> None:
+        self.detector.reset_round()
+        self.preview.clear_test_point()
+        self.test_result_label.setText("Testpunkt / Auto-Treffer: noch keiner gesetzt")
+        self._update_throw_list_label()
+
+        if self.detector.reference_gray is not None:
+            self.detector_status_label.setText("Auto-Erkennung: Runde zurückgesetzt, wieder scharf schaltbar")
+        else:
+            self.detector_status_label.setText("Auto-Erkennung: keine Referenz")
 
     def capture_reference_frame(self) -> None:
         if self.last_frame_bgr is None:
@@ -297,12 +321,15 @@ class CalibrationCard(QFrame):
             return
 
         self.detector.set_reference_frame(self.last_frame_bgr)
+        self.preview.clear_test_point()
+        self.test_result_label.setText("Testpunkt / Auto-Treffer: noch keiner gesetzt")
+        self._update_throw_list_label()
         self.detector_status_label.setText("Auto-Erkennung: Referenz gespeichert (leeres Board)")
 
     def arm_detector(self) -> None:
         ok = self.detector.arm()
         if ok:
-            self.detector_status_label.setText("Auto-Erkennung: scharf, warte auf neuen Dart")
+            self.detector_status_label.setText("Auto-Erkennung: scharf, jetzt bis zu 3 Darts werfen")
         else:
             self.detector_status_label.setText("Auto-Erkennung: zuerst Referenzbild speichern")
 
@@ -332,6 +359,7 @@ class CalibrationCard(QFrame):
         self._points = deepcopy(calibration_config.get("points", self._default_points()))
         self.preview.set_overlay_config(self.get_calibration_config())
         self._update_point_info_label()
+        self._update_throw_list_label()
 
     def get_calibration_config(self) -> Dict:
         points = deepcopy(self._points if self._points else self._default_points())
@@ -425,13 +453,13 @@ class CalibrationPage(QWidget):
         self.calibration_config = deepcopy(calibration_config)
         self.save_callback = save_callback
 
-        self.title_label = QLabel("TripleOne – Kalibrierung / Phase 4.0")
+        self.title_label = QLabel("TripleOne – Kalibrierung / Phase 4.1")
         self.title_label.setStyleSheet("font-size: 26px; font-weight: bold;")
 
         self.info_label = QLabel(
-            "Phase 4.0:\n"
-            "Erste automatische Dart-Erkennung per Referenzbild + Frame-Differenz.\n"
-            "Workflow: Leeres Board speichern -> Auto-Erkennung scharf -> einen Dart werfen."
+            "Phase 4.1:\n"
+            "3 Darts nacheinander mit inkrementeller Referenz erkennen.\n"
+            "Workflow: Leeres Board speichern -> Auto-Erkennung scharf -> bis zu 3 Darts werfen."
         )
         self.info_label.setWordWrap(True)
         self.info_label.setStyleSheet("font-size: 13px; color: #cccccc;")

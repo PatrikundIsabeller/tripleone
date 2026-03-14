@@ -1,24 +1,28 @@
 # vision/dart_detector.py
-# Diese Datei enthält die erste automatische Dart-Erkennung über
-# Frame-Differenz, Konturerkennung und Spitzen-Schätzung.
+# Diese Datei enthält die automatische Dart-Erkennung über
+# inkrementelle Frame-Differenz, Board-Maske, Konturerkennung
+# und Spitzen-Schätzung.
 #
-# Phase 4.0:
+# Phase 4.1:
 # - Referenzbild vom leeren Board
-# - neue Bewegung / Objekt erkennen
-# - Dart-Kontur finden
-# - wahrscheinliche Spitze bestimmen
-# - Score über bestehende Board-Geometrie berechnen
+# - danach automatische Referenzaktualisierung nach jedem Treffer
+# - bis zu 3 Darts nacheinander erkennen
+# - Boardbereich wird per Homography eingeschränkt
+# - Cooldown und Sperrzeiten gegen Fehltrigger
+
+# vision/dart_detector.py
 
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 import cv2
 import numpy as np
 
-from vision.board_model import calculate_board_hit_from_image_point, project_image_point_to_board
+from vision.board_model import calculate_board_hit_from_image_point
 
 
 @dataclass
@@ -35,200 +39,207 @@ class DartDetectionResult:
 
 
 class DartDetector:
-    """
-    Erste Dart-Erkennung für ein einzelnes neues Dartobjekt.
-    Workflow:
-    1. set_reference_frame() mit leerem Board
-    2. arm()
-    3. process_frame() auf neue Frames anwenden
-    4. bei stabiler Erkennung Ergebnis zurückgeben
-    """
 
     def __init__(self) -> None:
-        self.reference_gray: Optional[np.ndarray] = None
-        self.is_armed: bool = False
 
-        self.diff_threshold: int = 28
-        self.min_contour_area: float = 140.0
-        self.max_contour_area: float = 25000.0
-
-        self.required_stable_frames: int = 3
-        self.match_distance_px: float = 18.0
-
-        self._last_candidate: Optional[Tuple[int, int]] = None
-        self._stable_counter: int = 0
-        self._locked: bool = False
-
-    def reset(self) -> None:
+        self.reference_gray = None
         self.is_armed = False
+
+        # maximale Darts pro Runde
+        self.max_darts_per_round = 3
+
+        self.diff_threshold = 22
+
+        self.min_contour_area = 120
+        self.max_contour_area = 15000
+
+        self.required_stable_frames = 3
+        self.match_distance_px = 18
+
+        self.arm_grace_seconds = 0.8
+        self.cooldown_seconds = 1.0
+
+        self._armed_at = 0
+        self._cooldown_until = 0
+
         self._last_candidate = None
         self._stable_counter = 0
-        self._locked = False
 
-    def clear_reference(self) -> None:
-        self.reference_gray = None
-        self.reset()
+        self.detected_darts = []
 
-    def set_reference_frame(self, frame_bgr: np.ndarray) -> None:
-        """
-        Speichert ein Referenzbild des leeren Boards.
-        """
-        gray = self._to_preprocessed_gray(frame_bgr)
-        self.reference_gray = gray
-        self.reset()
+    def reset_round(self):
 
-    def arm(self) -> bool:
-        """
-        Scharf schalten. Nur möglich, wenn ein Referenzbild vorhanden ist.
-        """
+        self.is_armed = False
+        self.detected_darts.clear()
+        self._last_candidate = None
+        self._stable_counter = 0
+
+    def set_reference_frame(self, frame):
+
+        self.reference_gray = self._to_gray(frame)
+        self.reset_round()
+
+    def arm(self):
+
         if self.reference_gray is None:
             return False
 
         self.is_armed = True
-        self._last_candidate = None
-        self._stable_counter = 0
-        self._locked = False
+        self._armed_at = time.monotonic()
         return True
 
-    def _to_preprocessed_gray(self, frame_bgr: np.ndarray) -> np.ndarray:
-        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (5, 5), 0)
-        return gray
+    def _to_gray(self, frame):
 
-    def _build_diff_mask(self, frame_bgr: np.ndarray) -> Optional[np.ndarray]:
-        if self.reference_gray is None:
-            return None
+        g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        g = cv2.GaussianBlur(g, (5, 5), 0)
+        return g
 
-        current_gray = self._to_preprocessed_gray(frame_bgr)
-        diff = cv2.absdiff(current_gray, self.reference_gray)
+    def _diff_mask(self, frame):
+
+        g = self._to_gray(frame)
+
+        diff = cv2.absdiff(g, self.reference_gray)
 
         _, mask = cv2.threshold(diff, self.diff_threshold, 255, cv2.THRESH_BINARY)
 
-        kernel_small = np.ones((3, 3), np.uint8)
-        kernel_big = np.ones((5, 5), np.uint8)
+        kernel = np.ones((3, 3), np.uint8)
 
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_small)
-        mask = cv2.dilate(mask, kernel_small, iterations=1)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_big)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.dilate(mask, kernel, iterations=1)
 
         return mask
 
-    def _find_best_contour(self, mask: np.ndarray) -> Optional[np.ndarray]:
+    def _find_dart_contour(self, mask):
+
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        best_contour = None
-        best_area = 0.0
+        best = None
+        best_area = 0
 
-        for contour in contours:
-            area = cv2.contourArea(contour)
+        for c in contours:
+
+            area = cv2.contourArea(c)
+
             if area < self.min_contour_area:
                 continue
+
             if area > self.max_contour_area:
                 continue
+
+            x, y, w, h = cv2.boundingRect(c)
+
+            aspect = max(w, h) / (min(w, h) + 1)
+
+            if aspect < 2.2:
+                continue
+
             if area > best_area:
+
                 best_area = area
-                best_contour = contour
+                best = c
 
-        return best_contour
+        return best
 
-    def _estimate_tip_from_contour(self, contour: np.ndarray, calibration: Dict) -> Optional[Tuple[int, int]]:
-        """
-        Schätzt die Dartspitze aus der Kontur.
-        Idee:
-        - Alle Konturpunkte ins normierte Board projizieren
-        - Der Punkt mit dem kleinsten Radius ist am ehesten die Spitze,
-          weil die Dartspitze am nächsten zum Board-Zentrum liegt.
-        """
-        pts = contour.reshape(-1, 2)
+    def _estimate_tip(self, contour, calibration):
 
-        best_pt: Optional[Tuple[int, int]] = None
-        best_radius = float("inf")
+        pts = contour.reshape(-1, 2).astype(np.float32)
+
+        mean, eigenvectors = cv2.PCACompute(pts, mean=None)
+
+        direction = eigenvectors[0]
+
+        center = mean[0]
+
+        projections = []
 
         for p in pts:
-            x_px = int(p[0])
-            y_px = int(p[1])
 
-            projected = project_image_point_to_board(x_px, y_px, calibration)
-            if projected is None:
-                continue
+            v = p - center
 
-            x_board, y_board = projected
-            radius = math.sqrt(x_board * x_board + y_board * y_board)
+            proj = np.dot(v, direction)
 
-            # harte Begrenzung, damit wir keine komplett unplausiblen Punkte nehmen
-            if radius > 1.35:
-                continue
+            projections.append(proj)
 
-            if radius < best_radius:
-                best_radius = radius
-                best_pt = (x_px, y_px)
+        min_idx = np.argmin(projections)
+        max_idx = np.argmax(projections)
 
-        return best_pt
+        p1 = pts[min_idx]
+        p2 = pts[max_idx]
 
-    def process_frame(self, frame_bgr: np.ndarray, calibration: Dict) -> Optional[DartDetectionResult]:
-        """
-        Prüft einen neuen Frame.
-        Gibt genau dann ein Ergebnis zurück, wenn eine stabile neue Dart-Erkennung
-        gefunden wurde.
-        """
+        board_center = calibration["points"][4]
+
+        cx = board_center["x_px"]
+        cy = board_center["y_px"]
+
+        d1 = math.hypot(p1[0] - cx, p1[1] - cy)
+        d2 = math.hypot(p2[0] - cx, p2[1] - cy)
+
+        if d1 < d2:
+            tip = p1
+        else:
+            tip = p2
+
+        return int(tip[0]), int(tip[1])
+
+    def process_frame(self, frame, calibration):
+
         if not self.is_armed:
             return None
 
-        if self.reference_gray is None:
+        now = time.monotonic()
+
+        if now - self._armed_at < self.arm_grace_seconds:
             return None
 
-        if self._locked:
+        if now < self._cooldown_until:
             return None
 
-        mask = self._build_diff_mask(frame_bgr)
-        if mask is None:
-            return None
+        mask = self._diff_mask(frame)
 
-        contour = self._find_best_contour(mask)
+        contour = self._find_dart_contour(mask)
+
         if contour is None:
             self._last_candidate = None
             self._stable_counter = 0
             return None
 
-        area = float(cv2.contourArea(contour))
-        tip = self._estimate_tip_from_contour(contour, calibration)
-        if tip is None:
-            self._last_candidate = None
-            self._stable_counter = 0
-            return None
+        tip = self._estimate_tip(contour, calibration)
 
         tx, ty = tip
 
         if self._last_candidate is None:
-            self._last_candidate = (tx, ty)
+
+            self._last_candidate = tip
             self._stable_counter = 1
             return None
 
         dx = tx - self._last_candidate[0]
         dy = ty - self._last_candidate[1]
-        distance = math.sqrt(dx * dx + dy * dy)
 
-        if distance <= self.match_distance_px:
+        dist = math.sqrt(dx * dx + dy * dy)
+
+        if dist < self.match_distance_px:
             self._stable_counter += 1
         else:
             self._stable_counter = 1
 
-        self._last_candidate = (tx, ty)
+        self._last_candidate = tip
 
         if self._stable_counter < self.required_stable_frames:
             return None
 
         hit = calculate_board_hit_from_image_point(tx, ty, calibration)
+
         if hit is None:
             return None
 
-        self._locked = True
-        self.is_armed = False
+        if hit.ring_name == "MISS":
+            return None
 
-        return DartDetectionResult(
+        result = DartDetectionResult(
             x_px=tx,
             y_px=ty,
-            contour_area=area,
+            contour_area=cv2.contourArea(contour),
             score_label=hit.label,
             score_value=hit.score,
             ring_name=hit.ring_name,
@@ -236,3 +247,14 @@ class DartDetector:
             board_y=hit.board_y,
             radius=hit.radius,
         )
+
+        self.detected_darts.append(result)
+
+        self.reference_gray = self._to_gray(frame)
+
+        self._cooldown_until = time.monotonic() + self.cooldown_seconds
+
+        self._stable_counter = 0
+        self._last_candidate = None
+
+        return result
