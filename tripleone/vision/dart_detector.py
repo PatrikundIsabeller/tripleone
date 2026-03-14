@@ -1,14 +1,10 @@
 # vision/dart_detector.py
-# Diese Datei enthält die automatische Dart-Erkennung über
-# inkrementelle Frame-Differenz, Board-Maske, Konturerkennung
-# und robuste Spitzen-Schätzung.
-#
-# Phase 4.3:
-# - inkrementelle Referenz
-# - Boardbereich wird maskiert
-# - robuste Konturfilter
-# - stabilere Spitzen-Schätzung
-# - bis zu 3 Darts nacheinander erkennen
+# Phase Tip-Detection:
+# - erkennt neue Pixel im Boardbereich
+# - sucht plausible Dart-Konturen
+# - erzeugt daraus ein Skelett
+# - nimmt den Endpunkt näher zum Boardzentrum als Spitze
+# - nur die Spitze wird gescored
 
 from __future__ import annotations
 
@@ -36,26 +32,38 @@ class DartDetectionResult:
     radius: float
 
 
-class DartDetector:
-    """
-    Robuste Einzeldart-Erkennung für bis zu 3 Darts nacheinander.
-    """
+@dataclass
+class DartDebugSnapshot:
+    is_armed: bool
+    diff_nonzero_pixels: int
+    contour_count_total: int
+    contour_count_valid: int
+    chosen_area: Optional[float]
+    chosen_aspect_ratio: Optional[float]
+    chosen_fill_ratio: Optional[float]
+    chosen_tip_x: Optional[int]
+    chosen_tip_y: Optional[int]
+    chosen_tip_radius: Optional[float]
+    reject_reason: str
+    info_text: str
 
+
+class DartDetector:
     def __init__(self) -> None:
         self.reference_gray: Optional[np.ndarray] = None
         self.is_armed: bool = False
 
         self.max_darts_per_round: int = 3
 
+        # Basisparameter
         self.diff_threshold: int = 22
-
-        self.min_contour_area: float = 110.0
-        self.max_contour_area: float = 14000.0
+        self.min_contour_area: float = 120.0
+        self.max_contour_area: float = 18000.0
 
         self.required_stable_frames: int = 3
-        self.match_distance_px: float = 16.0
+        self.match_distance_px: float = 14.0
 
-        self.arm_grace_seconds: float = 0.8
+        self.arm_grace_seconds: float = 0.7
         self.post_hit_cooldown_seconds: float = 0.9
 
         self._armed_at: float = 0.0
@@ -64,7 +72,56 @@ class DartDetector:
         self._last_candidate: Optional[Tuple[int, int]] = None
         self._stable_counter: int = 0
 
+        # Die UI nutzt das aktuell noch
         self.detected_darts: List[DartDetectionResult] = []
+
+        self._last_debug = DartDebugSnapshot(
+            is_armed=False,
+            diff_nonzero_pixels=0,
+            contour_count_total=0,
+            contour_count_valid=0,
+            chosen_area=None,
+            chosen_aspect_ratio=None,
+            chosen_fill_ratio=None,
+            chosen_tip_x=None,
+            chosen_tip_y=None,
+            chosen_tip_radius=None,
+            reject_reason="-",
+            info_text="Noch keine Analyse",
+        )
+
+    def get_debug_snapshot(self) -> DartDebugSnapshot:
+        return self._last_debug
+
+    def _set_debug(
+        self,
+        *,
+        diff_nonzero_pixels: int = 0,
+        contour_count_total: int = 0,
+        contour_count_valid: int = 0,
+        chosen_area: Optional[float] = None,
+        chosen_aspect_ratio: Optional[float] = None,
+        chosen_fill_ratio: Optional[float] = None,
+        chosen_tip_x: Optional[int] = None,
+        chosen_tip_y: Optional[int] = None,
+        chosen_tip_radius: Optional[float] = None,
+        reject_reason: str = "-",
+        info_text: str = "",
+    ) -> None:
+        self._last_debug = DartDebugSnapshot(
+            is_armed=self.is_armed,
+            diff_nonzero_pixels=diff_nonzero_pixels,
+            contour_count_total=contour_count_total,
+            contour_count_valid=contour_count_valid,
+            chosen_area=chosen_area,
+            chosen_aspect_ratio=chosen_aspect_ratio,
+            chosen_fill_ratio=chosen_fill_ratio,
+            chosen_tip_x=chosen_tip_x,
+            chosen_tip_y=chosen_tip_y,
+            chosen_tip_radius=chosen_tip_radius,
+            reject_reason=reject_reason,
+            info_text=info_text,
+        )
 
     def reset_round(self) -> None:
         self.is_armed = False
@@ -73,17 +130,21 @@ class DartDetector:
         self._last_candidate = None
         self._stable_counter = 0
         self.detected_darts = []
+        self._set_debug(info_text="Runde zurückgesetzt")
 
     def clear_reference(self) -> None:
         self.reference_gray = None
         self.reset_round()
+        self._set_debug(info_text="Referenz gelöscht")
 
     def set_reference_frame(self, frame_bgr: np.ndarray) -> None:
         self.reference_gray = self._to_preprocessed_gray(frame_bgr)
         self.reset_round()
+        self._set_debug(info_text="Referenzbild gespeichert")
 
     def arm(self) -> bool:
         if self.reference_gray is None:
+            self._set_debug(reject_reason="Keine Referenz", info_text="Arm fehlgeschlagen")
             return False
 
         self.is_armed = True
@@ -91,6 +152,7 @@ class DartDetector:
         self._cooldown_until = 0.0
         self._last_candidate = None
         self._stable_counter = 0
+        self._set_debug(info_text="Detector scharf")
         return True
 
     def _to_preprocessed_gray(self, frame_bgr: np.ndarray) -> np.ndarray:
@@ -99,10 +161,6 @@ class DartDetector:
         return gray
 
     def _build_board_mask(self, frame_bgr: np.ndarray, calibration: Dict) -> np.ndarray:
-        """
-        Erzeugt eine Maske, die nur den Dartboard-Bereich zulässt.
-        Verwendet die 4 Boundary-Punkte und erweitert sie leicht.
-        """
         h, w = frame_bgr.shape[:2]
         mask = np.zeros((h, w), dtype=np.uint8)
 
@@ -121,8 +179,8 @@ class DartDetector:
         pts_np = np.array(pts, dtype=np.int32)
         cv2.fillConvexPoly(mask, pts_np, 255, lineType=cv2.LINE_AA)
 
-        # etwas erweitern, damit Flights / äußere Bereiche nicht abgeschnitten werden
-        kernel = np.ones((31, 31), np.uint8)
+        # Etwas größer, damit Barrel/Flight am Rand nicht abgeschnitten werden
+        kernel = np.ones((35, 35), np.uint8)
         mask = cv2.dilate(mask, kernel, iterations=1)
 
         return mask
@@ -148,48 +206,102 @@ class DartDetector:
 
         return mask
 
-    def _contour_shape_ok(self, contour: np.ndarray) -> bool:
-        area = cv2.contourArea(contour)
-        if area < self.min_contour_area or area > self.max_contour_area:
-            return False
-
+    def _contour_metrics(self, contour: np.ndarray) -> Tuple[float, float, float]:
+        area = float(cv2.contourArea(contour))
         x, y, w, h = cv2.boundingRect(contour)
         short_side = max(1, min(w, h))
         long_side = max(w, h)
         aspect_ratio = long_side / short_side
-
-        if aspect_ratio < 2.0:
-            return False
-
         rect_area = max(1, w * h)
         fill_ratio = area / rect_area
+        return area, aspect_ratio, fill_ratio
 
-        # Sehr volle kompakte Flächen sind meist Schatten/Hand/Fehlobjekte
-        if fill_ratio > 0.72:
-            return False
+    def _contour_shape_ok(self, contour: np.ndarray) -> Tuple[bool, str]:
+        area, aspect_ratio, fill_ratio = self._contour_metrics(contour)
 
-        # Zu wenig Substanz ist oft Rauschen
-        if fill_ratio < 0.08:
-            return False
+        if area < self.min_contour_area:
+            return False, f"Area zu klein ({area:.1f})"
 
-        return True
+        if area > self.max_contour_area:
+            return False, f"Area zu groß ({area:.1f})"
 
-    def _find_candidate_contours(self, mask: np.ndarray) -> List[np.ndarray]:
+        if aspect_ratio < 2.0:
+            return False, f"Aspect zu klein ({aspect_ratio:.2f})"
+
+        if fill_ratio > 0.80:
+            return False, f"Fill zu hoch ({fill_ratio:.2f})"
+
+        if fill_ratio < 0.04:
+            return False, f"Fill zu klein ({fill_ratio:.2f})"
+
+        return True, "OK"
+
+    def _find_candidate_contours(self, mask: np.ndarray) -> Tuple[List[np.ndarray], int]:
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
         valid_contours: List[np.ndarray] = []
+
         for contour in contours:
-            if self._contour_shape_ok(contour):
+            ok, _ = self._contour_shape_ok(contour)
+            if ok:
                 valid_contours.append(contour)
 
         valid_contours.sort(key=cv2.contourArea, reverse=True)
-        return valid_contours
+        return valid_contours, len(contours)
 
-    def _get_axis_endpoints(self, contour: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    def _board_radius_of_pixel(self, x_px: int, y_px: int, calibration: Dict) -> Optional[float]:
+        projected = project_image_point_to_board(x_px, y_px, calibration)
+        if projected is None:
+            return None
+
+        x_board, y_board = projected
+        return math.sqrt(x_board * x_board + y_board * y_board)
+
+    def _skeletonize(self, binary_mask: np.ndarray) -> np.ndarray:
         """
-        Bestimmt über PCA die Hauptachse und liefert die beiden extremen Endpunkte
-        entlang dieser Achse.
+        Morphologische Skelettierung ohne Zusatzmodule.
         """
+        img = binary_mask.copy()
+        skeleton = np.zeros_like(img)
+        element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+
+        while True:
+            eroded = cv2.erode(img, element)
+            temp = cv2.dilate(eroded, element)
+            temp = cv2.subtract(img, temp)
+            skeleton = cv2.bitwise_or(skeleton, temp)
+            img = eroded.copy()
+
+            if cv2.countNonZero(img) == 0:
+                break
+
+        return skeleton
+
+    def _find_skeleton_endpoints(self, skeleton: np.ndarray) -> List[Tuple[int, int]]:
+        """
+        Endpunkt = Skelettpixel mit genau einem Nachbarn.
+        """
+        endpoints: List[Tuple[int, int]] = []
+
+        ys, xs = np.where(skeleton > 0)
+        if len(xs) == 0:
+            return endpoints
+
+        h, w = skeleton.shape[:2]
+
+        for x, y in zip(xs, ys):
+            x0 = max(0, x - 1)
+            x1 = min(w, x + 2)
+            y0 = max(0, y - 1)
+            y1 = min(h, y + 2)
+
+            roi = skeleton[y0:y1, x0:x1]
+            neighbors = int(np.count_nonzero(roi)) - 1
+            if neighbors == 1:
+                endpoints.append((x, y))
+
+        return endpoints
+
+    def _pca_endpoints(self, contour: np.ndarray) -> Optional[Tuple[Tuple[int, int], Tuple[int, int]]]:
         pts = contour.reshape(-1, 2).astype(np.float32)
         if len(pts) < 5:
             return None
@@ -207,66 +319,83 @@ class DartDetector:
 
         p1 = pts[min_idx]
         p2 = pts[max_idx]
-        return p1, p2
 
-    def _board_radius_of_pixel(self, x_px: int, y_px: int, calibration: Dict) -> Optional[float]:
-        projected = project_image_point_to_board(x_px, y_px, calibration)
-        if projected is None:
-            return None
+        return (
+            (int(round(float(p1[0]))), int(round(float(p1[1])))),
+            (int(round(float(p2[0]))), int(round(float(p2[1])))),
+        )
 
-        x_board, y_board = projected
-        return math.sqrt(x_board * x_board + y_board * y_board)
+    def _tip_from_endpoints(
+        self,
+        endpoints: List[Tuple[int, int]],
+        calibration: Dict,
+    ) -> Tuple[Optional[Tuple[int, int]], Optional[float], str]:
+        if not endpoints:
+            return None, None, "Keine Endpunkte"
 
-    def _estimate_tip_from_contour(self, contour: np.ndarray, calibration: Dict) -> Optional[Tuple[int, int]]:
+        endpoint_radii: List[Tuple[Tuple[int, int], float]] = []
+
+        for x_px, y_px in endpoints:
+            radius = self._board_radius_of_pixel(x_px, y_px, calibration)
+            if radius is None:
+                continue
+            endpoint_radii.append(((x_px, y_px), radius))
+
+        if not endpoint_radii:
+            return None, None, "Endpunkte nicht projizierbar"
+
+        endpoint_radii.sort(key=lambda item: item[1])
+        tip, tip_radius = endpoint_radii[0]
+
+        if tip_radius > 1.10:
+            return None, None, f"Tip zu weit außen ({tip_radius:.3f})"
+
+        return tip, tip_radius, "OK"
+
+    def _estimate_tip_from_contour(
+        self,
+        contour: np.ndarray,
+        calibration: Dict,
+        frame_shape: Tuple[int, int, int],
+    ) -> Tuple[Optional[Tuple[int, int]], Optional[float], str]:
         """
         Robuste Spitzen-Schätzung:
-        - Dart-Hauptachse per PCA
-        - beide Enden der Achse bestimmen
-        - Ende näher zum Boardzentrum ist Kandidat für die Spitze
-        - zusätzliche Plausibilitätsprüfung
+        1. lokale Konturmaske
+        2. Skelettierung
+        3. Endpunkte
+        4. Endpunkt näher zum Zentrum = Spitze
+        Fallback: PCA-Endpunkte
         """
-        endpoints = self._get_axis_endpoints(contour)
-        if endpoints is None:
-            return None
+        h, w = frame_shape[:2]
+        local_mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.drawContours(local_mask, [contour], -1, 255, thickness=cv2.FILLED)
 
-        p1, p2 = endpoints
+        skeleton = self._skeletonize(local_mask)
+        endpoints = self._find_skeleton_endpoints(skeleton)
 
-        x1, y1 = int(round(float(p1[0]))), int(round(float(p1[1])))
-        x2, y2 = int(round(float(p2[0]))), int(round(float(p2[1])))
+        # Wenn zu viele Endpunkte, auf die plausibelsten reduzieren
+        if len(endpoints) >= 2:
+            tip, tip_radius, reason = self._tip_from_endpoints(endpoints, calibration)
+            if tip is not None:
+                return tip, tip_radius, reason
 
-        r1 = self._board_radius_of_pixel(x1, y1, calibration)
-        r2 = self._board_radius_of_pixel(x2, y2, calibration)
+        # Fallback auf PCA-Endpunkte
+        pca_ends = self._pca_endpoints(contour)
+        if pca_ends is None:
+            return None, None, "Keine PCA-Endpunkte"
 
-        if r1 is None or r2 is None:
-            return None
+        tip, tip_radius, reason = self._tip_from_endpoints(list(pca_ends), calibration)
+        if tip is None:
+            return None, None, f"PCA-Fallback fehlgeschlagen: {reason}"
 
-        # Plausibilitätsfilter: beide Endpunkte dürfen nicht komplett unplausibel weit draußen sein
-        if r1 > 1.35 and r2 > 1.35:
-            return None
-
-        # Das Ende näher zum Zentrum ist typischerweise die Spitze
-        if r1 <= r2:
-            tip = (x1, y1)
-            tip_radius = r1
-        else:
-            tip = (x2, y2)
-            tip_radius = r2
-
-        # Die Spitze darf nicht komplett außerhalb des Boards liegen
-        if tip_radius > 1.10:
-            return None
-
-        return tip
+        return tip, tip_radius, "OK (PCA-Fallback)"
 
     def _candidate_is_new(self, x_px: int, y_px: int) -> bool:
-        """
-        Verhindert doppelte Erkennung an fast identischer Stelle.
-        """
         for dart in self.detected_darts:
             dx = x_px - dart.x_px
             dy = y_px - dart.y_px
             dist = math.sqrt(dx * dx + dy * dy)
-            if dist <= 22.0:
+            if dist <= 24.0:
                 return False
         return True
 
@@ -275,52 +404,90 @@ class DartDetector:
 
     def process_frame(self, frame_bgr: np.ndarray, calibration: Dict) -> Optional[DartDetectionResult]:
         if not self.is_armed:
+            self._set_debug(info_text="Detector nicht scharf", reject_reason="Nicht scharf")
             return None
 
         if self.reference_gray is None:
+            self._set_debug(info_text="Keine Referenz", reject_reason="Keine Referenz")
             return None
 
         if len(self.detected_darts) >= self.max_darts_per_round:
+            self._set_debug(info_text="Maximale Darts erreicht", reject_reason="Runde voll")
             return None
 
         now = time.monotonic()
 
         if (now - self._armed_at) < self.arm_grace_seconds:
+            self._set_debug(info_text="Grace-Phase nach Arm", reject_reason="Grace")
             return None
 
         if now < self._cooldown_until:
+            self._set_debug(info_text="Cooldown aktiv", reject_reason="Cooldown")
             return None
 
         mask = self._build_diff_mask(frame_bgr, calibration)
         if mask is None:
+            self._set_debug(info_text="Maskenerzeugung fehlgeschlagen", reject_reason="Keine Maske")
             return None
 
-        contours = self._find_candidate_contours(mask)
-        if not contours:
+        diff_nonzero = int(np.count_nonzero(mask))
+        valid_contours, total_contours = self._find_candidate_contours(mask)
+
+        if not valid_contours:
             self._last_candidate = None
             self._stable_counter = 0
+            self._set_debug(
+                diff_nonzero_pixels=diff_nonzero,
+                contour_count_total=total_contours,
+                contour_count_valid=0,
+                reject_reason="Keine gültige Kontur",
+                info_text="Keine brauchbare Kontur gefunden",
+            )
             return None
 
         best_tip: Optional[Tuple[int, int]] = None
-        best_area: float = 0.0
+        best_area: Optional[float] = None
+        best_aspect: Optional[float] = None
+        best_fill: Optional[float] = None
+        best_tip_radius: Optional[float] = None
+        reject_reason = "-"
+        info_text = "-"
 
-        for contour in contours:
-            tip = self._estimate_tip_from_contour(contour, calibration)
+        for contour in valid_contours:
+            area, aspect_ratio, fill_ratio = self._contour_metrics(contour)
+            tip, tip_radius, reason = self._estimate_tip_from_contour(contour, calibration, frame_bgr.shape)
+
             if tip is None:
+                reject_reason = reason
+                info_text = "Kontur vorhanden, aber keine Spitze"
                 continue
 
             tx, ty = tip
 
             if not self._candidate_is_new(tx, ty):
+                reject_reason = "Zu nah an vorhandenem Dart"
+                info_text = "Kandidat verworfen"
                 continue
 
             best_tip = tip
-            best_area = float(cv2.contourArea(contour))
+            best_area = area
+            best_aspect = aspect_ratio
+            best_fill = fill_ratio
+            best_tip_radius = tip_radius
+            reject_reason = "OK"
+            info_text = "Spitze erfolgreich geschätzt"
             break
 
         if best_tip is None:
             self._last_candidate = None
             self._stable_counter = 0
+            self._set_debug(
+                diff_nonzero_pixels=diff_nonzero,
+                contour_count_total=total_contours,
+                contour_count_valid=len(valid_contours),
+                reject_reason=reject_reason,
+                info_text=info_text,
+            )
             return None
 
         tx, ty = best_tip
@@ -328,6 +495,19 @@ class DartDetector:
         if self._last_candidate is None:
             self._last_candidate = (tx, ty)
             self._stable_counter = 1
+            self._set_debug(
+                diff_nonzero_pixels=diff_nonzero,
+                contour_count_total=total_contours,
+                contour_count_valid=len(valid_contours),
+                chosen_area=best_area,
+                chosen_aspect_ratio=best_aspect,
+                chosen_fill_ratio=best_fill,
+                chosen_tip_x=tx,
+                chosen_tip_y=ty,
+                chosen_tip_radius=best_tip_radius,
+                reject_reason="Warte auf Stabilisierung",
+                info_text="Erster Spitzen-Kandidatenframe",
+            )
             return None
 
         dx = tx - self._last_candidate[0]
@@ -342,22 +522,60 @@ class DartDetector:
         self._last_candidate = (tx, ty)
 
         if self._stable_counter < self.required_stable_frames:
+            self._set_debug(
+                diff_nonzero_pixels=diff_nonzero,
+                contour_count_total=total_contours,
+                contour_count_valid=len(valid_contours),
+                chosen_area=best_area,
+                chosen_aspect_ratio=best_aspect,
+                chosen_fill_ratio=best_fill,
+                chosen_tip_x=tx,
+                chosen_tip_y=ty,
+                chosen_tip_radius=best_tip_radius,
+                reject_reason=f"Stabilisierung {self._stable_counter}/{self.required_stable_frames}",
+                info_text="Kandidat noch nicht stabil genug",
+            )
             return None
 
         hit = calculate_board_hit_from_image_point(tx, ty, calibration)
         if hit is None:
+            self._set_debug(
+                diff_nonzero_pixels=diff_nonzero,
+                contour_count_total=total_contours,
+                contour_count_valid=len(valid_contours),
+                chosen_area=best_area,
+                chosen_aspect_ratio=best_aspect,
+                chosen_fill_ratio=best_fill,
+                chosen_tip_x=tx,
+                chosen_tip_y=ty,
+                chosen_tip_radius=best_tip_radius,
+                reject_reason="Scoring fehlgeschlagen",
+                info_text="Board-Hit-Berechnung fehlgeschlagen",
+            )
             return None
 
-        # Miss wird in dieser Phase nicht akzeptiert
         if hit.ring_name == "MISS":
             self._last_candidate = None
             self._stable_counter = 0
+            self._set_debug(
+                diff_nonzero_pixels=diff_nonzero,
+                contour_count_total=total_contours,
+                contour_count_valid=len(valid_contours),
+                chosen_area=best_area,
+                chosen_aspect_ratio=best_aspect,
+                chosen_fill_ratio=best_fill,
+                chosen_tip_x=tx,
+                chosen_tip_y=ty,
+                chosen_tip_radius=best_tip_radius,
+                reject_reason="MISS verworfen",
+                info_text="Spitze lag außerhalb",
+            )
             return None
 
         result = DartDetectionResult(
             x_px=tx,
             y_px=ty,
-            contour_area=best_area,
+            contour_area=float(best_area),
             score_label=hit.label,
             score_value=hit.score,
             ring_name=hit.ring_name,
@@ -367,15 +585,24 @@ class DartDetector:
         )
 
         self.detected_darts.append(result)
-
-        # WICHTIG: aktueller Zustand wird Referenz für den nächsten Dart
         self._update_reference_after_hit(frame_bgr)
 
         self._cooldown_until = time.monotonic() + self.post_hit_cooldown_seconds
         self._last_candidate = None
         self._stable_counter = 0
 
-        if len(self.detected_darts) >= self.max_darts_per_round:
-            self.is_armed = False
+        self._set_debug(
+            diff_nonzero_pixels=diff_nonzero,
+            contour_count_total=total_contours,
+            contour_count_valid=len(valid_contours),
+            chosen_area=best_area,
+            chosen_aspect_ratio=best_aspect,
+            chosen_fill_ratio=best_fill,
+            chosen_tip_x=tx,
+            chosen_tip_y=ty,
+            chosen_tip_radius=best_tip_radius,
+            reject_reason="OK",
+            info_text=f"Spitzen-Treffer erkannt: {result.score_label} = {result.score_value}",
+        )
 
         return result

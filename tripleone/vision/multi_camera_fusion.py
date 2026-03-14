@@ -1,11 +1,7 @@
 # vision/multi_camera_fusion.py
-# Diese Datei enthält die Mehrkamera-Fusion für TripleOne.
-#
-# Phase 5.0:
-# - mehrere Kamera-Treffer zusammenführen
-# - robuste Fusion über Board-Koordinaten
-# - Median statt Mittelwert gegen Ausreißer
-# - finalen Score aus fusioniertem Boardpunkt berechnen
+# Phase 5.x:
+# - mehrere Kamera-Kandidaten zusammenführen
+# - Median im Board-Raum gegen Ausreißer
 
 from __future__ import annotations
 
@@ -18,9 +14,6 @@ from vision.board_model import calculate_board_hit_from_board_point
 
 @dataclass
 class CameraBoardCandidate:
-    """
-    Einzelner Trefferkandidat einer Kamera im normierten Boardraum.
-    """
     camera_index: int
     score_label: str
     score_value: int
@@ -32,9 +25,6 @@ class CameraBoardCandidate:
 
 @dataclass
 class FusedDartResult:
-    """
-    Ergebnis einer Mehrkamera-Fusion.
-    """
     dart_index: int
     final_label: str
     final_score: int
@@ -49,9 +39,6 @@ def fuse_camera_candidates(
     dart_index: int,
     candidates: List[CameraBoardCandidate],
 ) -> FusedDartResult:
-    """
-    Führt mehrere Kamera-Kandidaten über den Median der Board-Koordinaten zusammen.
-    """
     if not candidates:
         raise ValueError("Für die Fusion werden mindestens 1 Kamera-Kandidat benötigt.")
 

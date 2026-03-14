@@ -1,15 +1,9 @@
 # app/pages/calibration_page.py
-# Diese Datei enthält die Kalibrierungsseite.
-# Hier wird pro Kamera das Livebild mit Homography-Overlay angezeigt.
-#
-# Phase 5.1:
-# - globale Steuerung für:
-#   - Leeres Board speichern
-#   - Auto-Erkennung scharf
-#   - Runde zurücksetzen
-# - 3-Kamera-Fusion bleibt aktiv
-# - Kamera-Karten sind Diagnose-/Preview-Karten
-# - keine separaten Auto-Erkennungsbuttons mehr pro Kamera
+# Phase 5.4:
+# - globales Referenzbild / global scharf
+# - zentraler Event-Manager
+# - pro Kamera Debug-Ausgabe für Detection
+# - Fusion erst nach Eventende
 
 from __future__ import annotations
 
@@ -18,7 +12,7 @@ from typing import Callable, Dict, List, Optional
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QImage
 from PyQt6.QtWidgets import (
     QWidget,
@@ -36,6 +30,7 @@ from PyQt6.QtWidgets import (
 from vision.camera_manager import CameraWorker
 from vision.board_model import calculate_board_hit_from_image_point
 from vision.dart_detector import DartDetector, DartDetectionResult
+from vision.dart_event_manager import DartEventManager, ClosedDartEvent
 from vision.multi_camera_fusion import (
     CameraBoardCandidate,
     FusedDartResult,
@@ -45,11 +40,6 @@ from app.widgets.calibration_preview import CalibrationPreview
 
 
 class CalibrationCard(QFrame):
-    """
-    Eine Diagnose-/Preview-Karte für genau eine Kamera.
-    Auto-Erkennung wird global über die Hauptseite gesteuert.
-    """
-
     def __init__(
         self,
         title: str,
@@ -104,6 +94,30 @@ class CalibrationCard(QFrame):
         self._points: List[Dict[str, int]] = []
 
         self.detector = DartDetector()
+        
+        # Kameraspezifisches Tuning der Detector-Parameter
+        # Kamera 3 ist aktuell zu empfindlich und zählt Nachbewegungen doppelt.
+        if self.camera_slot == 0:
+            # Kamera 1: läuft schon recht gut
+            self.detector.diff_threshold = 22
+            self.detector.min_contour_area = 110.0
+            self.detector.required_stable_frames = 3
+            self.detector.post_hit_cooldown_seconds = 0.9
+
+        elif self.camera_slot == 1:
+            # Kamera 2: läuft schon recht gut
+            self.detector.diff_threshold = 22
+            self.detector.min_contour_area = 110.0
+            self.detector.required_stable_frames = 3
+            self.detector.post_hit_cooldown_seconds = 0.9
+
+        elif self.camera_slot == 2:
+            # Kamera 3: strenger machen gegen Schatten / Nachtrigger
+            self.detector.diff_threshold = 28
+            self.detector.min_contour_area = 180.0
+            self.detector.required_stable_frames = 4
+            self.detector.post_hit_cooldown_seconds = 1.4
+
         self.last_frame_bgr: Optional[np.ndarray] = None
 
         self.title_label = QLabel(title)
@@ -115,13 +129,9 @@ class CalibrationCard(QFrame):
         self.help_label = QLabel(
             "Tipp:\n"
             "- Ziehe P1 bis P4 exakt auf den äußeren Double-Ring\n"
-            "- P1 = Grenze 20|1\n"
-            "- P2 = Grenze 6|10\n"
-            "- P3 = Grenze 3|19\n"
-            "- P4 = Grenze 11|14\n"
-            "- C  = Bull-Mittelpunkt\n"
-            "- Rechtsklick ins Bild = Score-Test\n"
-            "- Referenz / Scharfstellung erfolgt global oben"
+            "- Rechtsklick = Score-Test\n"
+            "- Referenz / Scharfstellung global oben\n"
+            "- Unten siehst du jetzt die Debug-Werte der Erkennung"
         )
         self.help_label.setStyleSheet("font-size: 12px; color: #d8d8d8;")
 
@@ -141,7 +151,6 @@ class CalibrationCard(QFrame):
         self.show_sector_lines_check.setChecked(True)
 
         self.reset_button = QPushButton("5 Punkte zurücksetzen")
-        self.reset_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.reset_button.clicked.connect(self.reset_points)
 
         self.point_info_label = QLabel("Punkte: P1 bis P4 + C noch nicht angepasst")
@@ -159,6 +168,10 @@ class CalibrationCard(QFrame):
         self.detector_status_label = QLabel("Auto-Erkennung: keine Referenz")
         self.detector_status_label.setWordWrap(True)
         self.detector_status_label.setStyleSheet("font-size: 12px; color: #ffdb8a; font-weight: 700;")
+
+        self.debug_label = QLabel("Debug: -")
+        self.debug_label.setWordWrap(True)
+        self.debug_label.setStyleSheet("font-size: 11px; color: #d0d0d0;")
 
         self.status_label = QLabel("Status: nicht gestartet")
         self.status_label.setWordWrap(True)
@@ -197,6 +210,7 @@ class CalibrationCard(QFrame):
         layout.addWidget(self.test_result_label)
         layout.addWidget(self.throw_list_label)
         layout.addWidget(self.detector_status_label)
+        layout.addWidget(self.debug_label)
         layout.addWidget(self.status_label)
 
     def _connect_signals(self) -> None:
@@ -227,16 +241,12 @@ class CalibrationCard(QFrame):
             self.test_result_label.setText(f"Testpunkt: Fehler bei Rückprojektion | Punkt=({x_px}, {y_px})")
             return
 
-        score_text = f"{result.label} = {result.score}"
-
         self.test_result_label.setText(
-            f"Testpunkt: {score_text} | "
+            f"Testpunkt: {result.label} = {result.score} | "
             f"Ring: {result.ring_name} | "
-            f"Radius: {result.radius:.3f} | "
             f"Board=({result.board_x:.3f}, {result.board_y:.3f}) | "
             f"Bild=({result.image_x_px}, {result.image_y_px})"
         )
-
         self.preview.set_test_point(x_px, y_px)
 
     def _update_throw_list_label(self) -> None:
@@ -245,8 +255,34 @@ class CalibrationCard(QFrame):
             labels.append("-")
 
         total = sum(d.score_value for d in self.detector.detected_darts)
-        self.throw_list_label.setText(
-            f"Darts: {labels[0]} / {labels[1]} / {labels[2]} | Gesamt: {total}"
+        self.throw_list_label.setText(f"Darts: {labels[0]} / {labels[1]} / {labels[2]} | Gesamt: {total}")
+
+    def _update_debug_label(self) -> None:
+        dbg = self.detector.get_debug_snapshot()
+
+        area = f"{dbg.chosen_area:.1f}" if dbg.chosen_area is not None else "-"
+        aspect = f"{dbg.chosen_aspect_ratio:.2f}" if dbg.chosen_aspect_ratio is not None else "-"
+        fill = f"{dbg.chosen_fill_ratio:.2f}" if dbg.chosen_fill_ratio is not None else "-"
+        tip = (
+            f"({dbg.chosen_tip_x},{dbg.chosen_tip_y})"
+            if dbg.chosen_tip_x is not None and dbg.chosen_tip_y is not None
+            else "-"
+        )
+        tip_radius = f"{dbg.chosen_tip_radius:.3f}" if dbg.chosen_tip_radius is not None else "-"
+
+        self.debug_label.setText(
+            "Debug: "
+            f"armed={dbg.is_armed} | "
+            f"diff={dbg.diff_nonzero_pixels} | "
+            f"contours={dbg.contour_count_total} | "
+            f"valid={dbg.contour_count_valid} | "
+            f"area={area} | "
+            f"aspect={aspect} | "
+            f"fill={fill} | "
+            f"tip={tip} | "
+            f"tip_r={tip_radius} | "
+            f"reason={dbg.reject_reason} | "
+            f"info={dbg.info_text}"
         )
 
     def _handle_auto_detection_result(self, result: DartDetectionResult) -> None:
@@ -277,12 +313,10 @@ class CalibrationCard(QFrame):
         points = self._points if self._points else self._default_points()
         labels = ["P1", "P2", "P3", "P4", "C"]
         parts = []
-
         for i, point in enumerate(points):
             x_px = int(point.get("x_px", 0))
             y_px = int(point.get("y_px", 0))
             parts.append(f"{labels[i]}=({x_px},{y_px})")
-
         self.point_info_label.setText("Punkte: " + " | ".join(parts))
 
     def _get_frame_width(self) -> int:
@@ -308,6 +342,7 @@ class CalibrationCard(QFrame):
         self.preview.clear_test_point()
         self.test_result_label.setText("Testpunkt / Auto-Treffer: noch keiner gesetzt")
         self._update_throw_list_label()
+        self._update_debug_label()
 
         if self.detector.reference_gray is not None:
             self.detector_status_label.setText("Auto-Erkennung: Runde zurückgesetzt, wieder scharf schaltbar")
@@ -315,9 +350,6 @@ class CalibrationCard(QFrame):
             self.detector_status_label.setText("Auto-Erkennung: keine Referenz")
 
     def capture_reference_frame(self) -> bool:
-        """
-        Speichert das aktuelle Livebild als Referenz.
-        """
         if self.last_frame_bgr is None:
             self.detector_status_label.setText("Auto-Erkennung: kein Livebild für Referenz vorhanden")
             return False
@@ -326,14 +358,13 @@ class CalibrationCard(QFrame):
         self.preview.clear_test_point()
         self.test_result_label.setText("Testpunkt / Auto-Treffer: noch keiner gesetzt")
         self._update_throw_list_label()
+        self._update_debug_label()
         self.detector_status_label.setText("Auto-Erkennung: Referenz gespeichert")
         return True
 
     def arm_detector(self) -> bool:
-        """
-        Scharf schalten.
-        """
         ok = self.detector.arm()
+        self._update_debug_label()
         if ok:
             self.detector_status_label.setText("Auto-Erkennung: global scharf")
         else:
@@ -367,10 +398,10 @@ class CalibrationCard(QFrame):
         self.preview.set_overlay_config(self.get_calibration_config())
         self._update_point_info_label()
         self._update_throw_list_label()
+        self._update_debug_label()
 
     def get_calibration_config(self) -> Dict:
         points = deepcopy(self._points if self._points else self._default_points())
-
         return {
             "frame_width": self._get_frame_width(),
             "frame_height": self._get_frame_height(),
@@ -404,6 +435,8 @@ class CalibrationCard(QFrame):
             return
 
         detection = self.detector.process_frame(self.last_frame_bgr, self.get_calibration_config())
+        self._update_debug_label()
+
         if detection is not None:
             self._handle_auto_detection_result(detection)
 
@@ -415,6 +448,7 @@ class CalibrationCard(QFrame):
         self.last_frame_bgr = None
         self.test_result_label.setText("Testpunkt / Auto-Treffer: noch keiner gesetzt")
         self.set_status("gestoppt")
+        self._update_debug_label()
 
     def start_worker(self) -> None:
         self.stop_worker()
@@ -447,10 +481,6 @@ class CalibrationCard(QFrame):
 
 
 class CalibrationPage(QWidget):
-    """
-    Hauptseite mit globaler Steuerung für 3 Kameras.
-    """
-
     def __init__(
         self,
         camera_config: Dict,
@@ -464,65 +494,53 @@ class CalibrationPage(QWidget):
         self.calibration_config = deepcopy(calibration_config)
         self.save_callback = save_callback
 
-        self.camera_detection_map: Dict[int, List[DartDetectionResult]] = {0: [], 1: [], 2: []}
+        self.event_manager = DartEventManager()
         self.fused_darts: List[FusedDartResult] = []
 
-        self.title_label = QLabel("TripleOne – Kalibrierung / Phase 5.1")
+        self.title_label = QLabel("TripleOne – Kalibrierung / Phase 5.4 Debug")
         self.title_label.setStyleSheet("font-size: 26px; font-weight: bold;")
 
         self.info_label = QLabel(
-            "Phase 5.1:\n"
-            "Leeres Board speichern, Auto-Erkennung scharf und Runden-Reset sind jetzt global.\n"
-            "Alle aktiven Kameras werden gleichzeitig vorbereitet und liefern gemeinsam Daten für die Fusion."
+            "Phase 5.4:\n"
+            "Jetzt siehst du pro Kamera die Debug-Werte der Detection. "
+            "Damit können wir endlich erkennen, warum eine Kamera nichts oder nur falsche Treffer liefert."
         )
         self.info_label.setWordWrap(True)
         self.info_label.setStyleSheet("font-size: 13px; color: #cccccc;")
 
-        self.card_1 = CalibrationCard(
-            "Kamera 1",
-            camera_slot=0,
-            auto_detection_callback=self.handle_camera_auto_detection,
-        )
-        self.card_2 = CalibrationCard(
-            "Kamera 2",
-            camera_slot=1,
-            auto_detection_callback=self.handle_camera_auto_detection,
-        )
-        self.card_3 = CalibrationCard(
-            "Kamera 3",
-            camera_slot=2,
-            auto_detection_callback=self.handle_camera_auto_detection,
-        )
+        self.card_1 = CalibrationCard("Kamera 1", camera_slot=0, auto_detection_callback=self.handle_camera_auto_detection)
+        self.card_2 = CalibrationCard("Kamera 2", camera_slot=1, auto_detection_callback=self.handle_camera_auto_detection)
+        self.card_3 = CalibrationCard("Kamera 3", camera_slot=2, auto_detection_callback=self.handle_camera_auto_detection)
         self.cards: List[CalibrationCard] = [self.card_1, self.card_2, self.card_3]
 
         self.start_button = QPushButton("Livebilder starten / aktualisieren")
-        self.start_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.start_button.clicked.connect(self.apply_preview)
 
         self.stop_button = QPushButton("Alle Kameras stoppen")
-        self.stop_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.stop_button.clicked.connect(self.stop_all_cameras)
 
         self.save_button = QPushButton("Kalibrierung speichern")
-        self.save_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.save_button.clicked.connect(self.save_settings)
 
         self.reset_all_button = QPushButton("Alle 5-Punkt-Overlays zurücksetzen")
-        self.reset_all_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.reset_all_button.clicked.connect(self.reset_all_overlays)
 
-        # NEU: globale Steuerung
         self.global_reference_button = QPushButton("Leeres Board global speichern")
-        self.global_reference_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.global_reference_button.clicked.connect(self.capture_reference_global)
 
         self.global_arm_button = QPushButton("Auto-Erkennung global scharf")
-        self.global_arm_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.global_arm_button.clicked.connect(self.arm_detectors_global)
 
         self.global_reset_round_button = QPushButton("Runde global zurücksetzen")
-        self.global_reset_round_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.global_reset_round_button.clicked.connect(self.reset_fusion_state)
+        self.global_reset_round_button.clicked.connect(self.reset_round_global)
+
+        self.global_status_label = QLabel("Global: noch keine Aktion ausgeführt")
+        self.global_status_label.setWordWrap(True)
+        self.global_status_label.setStyleSheet("font-size: 13px; color: #8effc9; font-weight: 700;")
+
+        self.event_status_label = QLabel("Event-Manager: nicht scharf")
+        self.event_status_label.setWordWrap(True)
+        self.event_status_label.setStyleSheet("font-size: 13px; color: #7fe6ff; font-weight: 700;")
 
         self.fusion_status_label = QLabel("Fusion: noch keine gemeinsamen Treffer")
         self.fusion_status_label.setWordWrap(True)
@@ -536,13 +554,13 @@ class CalibrationPage(QWidget):
         self.fusion_detail_label.setWordWrap(True)
         self.fusion_detail_label.setStyleSheet("font-size: 12px; color: #d0d0d0;")
 
-        self.global_status_label = QLabel("Global: noch keine Aktion ausgeführt")
-        self.global_status_label.setWordWrap(True)
-        self.global_status_label.setStyleSheet("font-size: 13px; color: #8effc9; font-weight: 700;")
+        self.event_timer = QTimer(self)
+        self.event_timer.timeout.connect(self._poll_event_manager)
+        self.event_timer.start(50)
 
         self._build_ui()
         self._load_data_into_ui()
-        self._update_fusion_labels()
+        self._update_status_labels()
 
     def _build_ui(self) -> None:
         self.setStyleSheet("""
@@ -580,12 +598,13 @@ class CalibrationPage(QWidget):
         cards_layout.addWidget(self.card_2, 1)
         cards_layout.addWidget(self.card_3, 1)
 
-        fusion_layout = QVBoxLayout()
-        fusion_layout.setSpacing(8)
-        fusion_layout.addWidget(self.global_status_label)
-        fusion_layout.addWidget(self.fusion_status_label)
-        fusion_layout.addWidget(self.fusion_darts_label)
-        fusion_layout.addWidget(self.fusion_detail_label)
+        info_layout = QVBoxLayout()
+        info_layout.setSpacing(8)
+        info_layout.addWidget(self.global_status_label)
+        info_layout.addWidget(self.event_status_label)
+        info_layout.addWidget(self.fusion_status_label)
+        info_layout.addWidget(self.fusion_darts_label)
+        info_layout.addWidget(self.fusion_detail_label)
 
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(20, 20, 20, 20)
@@ -594,7 +613,7 @@ class CalibrationPage(QWidget):
         main_layout.addWidget(self.info_label)
         main_layout.addLayout(row_main)
         main_layout.addLayout(row_global)
-        main_layout.addLayout(fusion_layout)
+        main_layout.addLayout(info_layout)
         main_layout.addLayout(cards_layout, 1)
 
     def _load_data_into_ui(self) -> None:
@@ -610,7 +629,6 @@ class CalibrationPage(QWidget):
     def update_camera_config(self, new_camera_config: Dict) -> None:
         self.camera_config = deepcopy(new_camera_config)
         cam_list = self.camera_config.get("cameras", [])
-
         for i, card in enumerate(self.cards):
             if i < len(cam_list):
                 card.set_camera_config(cam_list[i])
@@ -630,12 +648,7 @@ class CalibrationPage(QWidget):
     def save_settings(self) -> None:
         self.calibration_config = self.collect_calibration_config()
         self.save_callback(self.calibration_config)
-
-        QMessageBox.information(
-            self,
-            "Gespeichert",
-            "Die Kalibrierung wurde gespeichert.",
-        )
+        QMessageBox.information(self, "Gespeichert", "Die Kalibrierung wurde gespeichert.")
 
     def reset_all_overlays(self) -> None:
         for card in self.cards:
@@ -660,9 +673,6 @@ class CalibrationPage(QWidget):
         return 2
 
     def capture_reference_global(self) -> None:
-        """
-        Speichert auf allen aktiven Kameras gleichzeitig das aktuelle Livebild als Referenz.
-        """
         active_slots = self._enabled_camera_slots()
         if not active_slots:
             self.global_status_label.setText("Global: keine aktiven Kameras vorhanden")
@@ -673,27 +683,17 @@ class CalibrationPage(QWidget):
             if self.cards[slot].capture_reference_frame():
                 success += 1
 
-        self.camera_detection_map = {0: [], 1: [], 2: []}
-        self.fused_darts = []
-        self._update_fusion_labels()
-
+        self.reset_round_global(update_global_status=False)
         self.global_status_label.setText(
             f"Global: Referenz gespeichert auf {success}/{len(active_slots)} aktiven Kameras"
         )
+        self._update_status_labels()
 
     def arm_detectors_global(self) -> None:
-        """
-        Schaltet alle aktiven Kameras gleichzeitig scharf.
-        """
         active_slots = self._enabled_camera_slots()
         if not active_slots:
             self.global_status_label.setText("Global: keine aktiven Kameras vorhanden")
             return
-
-        # Vor neuem Scharfstellen Runde/Fusion zurücksetzen
-        self.camera_detection_map = {0: [], 1: [], 2: []}
-        self.fused_darts = []
-        self._update_fusion_labels()
 
         success = 0
         for slot in active_slots:
@@ -701,6 +701,8 @@ class CalibrationPage(QWidget):
                 success += 1
 
         if success == len(active_slots):
+            self.event_manager.arm()
+            self.fused_darts = []
             self.global_status_label.setText(
                 f"Global: Auto-Erkennung auf {success}/{len(active_slots)} aktiven Kameras scharf"
             )
@@ -709,56 +711,67 @@ class CalibrationPage(QWidget):
                 f"Global: nur {success}/{len(active_slots)} Kameras scharf – zuerst globale Referenz speichern"
             )
 
-    def reset_fusion_state(self) -> None:
-        """
-        Setzt globale Runde und lokale Detektoren zurück.
-        """
-        self.camera_detection_map = {0: [], 1: [], 2: []}
+        self._update_status_labels()
+
+    def reset_round_global(self, update_global_status: bool = True) -> None:
+        self.event_manager.reset_round()
         self.fused_darts = []
 
         for card in self.cards:
             card.reset_detector_round()
 
-        self._update_fusion_labels()
-        self.global_status_label.setText("Global: Runde und Fusion zurückgesetzt")
+        if update_global_status:
+            self.global_status_label.setText("Global: Runde und Event-Manager zurückgesetzt")
+
+        self._update_status_labels()
 
     def handle_camera_auto_detection(self, camera_index: int, result: DartDetectionResult) -> None:
-        self.camera_detection_map[camera_index].append(result)
-        self._try_fuse_new_darts()
+        accepted = self.event_manager.add_candidate(camera_index, result)
+        if not accepted:
+            return
+        self._update_status_labels()
 
-    def _try_fuse_new_darts(self) -> None:
-        target_dart_index = len(self.fused_darts)
+    def _poll_event_manager(self) -> None:
+        closed_event = self.event_manager.poll_closed_event()
+        if closed_event is None:
+            self.event_status_label.setText(self.event_manager.current_status_text())
+            return
+
+        self._fuse_closed_event(closed_event)
+        self._update_status_labels()
+
+    def _fuse_closed_event(self, closed_event: ClosedDartEvent) -> None:
         candidates: List[CameraBoardCandidate] = []
 
-        active_slots = self._enabled_camera_slots()
-        for slot in active_slots:
-            detections = self.camera_detection_map.get(slot, [])
-            if len(detections) > target_dart_index:
-                det = detections[target_dart_index]
-                candidates.append(
-                    CameraBoardCandidate(
-                        camera_index=slot,
-                        score_label=det.score_label,
-                        score_value=det.score_value,
-                        ring_name=det.ring_name,
-                        board_x=det.board_x,
-                        board_y=det.board_y,
-                        radius=det.radius,
-                    )
+        for item in closed_event.candidates:
+            det = item.detection
+            candidates.append(
+                CameraBoardCandidate(
+                    camera_index=item.camera_index,
+                    score_label=det.score_label,
+                    score_value=det.score_value,
+                    ring_name=det.ring_name,
+                    board_x=det.board_x,
+                    board_y=det.board_y,
+                    radius=det.radius,
                 )
+            )
 
         if len(candidates) < self._minimum_candidates_for_fusion():
-            self._update_fusion_labels()
+            self.fusion_status_label.setText(
+                f"Fusion: Event {closed_event.event_index} verworfen – zu wenige Kandidaten ({len(candidates)})"
+            )
             return
 
         fused = fuse_camera_candidates(
-            dart_index=target_dart_index + 1,
+            dart_index=closed_event.event_index,
             candidates=candidates,
         )
         self.fused_darts.append(fused)
-        self._update_fusion_labels()
 
-    def _update_fusion_labels(self) -> None:
+    def _update_status_labels(self) -> None:
+        self.event_status_label.setText(self.event_manager.current_status_text())
+
         if not self.fused_darts:
             self.fusion_status_label.setText("Fusion: noch keine gemeinsamen Treffer")
             self.fusion_darts_label.setText("Finale Darts: - / - / -")
@@ -772,7 +785,7 @@ class CalibrationPage(QWidget):
         total = sum(d.final_score for d in self.fused_darts)
 
         self.fusion_status_label.setText(
-            f"Fusion: {len(self.fused_darts)} finaler Treffer aus Mehrkamera-Daten berechnet"
+            f"Fusion: {len(self.fused_darts)} finale Darts aus Eventfenstern berechnet"
         )
         self.fusion_darts_label.setText(
             f"Finale Darts: {labels[0]} / {labels[1]} / {labels[2]} | Gesamt: {total}"
