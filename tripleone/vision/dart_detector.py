@@ -1,10 +1,9 @@
 # vision/dart_detector.py
-# Phase Tip-Detection:
-# - erkennt neue Pixel im Boardbereich
-# - sucht plausible Dart-Konturen
-# - erzeugt daraus ein Skelett
-# - nimmt den Endpunkt näher zum Boardzentrum als Spitze
-# - nur die Spitze wird gescored
+# Phase 6.0:
+# - Board-Impact Point Detection
+# - Dartachse bestimmen
+# - entlang der Achse den wahrscheinlichen Einschlagpunkt auf der virtuellen Boardfläche suchen
+# - nur dieser Impact-Point wird gewertet
 
 from __future__ import annotations
 
@@ -72,7 +71,7 @@ class DartDetector:
         self._last_candidate: Optional[Tuple[int, int]] = None
         self._stable_counter: int = 0
 
-        # Die UI nutzt das aktuell noch
+        # Aktuell noch von der UI verwendet
         self.detected_darts: List[DartDetectionResult] = []
 
         self._last_debug = DartDebugSnapshot(
@@ -179,7 +178,6 @@ class DartDetector:
         pts_np = np.array(pts, dtype=np.int32)
         cv2.fillConvexPoly(mask, pts_np, 255, lineType=cv2.LINE_AA)
 
-        # Etwas größer, damit Barrel/Flight am Rand nicht abgeschnitten werden
         kernel = np.ones((35, 35), np.uint8)
         mask = cv2.dilate(mask, kernel, iterations=1)
 
@@ -256,52 +254,10 @@ class DartDetector:
         x_board, y_board = projected
         return math.sqrt(x_board * x_board + y_board * y_board)
 
-    def _skeletonize(self, binary_mask: np.ndarray) -> np.ndarray:
+    def _pca_axis(self, contour: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         """
-        Morphologische Skelettierung ohne Zusatzmodule.
+        Gibt Mittelpunkt und Hauptrichtung der Kontur zurück.
         """
-        img = binary_mask.copy()
-        skeleton = np.zeros_like(img)
-        element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
-
-        while True:
-            eroded = cv2.erode(img, element)
-            temp = cv2.dilate(eroded, element)
-            temp = cv2.subtract(img, temp)
-            skeleton = cv2.bitwise_or(skeleton, temp)
-            img = eroded.copy()
-
-            if cv2.countNonZero(img) == 0:
-                break
-
-        return skeleton
-
-    def _find_skeleton_endpoints(self, skeleton: np.ndarray) -> List[Tuple[int, int]]:
-        """
-        Endpunkt = Skelettpixel mit genau einem Nachbarn.
-        """
-        endpoints: List[Tuple[int, int]] = []
-
-        ys, xs = np.where(skeleton > 0)
-        if len(xs) == 0:
-            return endpoints
-
-        h, w = skeleton.shape[:2]
-
-        for x, y in zip(xs, ys):
-            x0 = max(0, x - 1)
-            x1 = min(w, x + 2)
-            y0 = max(0, y - 1)
-            y1 = min(h, y + 2)
-
-            roi = skeleton[y0:y1, x0:x1]
-            neighbors = int(np.count_nonzero(roi)) - 1
-            if neighbors == 1:
-                endpoints.append((x, y))
-
-        return endpoints
-
-    def _pca_endpoints(self, contour: np.ndarray) -> Optional[Tuple[Tuple[int, int], Tuple[int, int]]]:
         pts = contour.reshape(-1, 2).astype(np.float32)
         if len(pts) < 5:
             return None
@@ -312,83 +268,111 @@ class DartDetector:
 
         center = mean[0]
         direction = eigenvectors[0]
+        norm = np.linalg.norm(direction)
+        if norm <= 1e-6:
+            return None
 
-        projections = np.dot(pts - center, direction)
-        min_idx = int(np.argmin(projections))
-        max_idx = int(np.argmax(projections))
+        direction = direction / norm
+        return center, direction
 
-        p1 = pts[min_idx]
-        p2 = pts[max_idx]
-
-        return (
-            (int(round(float(p1[0]))), int(round(float(p1[1])))),
-            (int(round(float(p2[0]))), int(round(float(p2[1])))),
-        )
-
-    def _tip_from_endpoints(
+    def _sample_axis_impact_point(
         self,
-        endpoints: List[Tuple[int, int]],
+        center: np.ndarray,
+        direction: np.ndarray,
+        contour: np.ndarray,
         calibration: Dict,
+        frame_shape: Tuple[int, int, int],
     ) -> Tuple[Optional[Tuple[int, int]], Optional[float], str]:
-        if not endpoints:
-            return None, None, "Keine Endpunkte"
+        """
+        Sucht entlang der Dartachse den Punkt, der die virtuelle Boardfläche
+        am wahrscheinlichsten trifft.
 
-        endpoint_radii: List[Tuple[Tuple[int, int], float]] = []
+        Idee:
+        - wir nehmen beide Richtungen der Achse
+        - sampeln viele Punkte entlang der Linie
+        - behalten nur Punkte innerhalb / nahe der Kontur
+        - projizieren sie in den Boardraum
+        - der Punkt mit kleinstem Radius innerhalb sinnvoller Boardfläche ist der Impact-Point
+        """
+        h, w = frame_shape[:2]
 
-        for x_px, y_px in endpoints:
-            radius = self._board_radius_of_pixel(x_px, y_px, calibration)
-            if radius is None:
-                continue
-            endpoint_radii.append(((x_px, y_px), radius))
+        # Konturmaske für "liegt der Punkt auf dem Dartobjekt?"
+        contour_mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.drawContours(contour_mask, [contour], -1, 255, thickness=cv2.FILLED)
 
-        if not endpoint_radii:
-            return None, None, "Endpunkte nicht projizierbar"
+        # Länge des Bounding-Rechtecks als Sampling-Bereich
+        x, y, bw, bh = cv2.boundingRect(contour)
+        half_length = float(max(bw, bh)) * 0.9
+        step = 1.5
 
-        endpoint_radii.sort(key=lambda item: item[1])
-        tip, tip_radius = endpoint_radii[0]
+        candidates: List[Tuple[Tuple[int, int], float]] = []
 
-        if tip_radius > 1.10:
-            return None, None, f"Tip zu weit außen ({tip_radius:.3f})"
+        for sign in (-1.0, 1.0):
+            t = 0.0
+            while t <= half_length:
+                px = center[0] + sign * direction[0] * t
+                py = center[1] + sign * direction[1] * t
 
-        return tip, tip_radius, "OK"
+                ix = int(round(float(px)))
+                iy = int(round(float(py)))
 
-    def _estimate_tip_from_contour(
+                if ix < 0 or iy < 0 or ix >= w or iy >= h:
+                    t += step
+                    continue
+
+                # Punkt muss auf dem Dartblob oder direkt an seinem Rand liegen
+                if contour_mask[iy, ix] == 0:
+                    t += step
+                    continue
+
+                radius = self._board_radius_of_pixel(ix, iy, calibration)
+                if radius is None:
+                    t += step
+                    continue
+
+                # Nur Punkte im sinnvollen Boardbereich
+                if radius <= 1.08:
+                    candidates.append(((ix, iy), radius))
+
+                t += step
+
+        if not candidates:
+            return None, None, "Keine Impact-Samples gefunden"
+
+        # kleinster Radius = am ehesten Spitze/Impact
+        candidates.sort(key=lambda item: item[1])
+        impact_point, impact_radius = candidates[0]
+
+        return impact_point, impact_radius, "OK"
+
+    def _estimate_impact_point_from_contour(
         self,
         contour: np.ndarray,
         calibration: Dict,
         frame_shape: Tuple[int, int, int],
     ) -> Tuple[Optional[Tuple[int, int]], Optional[float], str]:
         """
-        Robuste Spitzen-Schätzung:
-        1. lokale Konturmaske
-        2. Skelettierung
-        3. Endpunkte
-        4. Endpunkt näher zum Zentrum = Spitze
-        Fallback: PCA-Endpunkte
+        Hauptlogik Phase 6.0:
+        - Dartachse per PCA
+        - virtuellen Impact-Point entlang der Achse suchen
         """
-        h, w = frame_shape[:2]
-        local_mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.drawContours(local_mask, [contour], -1, 255, thickness=cv2.FILLED)
+        axis = self._pca_axis(contour)
+        if axis is None:
+            return None, None, "Keine PCA-Achse"
 
-        skeleton = self._skeletonize(local_mask)
-        endpoints = self._find_skeleton_endpoints(skeleton)
+        center, direction = axis
 
-        # Wenn zu viele Endpunkte, auf die plausibelsten reduzieren
-        if len(endpoints) >= 2:
-            tip, tip_radius, reason = self._tip_from_endpoints(endpoints, calibration)
-            if tip is not None:
-                return tip, tip_radius, reason
+        impact_point, impact_radius, reason = self._sample_axis_impact_point(
+            center=center,
+            direction=direction,
+            contour=contour,
+            calibration=calibration,
+            frame_shape=frame_shape,
+        )
+        if impact_point is None:
+            return None, None, reason
 
-        # Fallback auf PCA-Endpunkte
-        pca_ends = self._pca_endpoints(contour)
-        if pca_ends is None:
-            return None, None, "Keine PCA-Endpunkte"
-
-        tip, tip_radius, reason = self._tip_from_endpoints(list(pca_ends), calibration)
-        if tip is None:
-            return None, None, f"PCA-Fallback fehlgeschlagen: {reason}"
-
-        return tip, tip_radius, "OK (PCA-Fallback)"
+        return impact_point, impact_radius, "OK"
 
     def _candidate_is_new(self, x_px: int, y_px: int) -> bool:
         for dart in self.detected_darts:
@@ -455,27 +439,31 @@ class DartDetector:
 
         for contour in valid_contours:
             area, aspect_ratio, fill_ratio = self._contour_metrics(contour)
-            tip, tip_radius, reason = self._estimate_tip_from_contour(contour, calibration, frame_bgr.shape)
+            impact_point, impact_radius, reason = self._estimate_impact_point_from_contour(
+                contour=contour,
+                calibration=calibration,
+                frame_shape=frame_bgr.shape,
+            )
 
-            if tip is None:
+            if impact_point is None:
                 reject_reason = reason
-                info_text = "Kontur vorhanden, aber keine Spitze"
+                info_text = "Kontur vorhanden, aber kein Board-Impact"
                 continue
 
-            tx, ty = tip
+            tx, ty = impact_point
 
             if not self._candidate_is_new(tx, ty):
                 reject_reason = "Zu nah an vorhandenem Dart"
-                info_text = "Kandidat verworfen"
+                info_text = "Impact-Kandidat verworfen"
                 continue
 
-            best_tip = tip
+            best_tip = impact_point
             best_area = area
             best_aspect = aspect_ratio
             best_fill = fill_ratio
-            best_tip_radius = tip_radius
+            best_tip_radius = impact_radius
             reject_reason = "OK"
-            info_text = "Spitze erfolgreich geschätzt"
+            info_text = "Board-Impact-Point erfolgreich geschätzt"
             break
 
         if best_tip is None:
@@ -506,7 +494,7 @@ class DartDetector:
                 chosen_tip_y=ty,
                 chosen_tip_radius=best_tip_radius,
                 reject_reason="Warte auf Stabilisierung",
-                info_text="Erster Spitzen-Kandidatenframe",
+                info_text="Erster Impact-Kandidatenframe",
             )
             return None
 
@@ -533,7 +521,7 @@ class DartDetector:
                 chosen_tip_y=ty,
                 chosen_tip_radius=best_tip_radius,
                 reject_reason=f"Stabilisierung {self._stable_counter}/{self.required_stable_frames}",
-                info_text="Kandidat noch nicht stabil genug",
+                info_text="Impact-Kandidat noch nicht stabil genug",
             )
             return None
 
@@ -568,7 +556,7 @@ class DartDetector:
                 chosen_tip_y=ty,
                 chosen_tip_radius=best_tip_radius,
                 reject_reason="MISS verworfen",
-                info_text="Spitze lag außerhalb",
+                info_text="Impact lag außerhalb",
             )
             return None
 
@@ -602,7 +590,7 @@ class DartDetector:
             chosen_tip_y=ty,
             chosen_tip_radius=best_tip_radius,
             reject_reason="OK",
-            info_text=f"Spitzen-Treffer erkannt: {result.score_label} = {result.score_value}",
+            info_text=f"Impact-Treffer erkannt: {result.score_label} = {result.score_value}",
         )
 
         return result
