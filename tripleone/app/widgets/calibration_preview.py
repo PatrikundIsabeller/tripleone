@@ -1,585 +1,825 @@
 # app/widgets/calibration_preview.py
-# Diese Datei enthält das Vorschau-Widget für die Kalibrierungsseite.
-# Es zeigt das Livebild der Kamera und zeichnet darüber ein per Homography
-# verzerrtes Dartboard-Overlay.
+# Reset K1:
+# - nur 4 manuelle Marker
+# - Bullzentrum wird automatisch berechnet
+# - Präzisionslupe für aktiven Marker
+# - feines Justieren per Maus + Pfeiltasten
 #
-# Phase 3.4b:
-# - 4 Boundary-Punkte + 1 Center-Punkt
-# - echtes Homography-Overlay
-#
-# Phase 3.5:
-# - visuelle Trefferanzeige im Kamerabild
-# - Trefferanzeige im kanonischen Board
-# - Rechtsklick = Score-Test
+# Marker-Bedeutung:
+# P1 = 20|1 auf äußerem Double-Draht
+# P2 = 6|10 auf äußerem Double-Draht
+# P3 = 3|19 auf äußerem Double-Draht
+# P4 = 11|14 auf äußerem Double-Draht
 
 from __future__ import annotations
 
 import math
+from copy import deepcopy
 from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import Qt, QRectF, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPen, QMouseEvent, QPixmap
-from PyQt6.QtWidgets import QWidget
-
-from vision.board_model import (
-    SECTOR_ORDER,
-    RING_RADII,
-    build_overlay_to_image_homography,
-    project_image_point_to_board,
-    board_point_to_overlay_pixel,
+from PyQt6.QtCore import QPoint, QPointF, QRectF, Qt, pyqtSignal
+from PyQt6.QtGui import (
+    QColor,
+    QFont,
+    QImage,
+    QKeyEvent,
+    QMouseEvent,
+    QPaintEvent,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+    QWheelEvent,
 )
-
-
-POINT_LABELS = ["P1", "P2", "P3", "P4", "C"]
+from PyQt6.QtWidgets import QWidget
 
 
 class CalibrationPreview(QWidget):
+    """
+    Reset K1:
+    - 4 manuelle Marker
+    - Bull wird automatisch aus Homography berechnet
+    - Rechtsklick = Testpunkt
+    - aktive Marker-Lupe
+    - Pfeiltasten = Feinjustage
+    """
+
     points_changed = pyqtSignal(list)
     test_point_selected = pyqtSignal(int, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumHeight(320)
-        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
-        self._image: Optional[QImage] = None
-        self._status_text = "Keine Vorschau"
+        self._frame: Optional[QImage] = None
+        self._overlay_config: Dict = {}
+        self._manual_points: List[Dict[str, int]] = []
+        self._test_point: Optional[Tuple[int, int]] = None
+        self._status_text: str = ""
 
-        self._overlay_config: Dict = {
-            "frame_width": 1280,
-            "frame_height": 720,
-            "overlay_alpha": 0.90,
-            "show_numbers": True,
-            "show_sector_lines": True,
-            "points": [
-                {"x_px": 930, "y_px": 233},
-                {"x_px": 1051, "y_px": 609},
-                {"x_px": 462, "y_px": 478},
-                {"x_px": 621, "y_px": 217},
-                {"x_px": 748, "y_px": 361},
-            ],
-        }
+        self._active_point_index: Optional[int] = None
+        self._dragging: bool = False
+        self._drag_anchor_img: Optional[Tuple[float, float]] = None
+        self._drag_anchor_point: Optional[Tuple[float, float]] = None
 
-        self._dragging_index: Optional[int] = None
-        self._hover_index: Optional[int] = None
-        self._test_point_px: Optional[Tuple[int, int]] = None
-        self._test_board_point: Optional[Tuple[float, float]] = None
-        self._last_mouse_frame_pos: Optional[Tuple[int, int]] = None
+        self._loupe_zoom: int = 10
+        self._loupe_radius_px: int = 14
+        self._marker_radius_px: int = 10
+        self._selection_distance_px: int = 22
 
-        self._loupe_source_half_size = 28
-        self._loupe_size_px = 220
-        self._loupe_margin_px = 14
+        self._label_font = QFont("Arial", 10, QFont.Weight.Bold)
+        self._small_font = QFont("Arial", 8)
+
+    # ------------------------------------------------------------
+    # Öffentliche API
+    # ------------------------------------------------------------
+
+    def set_frame(self, image: QImage) -> None:
+        self._frame = image
+        self.update()
+
+    def clear_frame(self) -> None:
+        self._frame = None
+        self.update()
 
     def set_status_text(self, text: str) -> None:
         self._status_text = text
         self.update()
 
-    def set_frame(self, image: QImage) -> None:
-        self._image = image
-        self.update()
-
-    def clear_frame(self) -> None:
-        self._image = None
-        self._test_point_px = None
-        self._test_board_point = None
-        self._last_mouse_frame_pos = None
-        self.update()
-
-    def set_overlay_config(self, config: Dict) -> None:
-        self._overlay_config = dict(config)
-        self.update()
-
     def set_test_point(self, x_px: int, y_px: int) -> None:
-        self._test_point_px = (x_px, y_px)
-        self._test_board_point = project_image_point_to_board(x_px, y_px, self._overlay_config)
+        self._test_point = (int(x_px), int(y_px))
         self.update()
 
     def clear_test_point(self) -> None:
-        self._test_point_px = None
-        self._test_board_point = None
+        self._test_point = None
         self.update()
 
-    def _get_image_rect(self) -> Optional[QRectF]:
-        if self._image is None or self._image.width() <= 0 or self._image.height() <= 0:
-            return None
+    def set_overlay_config(self, config: Dict) -> None:
+        self._overlay_config = deepcopy(config)
 
-        widget_w = self.width()
-        widget_h = self.height()
-        image_w = self._image.width()
-        image_h = self._image.height()
+        points = deepcopy(config.get("points", []))
+        # Reset K1:
+        # nur die ersten 4 Punkte sind manuell ziehbar
+        self._manual_points = points[:4]
 
-        scale = min(widget_w / image_w, widget_h / image_h)
-        draw_w = image_w * scale
-        draw_h = image_h * scale
+        self.update()
 
-        x = (widget_w - draw_w) / 2.0
-        y = (widget_h - draw_h) / 2.0
+    # ------------------------------------------------------------
+    # Geometrie / Hilfsfunktionen
+    # ------------------------------------------------------------
+
+    def _image_size(self) -> Tuple[int, int]:
+        if self._frame is None:
+            return 1280, 720
+        return self._frame.width(), self._frame.height()
+
+    def _frame_rect(self) -> QRectF:
+        """
+        Rechteck, in dem das Bild letterboxed dargestellt wird.
+        """
+        w = self.width()
+        h = self.height()
+
+        img_w, img_h = self._image_size()
+        if img_w <= 0 or img_h <= 0:
+            return QRectF(0, 0, w, h)
+
+        scale = min(w / img_w, h / img_h)
+        draw_w = img_w * scale
+        draw_h = img_h * scale
+
+        x = (w - draw_w) / 2.0
+        y = (h - draw_h) / 2.0
         return QRectF(x, y, draw_w, draw_h)
 
-    def _frame_to_widget(self, image_rect: QRectF, x_px: float, y_px: float) -> Tuple[float, float]:
-        frame_width = max(1, int(self._overlay_config.get("frame_width", 1280)))
-        frame_height = max(1, int(self._overlay_config.get("frame_height", 720)))
+    def _widget_to_image(self, widget_pos: QPointF) -> Optional[Tuple[float, float]]:
+        if self._frame is None:
+            return None
 
-        x = image_rect.left() + (x_px / frame_width) * image_rect.width()
-        y = image_rect.top() + (y_px / frame_height) * image_rect.height()
-        return x, y
+        rect = self._frame_rect()
+        if not rect.contains(widget_pos):
+            return None
 
-    def _widget_to_frame(self, image_rect: QRectF, x_widget: float, y_widget: float) -> Tuple[int, int]:
-        frame_width = max(1, int(self._overlay_config.get("frame_width", 1280)))
-        frame_height = max(1, int(self._overlay_config.get("frame_height", 720)))
+        img_w, img_h = self._image_size()
+        rel_x = (widget_pos.x() - rect.x()) / rect.width()
+        rel_y = (widget_pos.y() - rect.y()) / rect.height()
 
-        x_px = int(round(((x_widget - image_rect.left()) / image_rect.width()) * frame_width))
-        y_px = int(round(((y_widget - image_rect.top()) / image_rect.height()) * frame_height))
-
-        x_px = max(0, min(x_px, frame_width - 1))
-        y_px = max(0, min(y_px, frame_height - 1))
+        x_px = rel_x * img_w
+        y_px = rel_y * img_h
         return x_px, y_px
 
-    def _get_points_frame(self) -> List[Tuple[int, int]]:
-        points = self._overlay_config.get("points", [])
-        result = []
+    def _image_to_widget(self, x_px: float, y_px: float) -> QPointF:
+        rect = self._frame_rect()
+        img_w, img_h = self._image_size()
 
-        for i in range(5):
-            raw = points[i] if i < len(points) and isinstance(points[i], dict) else {"x_px": 0, "y_px": 0}
-            result.append((int(raw.get("x_px", 0)), int(raw.get("y_px", 0))))
-        return result
+        if img_w <= 0 or img_h <= 0:
+            return QPointF(0, 0)
 
-    def _set_point(self, index: int, x_px: int, y_px: int) -> None:
-        frame_width = max(1, int(self._overlay_config.get("frame_width", 1280)))
-        frame_height = max(1, int(self._overlay_config.get("frame_height", 720)))
+        x = rect.x() + (x_px / img_w) * rect.width()
+        y = rect.y() + (y_px / img_h) * rect.height()
+        return QPointF(x, y)
 
-        x_px = max(0, min(x_px, frame_width - 1))
-        y_px = max(0, min(y_px, frame_height - 1))
+    def _clamp_to_image(self, x_px: float, y_px: float) -> Tuple[int, int]:
+        img_w, img_h = self._image_size()
+        x_px = max(0, min(img_w - 1, round(x_px)))
+        y_px = max(0, min(img_h - 1, round(y_px)))
+        return int(x_px), int(y_px)
 
-        points = list(self._overlay_config.get("points", []))
-        while len(points) < 5:
+    # ------------------------------------------------------------
+    # Feste 4-Punkt-Geometrie
+    # ------------------------------------------------------------
+
+    def _dest_point_on_outer_double(self, boundary_angle_deg: float) -> Tuple[float, float]:
+        s = 900.0
+        cx = s / 2.0
+        cy = s / 2.0
+        r = s * 0.36
+
+        a = math.radians(boundary_angle_deg)
+        x = cx + math.cos(a) * r
+        y = cy - math.sin(a) * r
+        return x, y
+
+    def _topdown_destination_points(self) -> np.ndarray:
+        """
+        Feste Referenzpunkte auf dem äußeren Double-Draht.
+        """
+        p1 = self._dest_point_on_outer_double(81.0)   # 20|1
+        p2 = self._dest_point_on_outer_double(351.0)  # 6|10
+        p3 = self._dest_point_on_outer_double(261.0)  # 3|19
+        p4 = self._dest_point_on_outer_double(171.0)  # 11|14
+        return np.array([p1, p2, p3, p4], dtype=np.float32)
+
+    def _src_points_array(self) -> Optional[np.ndarray]:
+        if len(self._manual_points) != 4:
+            return None
+
+        src = []
+        for item in self._manual_points:
+            src.append([float(item["x_px"]), float(item["y_px"])])
+        return np.array(src, dtype=np.float32)
+
+    def _homography_image_to_topdown(self) -> Optional[np.ndarray]:
+        src = self._src_points_array()
+        if src is None:
+            return None
+        dst = self._topdown_destination_points()
+        return cv2.getPerspectiveTransform(src, dst)
+
+    def _homography_topdown_to_image(self) -> Optional[np.ndarray]:
+        src = self._src_points_array()
+        if src is None:
+            return None
+        dst = self._topdown_destination_points()
+        return cv2.getPerspectiveTransform(dst, src)
+
+    def _project_topdown_points_to_image(self, pts_topdown: np.ndarray) -> Optional[np.ndarray]:
+        """
+        pts_topdown: shape (N, 2)
+        """
+        h_inv = self._homography_topdown_to_image()
+        if h_inv is None:
+            return None
+
+        pts = pts_topdown.reshape(-1, 1, 2).astype(np.float32)
+        mapped = cv2.perspectiveTransform(pts, h_inv)
+        return mapped.reshape(-1, 2)
+
+    def _computed_bull_image_point(self) -> Optional[Tuple[float, float]]:
+        """
+        Bull wird aus Homography berechnet, nicht manuell gezogen.
+        """
+        center_top = np.array([[450.0, 450.0]], dtype=np.float32)
+        mapped = self._project_topdown_points_to_image(center_top)
+        if mapped is None:
+            return None
+        return float(mapped[0, 0]), float(mapped[0, 1])
+
+    def _computed_config_points(self) -> List[Dict[str, int]]:
+        """
+        Liefert 5 Punkte zurück:
+        - 4 manuelle
+        - 1 berechneter Bull
+        Damit bleibt die restliche Pipeline kompatibel.
+        """
+        points = deepcopy(self._manual_points)
+
+        bull = self._computed_bull_image_point()
+        if bull is None:
             points.append({"x_px": 0, "y_px": 0})
+        else:
+            bx, by = self._clamp_to_image(*bull)
+            points.append({"x_px": bx, "y_px": by})
 
-        points[index] = {"x_px": x_px, "y_px": y_px}
-        self._overlay_config["points"] = points
+        return points
 
-    def _find_near_point(self, image_rect: QRectF, x_widget: float, y_widget: float) -> Optional[int]:
-        points = self._get_points_frame()
+    # ------------------------------------------------------------
+    # Overlay-Erzeugung
+    # ------------------------------------------------------------
 
-        best_idx = None
-        best_dist = 999999.0
-
-        for i, (x_px, y_px) in enumerate(points):
-            xw, yw = self._frame_to_widget(image_rect, x_px, y_px)
-            dx = x_widget - xw
-            dy = y_widget - yw
-            dist = math.sqrt(dx * dx + dy * dy)
-
-            if dist < 24.0 and dist < best_dist:
-                best_idx = i
-                best_dist = dist
-
-        return best_idx
-
-    def _draw_text_with_outline(
-        self,
-        img: np.ndarray,
-        text: str,
-        x: int,
-        y: int,
-        font_scale: float,
-        fill_bgra: Tuple[int, int, int, int],
-        outline_bgra: Tuple[int, int, int, int],
-        fill_thickness: int = 2,
-        outline_thickness: int = 8,
-    ) -> None:
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        cv2.putText(img, text, (x, y), font, font_scale, outline_bgra, outline_thickness, lineType=cv2.LINE_AA)
-        cv2.putText(img, text, (x, y), font, font_scale, fill_bgra, fill_thickness, lineType=cv2.LINE_AA)
-
-    def _draw_line_with_shadow(
-        self,
-        img: np.ndarray,
-        p1: Tuple[int, int],
-        p2: Tuple[int, int],
-        line_bgra: Tuple[int, int, int, int],
-        shadow_bgra: Tuple[int, int, int, int],
-        line_thickness: int = 3,
-        shadow_thickness: int = 7,
-    ) -> None:
-        cv2.line(img, p1, p2, shadow_bgra, shadow_thickness, lineType=cv2.LINE_AA)
-        cv2.line(img, p1, p2, line_bgra, line_thickness, lineType=cv2.LINE_AA)
-
-    def _draw_circle_with_shadow(
-        self,
-        img: np.ndarray,
-        center: Tuple[int, int],
-        radius: int,
-        line_bgra: Tuple[int, int, int, int],
-        shadow_bgra: Tuple[int, int, int, int],
-        line_thickness: int,
-        shadow_thickness: int,
-    ) -> None:
-        cv2.circle(img, center, radius, shadow_bgra, shadow_thickness, lineType=cv2.LINE_AA)
-        cv2.circle(img, center, radius, line_bgra, line_thickness, lineType=cv2.LINE_AA)
-
-    def _draw_hit_marker_on_overlay(self, img: np.ndarray, size: int) -> None:
+    def _relative_radii(self) -> List[float]:
         """
-        Zeichnet den zuletzt geklickten Treffer im kanonischen Overlay.
+        Standardisierte Ringradien relativ zum äußeren Double-Radius.
         """
-        if self._test_board_point is None:
-            return
-
-        x_board, y_board = self._test_board_point
-        hx, hy = board_point_to_overlay_pixel(x_board, y_board, size)
-
-        cv2.circle(img, (hx, hy), 10, (0, 0, 0, 255), 4, lineType=cv2.LINE_AA)
-        cv2.circle(img, (hx, hy), 10, (0, 255, 180, 255), 2, lineType=cv2.LINE_AA)
-        cv2.line(img, (hx - 14, hy), (hx + 14, hy), (0, 255, 180, 255), 2, lineType=cv2.LINE_AA)
-        cv2.line(img, (hx, hy - 14), (hx, hy + 14), (0, 255, 180, 255), 2, lineType=cv2.LINE_AA)
-
-    def _create_canonical_overlay_rgba(self, size: int = 1600) -> np.ndarray:
-        img = np.zeros((size, size, 4), dtype=np.uint8)
-
-        alpha_factor = float(self._overlay_config.get("overlay_alpha", 0.90))
-        alpha = max(0, min(255, int(alpha_factor * 255)))
-
-        show_numbers = bool(self._overlay_config.get("show_numbers", True))
-        show_sector_lines = bool(self._overlay_config.get("show_sector_lines", True))
-
-        cx = size // 2
-        cy = size // 2
-        r = int(size * 0.40)
-
-        board_fill = (255, 120, 40, int(alpha * 0.30))
-        sector_highlight = (255, 0, 110, int(alpha * 0.82))
-        ring_white = (245, 245, 245, min(255, alpha))
-        shadow = (10, 10, 10, min(220, alpha))
-        text_fill = (255, 255, 255, 255)
-        text_outline = (0, 0, 0, 255)
-
-        cv2.circle(img, (cx, cy), r, board_fill, -1, lineType=cv2.LINE_AA)
-
-        # Highlight Segment 20
-        highlight_index = 0
-        start_deg = -90.0 - 9.0 + highlight_index * 18.0
-        end_deg = start_deg + 18.0
-
-        pts = [(cx, cy)]
-        for a in np.linspace(start_deg, end_deg, 20):
-            rad = math.radians(a)
-            pts.append((int(cx + math.cos(rad) * r), int(cy + math.sin(rad) * r)))
-        pts_np = np.array(pts, dtype=np.int32)
-        cv2.fillConvexPoly(img, pts_np, sector_highlight, lineType=cv2.LINE_AA)
-
-        ring_order = [
-            RING_RADII["inner_bull"],
-            RING_RADII["outer_bull"],
-            RING_RADII["triple_inner"],
-            RING_RADII["triple_outer"],
-            RING_RADII["double_inner"],
-            RING_RADII["double_outer"],
+        return [
+            1.000000,            # äußerer Double-Rand
+            162.0 / 170.0,       # innerer Double-Rand
+            107.0 / 170.0,       # äußerer Triple-Rand
+            99.0 / 170.0,        # innerer Triple-Rand
+            15.9 / 170.0,        # äußerer Bull-Rand
+            6.35 / 170.0,        # innerer Bull-Rand
         ]
 
-        for rel_radius in ring_order:
-            rr = int(round(r * rel_radius))
-            self._draw_circle_with_shadow(img, (cx, cy), rr, ring_white, shadow, 3, 7)
+    def _ring_polylines_image(self) -> List[np.ndarray]:
+        polylines = []
 
-        if show_sector_lines:
-            start_angle_deg = -90.0 - 9.0
-            for i in range(20):
-                angle_deg = start_angle_deg + i * 18.0
-                angle_rad = math.radians(angle_deg)
-                x2 = int(cx + math.cos(angle_rad) * r)
-                y2 = int(cy + math.sin(angle_rad) * r)
-                self._draw_line_with_shadow(img, (cx, cy), (x2, y2), ring_white, shadow, 2, 6)
+        rel_radii = self._relative_radii()
+        outer_r = 900.0 * 0.36
+        cx = 450.0
+        cy = 450.0
 
-        if show_numbers:
-            number_radius = int(r * 1.19)
-            for i, value in enumerate(SECTOR_ORDER):
-                angle_deg = -90.0 + i * 18.0
-                angle_rad = math.radians(angle_deg)
-                x = int(cx + math.cos(angle_rad) * number_radius)
-                y = int(cy + math.sin(angle_rad) * number_radius)
+        for rel_r in rel_radii:
+            r = outer_r * rel_r
+            pts = []
+            for deg in range(0, 361, 3):
+                a = math.radians(deg)
+                x = cx + math.cos(a) * r
+                y = cy - math.sin(a) * r
+                pts.append([x, y])
 
-                text = str(value)
-                font_scale = 1.05
-                (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 2)
+            pts_np = np.array(pts, dtype=np.float32)
+            mapped = self._project_topdown_points_to_image(pts_np)
+            if mapped is not None:
+                polylines.append(mapped)
 
-                tx = x - tw // 2
-                ty = y + th // 2
+        return polylines
 
-                self._draw_text_with_outline(
-                    img=img,
-                    text=text,
-                    x=tx,
-                    y=ty,
-                    font_scale=font_scale,
-                    fill_bgra=text_fill,
-                    outline_bgra=text_outline,
-                    fill_thickness=2,
-                    outline_thickness=7,
-                )
+    def _sector_lines_image(self) -> List[np.ndarray]:
+        lines = []
 
-        cv2.circle(img, (cx, cy), 5, (0, 255, 255, 255), -1, lineType=cv2.LINE_AA)
-        cv2.circle(img, (cx, cy), 12, (0, 255, 255, 220), 1, lineType=cv2.LINE_AA)
+        cx = 450.0
+        cy = 450.0
+        outer_r = 900.0 * 0.36
 
-        self._draw_hit_marker_on_overlay(img, size)
-        return img
+        # Segmentgrenzen alle 18°
+        # Startgrenze 20|1 bei 81°
+        for i in range(20):
+            angle_deg = 81.0 - i * 18.0
+            a = math.radians(angle_deg)
 
-    def _warp_overlay_to_frame(self) -> Optional[np.ndarray]:
-        frame_width = max(1, int(self._overlay_config.get("frame_width", 1280)))
-        frame_height = max(1, int(self._overlay_config.get("frame_height", 720)))
+            p0 = [cx, cy]
+            p1 = [cx + math.cos(a) * outer_r, cy - math.sin(a) * outer_r]
 
-        overlay = self._create_canonical_overlay_rgba(size=1600)
-        h = build_overlay_to_image_homography(self._overlay_config, overlay.shape[0])
-        if h is None:
-            return None
+            pts_np = np.array([p0, p1], dtype=np.float32)
+            mapped = self._project_topdown_points_to_image(pts_np)
+            if mapped is not None:
+                lines.append(mapped)
 
-        try:
-            warped = cv2.warpPerspective(
-                overlay,
-                h,
-                (frame_width, frame_height),
-                flags=cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_CONSTANT,
-                borderValue=(0, 0, 0, 0),
-            )
-        except cv2.error:
-            return None
+        return lines
 
-        return warped
+    def _segment_label_positions(self) -> List[Tuple[str, Tuple[float, float]]]:
+        """
+        Zahlen leicht außerhalb des Double-Rings.
+        """
+        order = [20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 12, 5]
 
-    def _numpy_rgba_to_qimage(self, rgba_img: np.ndarray) -> QImage:
-        h, w, ch = rgba_img.shape
-        bytes_per_line = ch * w
-        return QImage(rgba_img.data, w, h, bytes_per_line, QImage.Format.Format_RGBA8888).copy()
+        cx = 450.0
+        cy = 450.0
+        label_r = 900.0 * 0.405
 
-    def _frame_qimage_to_bgr(self) -> Optional[np.ndarray]:
-        if self._image is None:
-            return None
+        positions = []
+        for i, value in enumerate(order):
+            center_angle_deg = 72.0 - i * 18.0
+            a = math.radians(center_angle_deg)
+            x = cx + math.cos(a) * label_r
+            y = cy - math.sin(a) * label_r
+            positions.append((str(value), (x, y)))
 
-        image = self._image.convertToFormat(QImage.Format.Format_RGBA8888)
-        width = image.width()
-        height = image.height()
+        return positions
 
-        ptr = image.bits()
-        ptr.setsize(height * width * 4)
+    def _sector_wedge_image(
+        self,
+        start_angle_deg: float,
+        end_angle_deg: float,
+        inner_radius_rel: float = 0.0,
+        outer_radius_rel: float = 1.0,
+        steps: int = 48,
+    ) -> Optional[np.ndarray]:
+        """
+        Erzeugt einen Sektor als Polygon im Bildraum.
+        Winkel:
+        0° = rechts, 90° = oben
 
-        arr = np.frombuffer(ptr, dtype=np.uint8).reshape((height, width, 4))
-        bgr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
-        return bgr
+        Für das 20er-Segment:
+        Grenzen sind 99° und 81°.
+        """
+        cx = 450.0
+        cy = 450.0
+        outer_r = 900.0 * 0.36
+        r0 = outer_r * inner_radius_rel
+        r1 = outer_r * outer_radius_rel
 
-    def _draw_loupe(self, painter: QPainter, image_rect: QRectF) -> None:
-        active_index = self._dragging_index if self._dragging_index is not None else self._hover_index
-        if active_index is None:
+        if end_angle_deg > start_angle_deg:
+            angles_outer = np.linspace(start_angle_deg, end_angle_deg, steps)
+        else:
+            angles_outer = np.linspace(start_angle_deg, end_angle_deg, steps)
+
+        outer_pts = []
+        for deg in angles_outer:
+            a = math.radians(deg)
+            x = cx + math.cos(a) * r1
+            y = cy - math.sin(a) * r1
+            outer_pts.append([x, y])
+
+        inner_pts = []
+        for deg in reversed(angles_outer):
+            a = math.radians(deg)
+            x = cx + math.cos(a) * r0
+            y = cy - math.sin(a) * r0
+            inner_pts.append([x, y])
+
+        poly_top = np.array(outer_pts + inner_pts, dtype=np.float32)
+        mapped = self._project_topdown_points_to_image(poly_top)
+        return mapped    
+
+    def _draw_highlighted_twenty_segment(self, painter: QPainter) -> None:
+        """
+        Zeichnet das 20er-Segment rot/pink als visuelle Referenz.
+        Das ist nur optisch und beeinflusst die Kalibrierung nicht.
+        """
+        if len(self._manual_points) != 4:
             return
 
-        frame_bgr = self._frame_qimage_to_bgr()
-        if frame_bgr is None:
+        alpha = float(self._overlay_config.get("overlay_alpha", 0.35))
+
+        # 20-Segment liegt zwischen den Grenzen:
+        # 20|5 = 99°
+        # 20|1 = 81°
+        poly = self._sector_wedge_image(
+            start_angle_deg=99.0,
+            end_angle_deg=81.0,
+            inner_radius_rel=0.0,
+            outer_radius_rel=1.0,
+            steps=64,
+        )
+        if poly is None or len(poly) < 3:
             return
 
-        points = self._get_points_frame()
-        if active_index >= len(points):
-            return
+        path = QPainterPath()
+        first = self._image_to_widget(poly[0, 0], poly[0, 1])
+        path.moveTo(first)
 
-        px, py = points[active_index]
-        half = self._loupe_source_half_size
+        for pt in poly[1:]:
+            wpt = self._image_to_widget(pt[0], pt[1])
+            path.lineTo(wpt)
 
-        h, w = frame_bgr.shape[:2]
-        x1 = max(0, px - half)
-        y1 = max(0, py - half)
-        x2 = min(w, px + half + 1)
-        y2 = min(h, py + half + 1)
+        path.closeSubpath()
 
-        crop = frame_bgr[y1:y2, x1:x2].copy()
-        if crop.size == 0:
-            return
+        # etwas kräftiger als das übrige Overlay
+        fill_color = QColor(255, 0, 80, int(255 * max(0.20, alpha * 0.85)))
+        border_color = QColor(255, 120, 170, int(255 * max(0.30, alpha * 0.95)))
 
-        loupe = cv2.resize(crop, (self._loupe_size_px, self._loupe_size_px), interpolation=cv2.INTER_NEAREST)
+        painter.setPen(QPen(border_color, 1.2))
+        painter.setBrush(fill_color)
+        painter.drawPath(path)
 
-        cx = self._loupe_size_px // 2
-        cy = self._loupe_size_px // 2
+    # ------------------------------------------------------------
+    # Zeichnen
+    # ------------------------------------------------------------
 
-        cv2.line(loupe, (0, cy), (self._loupe_size_px, cy), (0, 255, 255), 1, lineType=cv2.LINE_AA)
-        cv2.line(loupe, (cx, 0), (cx, self._loupe_size_px), (0, 255, 255), 1, lineType=cv2.LINE_AA)
-        cv2.circle(loupe, (cx, cy), 7, (0, 255, 255), 1, lineType=cv2.LINE_AA)
-        cv2.circle(loupe, (cx, cy), 2, (0, 255, 255), -1, lineType=cv2.LINE_AA)
-
-        cv2.rectangle(loupe, (0, 0), (self._loupe_size_px - 1, self._loupe_size_px - 1), (255, 255, 255), 2, lineType=cv2.LINE_AA)
-
-        label = POINT_LABELS[active_index]
-        cv2.rectangle(loupe, (0, 0), (76, 28), (20, 20, 20), -1, lineType=cv2.LINE_AA)
-        cv2.putText(loupe, label, (10, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 1, lineType=cv2.LINE_AA)
-
-        loupe_rgb = cv2.cvtColor(loupe, cv2.COLOR_BGR2RGB)
-        qimg = QImage(
-            loupe_rgb.data,
-            loupe_rgb.shape[1],
-            loupe_rgb.shape[0],
-            loupe_rgb.shape[1] * 3,
-            QImage.Format.Format_RGB888,
-        ).copy()
-        pixmap = QPixmap.fromImage(qimg)
-
-        point_widget_x, point_widget_y = self._frame_to_widget(image_rect, px, py)
-        loupe_x = int(point_widget_x + self._loupe_margin_px)
-        loupe_y = int(point_widget_y - self._loupe_size_px - self._loupe_margin_px)
-
-        if loupe_x + self._loupe_size_px > self.width() - 6:
-            loupe_x = int(point_widget_x - self._loupe_size_px - self._loupe_margin_px)
-
-        if loupe_y < 6:
-            loupe_y = int(point_widget_y + self._loupe_margin_px)
-
-        loupe_x = max(6, min(loupe_x, self.width() - self._loupe_size_px - 6))
-        loupe_y = max(6, min(loupe_y, self.height() - self._loupe_size_px - 6))
-
-        painter.fillRect(QRectF(loupe_x + 4, loupe_y + 4, self._loupe_size_px, self._loupe_size_px), QColor(0, 0, 0, 110))
-        painter.drawPixmap(loupe_x, loupe_y, pixmap)
-
-    def paintEvent(self, event) -> None:
+    def paintEvent(self, event: QPaintEvent) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.fillRect(self.rect(), QColor(12, 12, 12))
 
-        painter.fillRect(self.rect(), QColor("#111111"))
-
-        image_rect = self._get_image_rect()
-        if image_rect is not None and self._image is not None:
-            painter.drawImage(image_rect, self._image)
-
-            warped_overlay = self._warp_overlay_to_frame()
-            if warped_overlay is not None:
-                qimg = self._numpy_rgba_to_qimage(warped_overlay)
-                painter.drawImage(image_rect, qimg)
-
-            self._draw_test_point(painter, image_rect)
-            self._draw_point_handles(painter, image_rect)
-            self._draw_loupe(painter, image_rect)
-        else:
-            painter.setPen(QColor("#9a9a9a"))
-            painter.setFont(QFont("Segoe UI", 12))
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._status_text)
-
-        painter.end()
-
-    def _draw_test_point(self, painter: QPainter, image_rect: QRectF) -> None:
-        if self._test_point_px is None:
+        if self._frame is None:
+            self._draw_empty_state(painter)
             return
 
-        x_px, y_px = self._test_point_px
-        xw, yw = self._frame_to_widget(image_rect, x_px, y_px)
+        frame_rect = self._frame_rect()
+        painter.drawImage(frame_rect, self._frame)
 
-        pen = QPen(QColor(0, 255, 180, 255))
-        pen.setWidthF(2.2)
+        self._draw_overlay(painter)
+        self._draw_test_point(painter)
+        self._draw_points(painter)
+        self._draw_status(painter)
+        self._draw_loupe(painter)
+
+    def _draw_empty_state(self, painter: QPainter) -> None:
+        painter.setPen(QPen(QColor(180, 180, 180), 1))
+        painter.setFont(self._label_font)
+        painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Kein Kamerabild")
+
+    def _draw_overlay(self, painter: QPainter) -> None:
+        if len(self._manual_points) != 4:
+            return
+
+        alpha = float(self._overlay_config.get("overlay_alpha", 0.35))
+        show_sector_lines = bool(self._overlay_config.get("show_sector_lines", True))
+        show_numbers = bool(self._overlay_config.get("show_numbers", True))
+
+        line_color = QColor(120, 220, 255, int(255 * alpha))
+        ring_pen = QPen(line_color, 1.5)
+        sector_pen = QPen(QColor(180, 240, 255, int(255 * alpha)), 1.2)
+
+        # 20er-Segment als rote Referenzfläche
+        self._draw_highlighted_twenty_segment(painter)
+        # Ringe
+        for poly in self._ring_polylines_image():
+            path = QPainterPath()
+            first = self._image_to_widget(poly[0, 0], poly[0, 1])
+            path.moveTo(first)
+            for pt in poly[1:]:
+                wpt = self._image_to_widget(pt[0], pt[1])
+                path.lineTo(wpt)
+
+            painter.setPen(ring_pen)
+            painter.drawPath(path)
+
+        # Segmentlinien
+        if show_sector_lines:
+            painter.setPen(sector_pen)
+            for line in self._sector_lines_image():
+                p0 = self._image_to_widget(line[0, 0], line[0, 1])
+                p1 = self._image_to_widget(line[1, 0], line[1, 1])
+                painter.drawLine(p0, p1)
+
+        # Zahlen
+        if show_numbers:
+            painter.setFont(self._small_font)
+            painter.setPen(QPen(QColor(230, 255, 255, 220), 1))
+            for text, pos in self._segment_label_positions():
+                mapped = self._project_topdown_points_to_image(
+                    np.array([[pos[0], pos[1]]], dtype=np.float32)
+                )
+                if mapped is None:
+                    continue
+                wx = self._image_to_widget(mapped[0, 0], mapped[0, 1])
+                painter.drawText(
+                    QRectF(wx.x() - 10, wx.y() - 8, 20, 16),
+                    Qt.AlignmentFlag.AlignCenter,
+                    text,
+                )
+
+        # Bull berechnet anzeigen
+        bull = self._computed_bull_image_point()
+        if bull is not None:
+            self._draw_crosshair(
+                painter,
+                bull[0],
+                bull[1],
+                QColor(0, 255, 255, 230),
+                radius=11,
+                thickness=2,
+                label="C",
+            )
+
+    def _draw_points(self, painter: QPainter) -> None:
+        labels = ["P1", "P2", "P3", "P4"]
+
+        for idx, point in enumerate(self._manual_points):
+            color = QColor(255, 255, 255, 230)
+            border = QColor(30, 30, 30, 255)
+
+            if self._active_point_index == idx:
+                color = QColor(255, 210, 60, 250)
+
+            wpt = self._image_to_widget(point["x_px"], point["y_px"])
+
+            painter.setPen(QPen(border, 2))
+            painter.setBrush(color)
+            painter.drawEllipse(wpt, self._marker_radius_px, self._marker_radius_px)
+
+            label_rect = QRectF(wpt.x() + 10, wpt.y() - 12, 54, 20)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(30, 30, 30, 190))
+            painter.drawRoundedRect(label_rect, 4, 4)
+
+            painter.setPen(QPen(QColor(255, 255, 255), 1))
+            painter.setFont(self._label_font)
+            painter.drawText(label_rect, Qt.AlignmentFlag.AlignCenter, labels[idx])
+
+    def _draw_test_point(self, painter: QPainter) -> None:
+        if self._test_point is None:
+            return
+
+        self._draw_crosshair(
+            painter,
+            self._test_point[0],
+            self._test_point[1],
+            QColor(40, 255, 120, 240),
+            radius=12,
+            thickness=2,
+            label=None,
+        )
+
+    def _draw_crosshair(
+        self,
+        painter: QPainter,
+        x_px: float,
+        y_px: float,
+        color: QColor,
+        radius: int = 10,
+        thickness: int = 2,
+        label: Optional[str] = None,
+    ) -> None:
+        wpt = self._image_to_widget(x_px, y_px)
+        pen = QPen(color, thickness)
         painter.setPen(pen)
-        painter.drawLine(int(xw - 10), int(yw), int(xw + 10), int(yw))
-        painter.drawLine(int(xw), int(yw - 10), int(xw), int(yw + 10))
-
-        ring_pen = QPen(QColor(0, 255, 180, 200))
-        ring_pen.setWidthF(1.5)
-        painter.setPen(ring_pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawEllipse(QRectF(xw - 8, yw - 8, 16, 16))
 
-    def _draw_point_handles(self, painter: QPainter, image_rect: QRectF) -> None:
-        points = self._get_points_frame()
+        painter.drawEllipse(wpt, radius, radius)
+        painter.drawLine(QPointF(wpt.x() - radius - 6, wpt.y()), QPointF(wpt.x() + radius + 6, wpt.y()))
+        painter.drawLine(QPointF(wpt.x(), wpt.y() - radius - 6), QPointF(wpt.x(), wpt.y() + radius + 6))
 
-        for i, (x_px, y_px) in enumerate(points):
-            xw, yw = self._frame_to_widget(image_rect, x_px, y_px)
+        if label:
+            rect = QRectF(wpt.x() + 12, wpt.y() - 12, 26, 20)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(30, 30, 30, 190))
+            painter.drawRoundedRect(rect, 4, 4)
+            painter.setPen(QPen(QColor(255, 255, 255), 1))
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, label)
 
-            base_color = QColor(0, 255, 255) if i == 4 else QColor(255, 255, 255)
+    def _draw_status(self, painter: QPainter) -> None:
+        if not self._status_text:
+            return
 
-            if self._dragging_index == i:
-                color = QColor(255, 180, 0)
-                radius = 12
-            elif self._hover_index == i:
-                color = QColor(0, 220, 255)
-                radius = 11
-            else:
-                color = base_color
-                radius = 10 if i == 4 else 9
+        rect = QRectF(10, self.height() - 28, self.width() - 20, 20)
+        painter.setPen(QPen(QColor(180, 180, 180), 1))
+        painter.setFont(self._small_font)
+        painter.drawText(rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self._status_text)
 
-            pen = QPen(color)
-            pen.setWidthF(2.2)
-            painter.setPen(pen)
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawEllipse(QRectF(xw - radius, yw - radius, radius * 2, radius * 2))
+    def _draw_loupe(self, painter: QPainter) -> None:
+        """
+        Große Präzisionslupe für aktiven Marker.
+        """
+        if self._frame is None:
+            return
+        if self._active_point_index is None:
+            return
+        if not (0 <= self._active_point_index < len(self._manual_points)):
+            return
 
-            if i == 4:
-                painter.drawLine(int(xw - 8), int(yw), int(xw + 8), int(yw))
-                painter.drawLine(int(xw), int(yw - 8), int(xw), int(yw + 8))
+        point = self._manual_points[self._active_point_index]
+        cx = int(point["x_px"])
+        cy = int(point["y_px"])
 
-            font = QFont("Segoe UI", 9)
-            font.setBold(True)
-            painter.setFont(font)
+        src_size = self._loupe_radius_px * 2 + 1
+        left = max(0, cx - self._loupe_radius_px)
+        top = max(0, cy - self._loupe_radius_px)
 
-            label_rect = QRectF(xw + 8, yw - 14, 34, 22)
-            painter.fillRect(label_rect, QColor(20, 20, 20, 180))
-            painter.setPen(QColor(255, 255, 255))
-            painter.drawText(label_rect, Qt.AlignmentFlag.AlignCenter, POINT_LABELS[i])
+        img_w, img_h = self._image_size()
+        left = min(left, img_w - src_size)
+        top = min(top, img_h - src_size)
+        left = max(0, left)
+        top = max(0, top)
+
+        cropped = self._frame.copy(left, top, min(src_size, img_w - left), min(src_size, img_h - top))
+        if cropped.isNull():
+            return
+
+        loupe_w = cropped.width() * self._loupe_zoom
+        loupe_h = cropped.height() * self._loupe_zoom
+
+        target_x = 18
+        target_y = 18
+
+        # Wenn links oben zu eng ist, rechts oben anzeigen
+        if target_x + loupe_w > self.width() - 20:
+            target_x = self.width() - loupe_w - 20
+
+        rect = QRectF(target_x, target_y, loupe_w, loupe_h)
+
+        pix = QPixmap.fromImage(cropped)
+        painter.setPen(QPen(QColor(255, 255, 255, 220), 2))
+        painter.setBrush(QColor(10, 10, 10, 210))
+        painter.drawRoundedRect(rect.adjusted(-6, -26, 6, 6), 10, 10)
+
+        painter.drawPixmap(rect.toRect(), pix)
+
+        # Lupe-Titel
+        painter.setFont(self._small_font)
+        painter.setPen(QPen(QColor(255, 240, 180), 1))
+        title = f"Präzisionslupe {self._loupe_zoom}x – {['P1','P2','P3','P4'][self._active_point_index]}"
+        painter.drawText(
+            QRectF(rect.x(), rect.y() - 22, rect.width(), 18),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            title,
+        )
+
+        # Fadenkreuz exakt auf aktuellem Punkt
+        local_x = (cx - left) * self._loupe_zoom + (self._loupe_zoom / 2.0)
+        local_y = (cy - top) * self._loupe_zoom + (self._loupe_zoom / 2.0)
+
+        lx = rect.x() + local_x
+        ly = rect.y() + local_y
+
+        painter.setPen(QPen(QColor(60, 255, 120), 2))
+        painter.drawLine(QPointF(rect.x(), ly), QPointF(rect.x() + rect.width(), ly))
+        painter.drawLine(QPointF(lx, rect.y()), QPointF(lx, rect.y() + rect.height()))
+        painter.drawEllipse(QPointF(lx, ly), 7, 7)
+
+        # 1px-Raster für Präzision
+        painter.setPen(QPen(QColor(255, 255, 255, 35), 1))
+        for i in range(cropped.width() + 1):
+            x = rect.x() + i * self._loupe_zoom
+            painter.drawLine(QPointF(x, rect.y()), QPointF(x, rect.y() + rect.height()))
+        for j in range(cropped.height() + 1):
+            y = rect.y() + j * self._loupe_zoom
+            painter.drawLine(QPointF(rect.x(), y), QPointF(rect.x() + rect.width(), y))
+
+        # Hinweise
+        hint_rect = QRectF(rect.x(), rect.y() + rect.height() + 6, rect.width(), 34)
+        painter.setPen(QPen(QColor(200, 200, 200), 1))
+        painter.drawText(
+            hint_rect,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+            "Pfeiltasten: 1 px   |   Shift + Pfeiltasten: 5 px\nAlt beim Ziehen: langsamer",
+        )
+
+    # ------------------------------------------------------------
+    # Interaktion
+    # ------------------------------------------------------------
+
+    def _nearest_point_index(self, img_x: float, img_y: float) -> Optional[int]:
+        best_idx = None
+        best_dist = None
+
+        for idx, point in enumerate(self._manual_points):
+            dx = point["x_px"] - img_x
+            dy = point["y_px"] - img_y
+            dist = math.sqrt(dx * dx + dy * dy)
+
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best_idx = idx
+
+        if best_dist is not None and best_dist <= self._selection_distance_px:
+            return best_idx
+        return None
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
-        image_rect = self._get_image_rect()
-        if image_rect is None:
-            super().mousePressEvent(event)
+        if self._frame is None:
             return
 
-        pos = event.position()
-        self._last_mouse_frame_pos = self._widget_to_frame(image_rect, pos.x(), pos.y())
+        self.setFocus()
+
+        img_pos = self._widget_to_image(event.position())
+        if img_pos is None:
+            return
+
+        img_x, img_y = img_pos
 
         if event.button() == Qt.MouseButton.RightButton:
-            x_px, y_px = self._last_mouse_frame_pos
-            self._test_point_px = (x_px, y_px)
-            self._test_board_point = project_image_point_to_board(x_px, y_px, self._overlay_config)
+            x_px, y_px = self._clamp_to_image(img_x, img_y)
+            self._test_point = (x_px, y_px)
             self.test_point_selected.emit(x_px, y_px)
             self.update()
-            event.accept()
             return
 
         if event.button() == Qt.MouseButton.LeftButton:
-            idx = self._find_near_point(image_rect, pos.x(), pos.y())
+            idx = self._nearest_point_index(img_x, img_y)
             if idx is not None:
-                self._dragging_index = idx
-                self.setCursor(Qt.CursorShape.ClosedHandCursor)
-                event.accept()
-                return
-
-        super().mousePressEvent(event)
+                self._active_point_index = idx
+                self._dragging = True
+                self._drag_anchor_img = (img_x, img_y)
+                self._drag_anchor_point = (
+                    float(self._manual_points[idx]["x_px"]),
+                    float(self._manual_points[idx]["y_px"]),
+                )
+                self.update()
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        image_rect = self._get_image_rect()
-        if image_rect is None:
-            super().mouseMoveEvent(event)
+        if not self._dragging or self._active_point_index is None:
+            return
+        if self._drag_anchor_img is None or self._drag_anchor_point is None:
             return
 
-        pos = event.position()
-        self._last_mouse_frame_pos = self._widget_to_frame(image_rect, pos.x(), pos.y())
-
-        if self._dragging_index is not None and (event.buttons() & Qt.MouseButton.LeftButton):
-            x_px, y_px = self._last_mouse_frame_pos
-            self._set_point(self._dragging_index, x_px, y_px)
-            self.points_changed.emit(self._overlay_config["points"])
-            self.update()
-            event.accept()
+        img_pos = self._widget_to_image(event.position())
+        if img_pos is None:
             return
 
-        hover_idx = self._find_near_point(image_rect, pos.x(), pos.y())
-        self._hover_index = hover_idx
+        img_x, img_y = img_pos
+        start_img_x, start_img_y = self._drag_anchor_img
+        start_px, start_py = self._drag_anchor_point
 
-        if hover_idx is not None:
-            self.setCursor(Qt.CursorShape.OpenHandCursor)
-        else:
-            self.setCursor(Qt.CursorShape.ArrowCursor)
+        dx = img_x - start_img_x
+        dy = img_y - start_img_y
 
+        # Alt = langsame Präzisionsbewegung
+        if event.modifiers() & Qt.KeyboardModifier.AltModifier:
+            dx *= 0.20
+            dy *= 0.20
+
+        new_x, new_y = self._clamp_to_image(start_px + dx, start_py + dy)
+
+        self._manual_points[self._active_point_index]["x_px"] = new_x
+        self._manual_points[self._active_point_index]["y_px"] = new_y
+
+        self.points_changed.emit(self._computed_config_points())
         self.update()
-        super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.MouseButton.LeftButton and self._dragging_index is not None:
-            self._dragging_index = None
-            self.setCursor(Qt.CursorShape.ArrowCursor)
-            self.update()
-            event.accept()
+        self._dragging = False
+        self._drag_anchor_img = None
+        self._drag_anchor_point = None
+        self.update()
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if self._active_point_index is None:
+            return
+        if not (0 <= self._active_point_index < len(self._manual_points)):
             return
 
-        super().mouseReleaseEvent(event)
+        step = 1
+        if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            step = 5
+
+        x_px = self._manual_points[self._active_point_index]["x_px"]
+        y_px = self._manual_points[self._active_point_index]["y_px"]
+
+        changed = False
+
+        if event.key() == Qt.Key.Key_Left:
+            x_px -= step
+            changed = True
+        elif event.key() == Qt.Key.Key_Right:
+            x_px += step
+            changed = True
+        elif event.key() == Qt.Key.Key_Up:
+            y_px -= step
+            changed = True
+        elif event.key() == Qt.Key.Key_Down:
+            y_px += step
+            changed = True
+        elif event.key() == Qt.Key.Key_Plus:
+            self._loupe_zoom = min(20, self._loupe_zoom + 1)
+            changed = True
+        elif event.key() == Qt.Key.Key_Minus:
+            self._loupe_zoom = max(4, self._loupe_zoom - 1)
+            changed = True
+        elif event.key() == Qt.Key.Key_Tab:
+            self._active_point_index = (self._active_point_index + 1) % 4
+            changed = True
+
+        if changed:
+            x_px, y_px = self._clamp_to_image(x_px, y_px)
+            self._manual_points[self._active_point_index]["x_px"] = x_px
+            self._manual_points[self._active_point_index]["y_px"] = y_px
+            self.points_changed.emit(self._computed_config_points())
+            self.update()
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        if self._active_point_index is None:
+            return
+
+        delta = event.angleDelta().y()
+        if delta > 0:
+            self._loupe_zoom = min(20, self._loupe_zoom + 1)
+        elif delta < 0:
+            self._loupe_zoom = max(4, self._loupe_zoom - 1)
+        self.update()
