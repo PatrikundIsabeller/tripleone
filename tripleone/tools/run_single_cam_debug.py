@@ -1,155 +1,602 @@
-# tools/run_single_cam_debug.py
-# Zweck:
-# Dieses Script ist ein kontrollierter Realtest für die Single-Cam-Pipeline.
-#
-# Es lädt:
-# - ein Referenzbild (leeres Board)
-# - ein aktuelles Bild (mit möglichem Dart)
-# - eine Kalibrierungsdatei / einen Kalibrierungs-Record
-#
-# Danach führt es die komplette Single-Cam-Pipeline aus:
-# 1) Candidate Detection
-# 2) Impact Estimation
-# 3) Score Mapping
-#
-# Und speichert:
-# - ein finales Overlay
-# - optionale Stage-Debugbilder
-# - eine JSON-Ergebnisdatei
-#
-# Wichtiger Hinweis:
-# Dieses Script ist absichtlich für reproduzierbare Einzelbildtests gebaut,
-# nicht für den finalen Livebetrieb.
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+tools/run_single_cam_debug.py
+
+Zweck:
+- Führt die komplette Single-Cam-Debug-Pipeline für ein Einzelbild aus
+- Nutzt Referenzbild + aktuelles Bild
+- Nutzt calibration.json + config.json
+- Speichert Debug-Overlays und optionale Stage-Bilder
+- Zeichnet zusätzlich die Score-Geometrie auf das Kamerabild
+
+Wichtige Ausgaben:
+- candidate_overlay.png
+- impact_overlay.png
+- single_cam_overlay.png
+- score_geometry_overlay.png
+
+Typischer Aufruf:
+py tools/run_single_cam_debug.py ^
+  --frame "D:\tripleone\tripleone\data\test_images\dart_01.png" ^
+  --reference "D:\tripleone\tripleone\data\references\camera_1_empty_board.png" ^
+  --calibration "D:\tripleone\tripleone\config\calibration.json" ^
+  --config "D:\tripleone\tripleone\config\config.json" ^
+  --camera-index 0 ^
+  --output-dir "D:\tripleone\tripleone\debug_output\single_cam_test" ^
+  --save-stage-images ^
+  --auto-board-mask ^
+  --auto-board-mask-scale 0.90 ^
+  --impact-strategy blend
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
 from typing import Any, Optional
 
 import cv2
 import numpy as np
 
-# Projekt-Root in sys.path aufnehmen, falls das Script direkt ausgeführt wird
-CURRENT_FILE = Path(__file__).resolve()
-PROJECT_ROOT = CURRENT_FILE.parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from vision.dart_candidate_detector import CandidateDetectorConfig
-from vision.impact_estimator import ImpactEstimatorConfig
-from vision.single_cam_detector import (
-    SingleCamDetectionResult,
-    SingleCamDetector,
-    SingleCamDetectorConfig,
-)
+# Projekt-Imports robust halten:
+try:
+    from vision.single_cam_detector import (
+        SingleCamDetector,
+        SingleCamDetectorConfig,
+    )
+except ImportError:  # pragma: no cover
+    from tripleone.vision.single_cam_detector import (  # type: ignore
+        SingleCamDetector,
+        SingleCamDetectorConfig,
+    )
 
 
-# -----------------------------------------------------------------------------
-# CLI
-# -----------------------------------------------------------------------------
+PointF = tuple[float, float]
+
+
+# ---------------------------------------------------------------------
+# Allgemeine Datei-/Bild-Helfer
+# ---------------------------------------------------------------------
+
+def load_image(image_path: str | Path) -> np.ndarray:
+    """
+    Lädt ein Bild von der Platte.
+    """
+    path = Path(image_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Bild nicht gefunden: {path}")
+
+    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if image is None:
+        raise RuntimeError(f"Bild konnte nicht geladen werden: {path}")
+
+    return image
+
+
+def save_image(path: str | Path, image: np.ndarray) -> None:
+    """
+    Speichert ein Bild auf der Platte.
+    """
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    ok = cv2.imwrite(str(out_path), image)
+    if not ok:
+        raise RuntimeError(f"Bild konnte nicht gespeichert werden: {out_path}")
+
+
+def load_json(json_path: str | Path) -> dict[str, Any]:
+    """
+    Lädt eine JSON-Datei robust.
+    """
+    path = Path(json_path)
+    if not path.exists():
+        raise FileNotFoundError(f"JSON-Datei nicht gefunden: {path}")
+
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if not isinstance(data, dict):
+        raise ValueError(f"JSON-Datei muss ein Objekt enthalten: {path}")
+
+    return data
+
+
+def ensure_bgr(image: np.ndarray) -> np.ndarray:
+    """
+    Stellt sicher, dass ein Bild als BGR vorliegt.
+    """
+    if image.ndim == 2:
+        return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    return image.copy()
+
+
+# ---------------------------------------------------------------------
+# Kalibrierung / Config lesen
+# ---------------------------------------------------------------------
+
+def _coerce_point(value: Any) -> PointF:
+    """
+    Wandelt verschiedene Punktformate in (x, y) um.
+    Unterstützt:
+    - (x, y)
+    - [x, y]
+    - {"x": ..., "y": ...}
+    - {"x_px": ..., "y_px": ...}
+    """
+    if isinstance(value, dict):
+        if "x" in value and "y" in value:
+            return float(value["x"]), float(value["y"])
+        if "x_px" in value and "y_px" in value:
+            return float(value["x_px"]), float(value["y_px"])
+        raise ValueError(f"Point dict muss x/y oder x_px/y_px enthalten: {value}")
+
+    if isinstance(value, (tuple, list, np.ndarray)) and len(value) == 2:
+        return float(value[0]), float(value[1])
+
+    raise ValueError(f"Ungültiges Punktformat: {value!r}")
+
+
+def _extract_manual_points_from_calibration_dict(data: dict[str, Any], camera_index: int) -> list[PointF]:
+    """
+    Liest 4 Kalibrierpunkte aus verschiedenen calibration.json-Formaten.
+
+    Unterstützte Muster:
+    - {"manual_points": [...]}
+    - {"cameras": [{"manual_points": [...]}, ...]}
+    - {"camera_calibrations": [{"manual_points": [...]}, ...]}
+    - {"points": [...]}
+    - {"marker_points": [...]}
+    """
+    candidates: list[Any] = []
+
+    # global direkt
+    for key in ("manual_points", "points", "marker_points", "image_points", "markers"):
+        if key in data:
+            candidates.append(data[key])
+
+    # verschachtelt über cameras
+    for list_key in ("cameras", "camera_calibrations", "camera_configs", "camera_data"):
+        items = data.get(list_key)
+        if isinstance(items, list) and 0 <= camera_index < len(items):
+            entry = items[camera_index]
+            if isinstance(entry, dict):
+                for key in ("manual_points", "points", "marker_points", "image_points", "markers"):
+                    if key in entry:
+                        candidates.append(entry[key])
+
+    for raw in candidates:
+        if isinstance(raw, list) and len(raw) == 4:
+            try:
+                return [_coerce_point(v) for v in raw]
+            except Exception:
+                continue
+
+    raise ValueError(
+        "Konnte keine 4 Kalibrierpunkte in calibration.json finden. "
+        "Erwartet z. B. manual_points / points / marker_points."
+    )
+
+
+def _extract_image_size_from_calibration_dict(
+    data: dict[str, Any],
+    camera_index: int,
+    *,
+    fallback_image: Optional[np.ndarray] = None,
+) -> tuple[int, int]:
+    """
+    Liest Bildgröße aus calibration.json oder fällt auf das geladene Bild zurück.
+    """
+    def _coerce_size(value: Any) -> Optional[tuple[int, int]]:
+        if isinstance(value, (tuple, list)) and len(value) == 2:
+            return int(value[0]), int(value[1])
+        if isinstance(value, dict):
+            if "width" in value and "height" in value:
+                return int(value["width"]), int(value["height"])
+            if "image_width" in value and "image_height" in value:
+                return int(value["image_width"]), int(value["image_height"])
+        return None
+
+    candidates: list[Any] = []
+
+    for key in ("image_size", "size", "frame_size"):
+        if key in data:
+            candidates.append(data[key])
+
+    for list_key in ("cameras", "camera_calibrations", "camera_configs", "camera_data"):
+        items = data.get(list_key)
+        if isinstance(items, list) and 0 <= camera_index < len(items):
+            entry = items[camera_index]
+            if isinstance(entry, dict):
+                for key in ("image_size", "size", "frame_size"):
+                    if key in entry:
+                        candidates.append(entry[key])
+                if "image_width" in entry and "image_height" in entry:
+                    candidates.append({"image_width": entry["image_width"], "image_height": entry["image_height"]})
+
+    if "image_width" in data and "image_height" in data:
+        candidates.append({"image_width": data["image_width"], "image_height": data["image_height"]})
+
+    for value in candidates:
+        size = _coerce_size(value)
+        if size is not None:
+            return size
+
+    if fallback_image is not None:
+        h, w = fallback_image.shape[:2]
+        return int(w), int(h)
+
+    raise ValueError("Konnte keine image_size bestimmen.")
+
+
+def _extract_single_cam_config_dict(config_data: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """
+    Extrahiert aus config.json nur den relevanten Single-Cam-Config-Block.
+
+    Unterstützte Muster:
+    - {"single_cam": {...}}
+    - {"single_cam_detector": {...}}
+    - {"vision": {"single_cam": {...}}}
+    - Fallback: Root-Level
+    """
+    if not config_data:
+        return {}
+
+    for key in ("single_cam", "single_cam_detector"):
+        value = config_data.get(key)
+        if isinstance(value, dict):
+            return dict(value)
+
+    vision = config_data.get("vision")
+    if isinstance(vision, dict):
+        for key in ("single_cam", "single_cam_detector"):
+            value = vision.get(key)
+            if isinstance(value, dict):
+                return dict(value)
+
+    return dict(config_data)
+
+
+def _build_single_cam_config(config_dict: dict[str, Any]) -> SingleCamDetectorConfig:
+    """
+    Baut robust ein SingleCamDetectorConfig-Objekt.
+    Nur existierende Felder werden übernommen.
+    """
+    config = SingleCamDetectorConfig()
+
+    allowed_fields = set(getattr(SingleCamDetectorConfig, "__dataclass_fields__", {}).keys())
+
+    for key, value in config_dict.items():
+        if key in allowed_fields:
+            setattr(config, key, value)
+
+    return config
+
+
+# ---------------------------------------------------------------------
+# Board-Mask / Polygon
+# ---------------------------------------------------------------------
+
+def _parse_board_polygon(value: Optional[str]) -> Optional[list[tuple[int, int]]]:
+    """
+    Erwartet JSON-String, z. B.:
+    [[100, 100], [200, 100], [200, 200], [100, 200]]
+    """
+    if not value:
+        return None
+
+    data = json.loads(value)
+    if not isinstance(data, list) or len(data) < 3:
+        raise ValueError("--board-polygon muss mindestens 3 Punkte enthalten.")
+
+    points: list[tuple[int, int]] = []
+    for item in data:
+        x, y = _coerce_point(item)
+        points.append((int(round(x)), int(round(y))))
+
+    return points
+
+
+def build_auto_board_mask(
+    frame: np.ndarray,
+    manual_points: list[PointF],
+    *,
+    scale: float = 0.90,
+) -> np.ndarray:
+    """
+    Baut aus den 4 Kalibrierpunkten eine grobe Kreisscheibe als ROI-Maske.
+
+    Idee:
+    - Mittelpunkt = Mittelwert der 4 Punkte
+    - Radius = mittlere Distanz der 4 Punkte zum Mittelpunkt
+    - optionaler Skalierungsfaktor
+    """
+    h, w = frame.shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+
+    pts = np.asarray(manual_points, dtype=np.float64)
+    center = np.mean(pts, axis=0)
+    dists = np.linalg.norm(pts - center[None, :], axis=1)
+    radius = float(np.mean(dists)) * float(scale)
+
+    cx = int(round(center[0]))
+    cy = int(round(center[1]))
+    rr = max(1, int(round(radius)))
+
+    cv2.circle(mask, (cx, cy), rr, 255, thickness=-1)
+    return mask
+
+
+# ---------------------------------------------------------------------
+# Score-Geometrie-Overlay
+# ---------------------------------------------------------------------
+
+def render_score_geometry_overlay(
+    frame: np.ndarray,
+    score_mapper: Any,
+) -> np.ndarray:
+    """
+    Zeichnet die vom ScoreMapper verwendete Score-Geometrie auf das Kamerabild.
+
+    Sichtbar:
+    - Bull-Zentrum
+    - wichtige Ringkreise
+    - Sektorlinien
+    - Segmentlabels
+
+    Ziel:
+    Prüfen, ob Kalibrierung/Rotation/Winkelaufteilung zur echten Dartscheibe passt.
+    """
+    canvas = ensure_bgr(frame)
+
+    if score_mapper is None:
+        return canvas
+
+    pipeline = getattr(score_mapper, "pipeline", None)
+    if pipeline is None:
+        return canvas
+
+    if not hasattr(score_mapper, "topdown_point_to_image"):
+        return canvas
+
+    segment_order = [20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 12, 5]
+
+    center_td = (450.0, 450.0)
+
+    # relative Radii passend zur bisherigen TripleOne-Geometrie
+    relative_radii = [0.985, 0.93, 0.57, 0.51, 0.093, 0.037]
+    outer_radius_td = 450.0
+    ring_radii_td = [outer_radius_td * r for r in relative_radii]
+
+    try:
+        center_img = score_mapper.topdown_point_to_image(center_td)
+    except Exception:
+        center_img = None
+
+    if center_img is None:
+        return canvas
+
+    cx = int(round(center_img[0]))
+    cy = int(round(center_img[1]))
+    cv2.circle(canvas, (cx, cy), 6, (0, 0, 255), -1)
+    cv2.circle(canvas, (cx, cy), 12, (255, 255, 255), 1)
+
+    circle_colors = [
+        (0, 255, 255),   # outer double
+        (0, 200, 255),   # inner double
+        (0, 255, 0),     # outer triple
+        (0, 200, 0),     # inner triple
+        (255, 255, 0),   # outer bull
+        (0, 0, 255),     # inner bull
+    ]
+
+    for radius_td, color in zip(ring_radii_td, circle_colors):
+        pts_img: list[tuple[int, int]] = []
+        for deg in range(0, 360, 5):
+            rad = np.deg2rad(deg)
+            x_td = center_td[0] + np.cos(rad) * radius_td
+            y_td = center_td[1] - np.sin(rad) * radius_td
+
+            try:
+                p_img = score_mapper.topdown_point_to_image((x_td, y_td))
+            except Exception:
+                p_img = None
+
+            if p_img is not None:
+                pts_img.append((int(round(p_img[0])), int(round(p_img[1]))))
+
+        if len(pts_img) >= 3:
+            poly = np.asarray(pts_img, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.polylines(canvas, [poly], isClosed=True, color=color, thickness=1, lineType=cv2.LINE_AA)
+
+    # Sektorgrenzen
+    for i in range(20):
+        boundary_deg = 90.0 - (i * 18.0) - 9.0
+        rad = np.deg2rad(boundary_deg)
+
+        x_td = center_td[0] + np.cos(rad) * outer_radius_td
+        y_td = center_td[1] - np.sin(rad) * outer_radius_td
+
+        try:
+            p_img = score_mapper.topdown_point_to_image((x_td, y_td))
+        except Exception:
+            p_img = None
+
+        if p_img is not None:
+            px = int(round(p_img[0]))
+            py = int(round(p_img[1]))
+            cv2.line(canvas, (cx, cy), (px, py), (255, 0, 0), 1, cv2.LINE_AA)
+
+    # Segmentlabels
+    label_radius_td = outer_radius_td * 1.03
+
+    for i, segment in enumerate(segment_order):
+        angle_deg = 90.0 - (i * 18.0)
+        rad = np.deg2rad(angle_deg)
+
+        x_td = center_td[0] + np.cos(rad) * label_radius_td
+        y_td = center_td[1] - np.sin(rad) * label_radius_td
+
+        try:
+            p_img = score_mapper.topdown_point_to_image((x_td, y_td))
+        except Exception:
+            p_img = None
+
+        if p_img is None:
+            continue
+
+        lx = int(round(p_img[0]))
+        ly = int(round(p_img[1]))
+
+        cv2.putText(
+            canvas,
+            str(segment),
+            (lx - 10, ly + 4),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            canvas,
+            str(segment),
+            (lx - 10, ly + 4),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (0, 0, 0),
+            1,
+            cv2.LINE_AA,
+        )
+
+    return canvas
+
+
+# ---------------------------------------------------------------------
+# Detector / Strategie-Overrides
+# ---------------------------------------------------------------------
+
+def _get_score_mapper(detector: Any) -> Any:
+    """
+    Holt den ScoreMapper robust aus dem Detector.
+    """
+    public_mapper = getattr(detector, "score_mapper", None)
+    if public_mapper is not None:
+        return public_mapper
+
+    return getattr(detector, "_score_mapper", None)
+
+
+def _apply_runtime_overrides(detector: Any, args: argparse.Namespace) -> None:
+    """
+    Wendet CLI-Overrides auf Config / Unterobjekte an.
+    """
+    # Detector-Config
+    detector_config = getattr(detector, "config", None)
+    if detector_config is not None:
+        if args.score_all_estimates:
+            setattr(detector_config, "score_all_estimates", True)
+        if args.max_estimates_to_score is not None:
+            setattr(detector_config, "max_estimates_to_score", int(args.max_estimates_to_score))
+        if args.min_impact_confidence is not None:
+            setattr(detector_config, "min_impact_confidence", float(args.min_impact_confidence))
+        if args.min_combined_confidence is not None:
+            setattr(detector_config, "min_combined_confidence", float(args.min_combined_confidence))
+
+    # Candidate-Detector-Config
+    candidate_detector = getattr(detector, "candidate_detector", None)
+    candidate_config = getattr(candidate_detector, "config", None) if candidate_detector is not None else None
+    if candidate_config is not None:
+        if args.candidate_diff_threshold is not None:
+            setattr(candidate_config, "diff_threshold", float(args.candidate_diff_threshold))
+        if args.candidate_min_area is not None:
+            setattr(candidate_config, "min_contour_area", float(args.candidate_min_area))
+        if args.candidate_min_confidence is not None:
+            setattr(candidate_config, "min_confidence", float(args.candidate_min_confidence))
+
+    # Impact-Estimator-Config
+    impact_estimator = getattr(detector, "impact_estimator", None)
+    impact_config = getattr(impact_estimator, "config", None) if impact_estimator is not None else None
+    if impact_config is not None and args.impact_strategy:
+        setattr(impact_config, "strategy", str(args.impact_strategy))
+
+
+# ---------------------------------------------------------------------
+# Zusammenfassung drucken
+# ---------------------------------------------------------------------
+
+def print_result_summary(
+    result: Any,
+    *,
+    calibration_source: str,
+    camera_index: int,
+    image_size: tuple[int, int],
+) -> None:
+    """
+    Druckt eine kompakte Ergebniszusammenfassung.
+    """
+    metadata = getattr(result, "metadata", {}) or {}
+    scored_estimates = getattr(result, "scored_estimates", []) or []
+
+    best = scored_estimates[0] if scored_estimates else None
+
+    print()
+    print("===== SINGLE CAM DEBUG RESULT =====")
+    print(f"Calibration Source: {calibration_source}")
+    print(f"Camera Index: {camera_index}")
+    print(f"Image Size: {image_size}")
+
+    if best is None:
+        print("Best Label: None")
+        print("Best Score: None")
+        print("Scored Estimates: 0")
+        print(f"Candidate Count: {metadata.get('candidate_count')}")
+        print(f"Impact Count: {metadata.get('impact_count')}")
+        return
+
+    print(f"Best Label: {getattr(best, 'label', None)}")
+    print(f"Best Score: {getattr(best, 'score', None)}")
+    print(f"Scored Estimates: {len(scored_estimates)}")
+    print(f"Best Candidate ID: {getattr(best, 'candidate_id', None)}")
+    print(f"Image Point: {getattr(best, 'image_point', None)}")
+    print(f"Candidate Confidence: {getattr(best, 'candidate_confidence', None):.4f}")
+    print(f"Impact Confidence: {getattr(best, 'impact_confidence', None):.4f}")
+    print(f"Combined Confidence: {getattr(best, 'combined_confidence', None):.4f}")
+    print(f"Impact Method: {getattr(best, 'impact_method', None)}")
+    print(f"Hypothesis Count: {getattr(best, 'hypothesis_count', None)}")
+    print(f"Candidate Count: {metadata.get('candidate_count')}")
+    print(f"Impact Count: {metadata.get('impact_count')}")
+
+
+# ---------------------------------------------------------------------
+# Argumente
+# ---------------------------------------------------------------------
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    """
-    Baut den CLI-Parser für das Debug-Script.
-    """
-    parser = argparse.ArgumentParser(
-        description="Run a reproducible single-camera debug test for Triple One."
-    )
+    parser = argparse.ArgumentParser(description="Single-Cam-Debuglauf für TripleOne.")
 
-    parser.add_argument(
-        "--frame",
-        required=True,
-        help="Pfad zum aktuellen Bild (z. B. Board mit Dart).",
-    )
-    parser.add_argument(
-        "--reference",
-        required=True,
-        help="Pfad zum Referenzbild des leeren Boards.",
-    )
-    parser.add_argument(
-        "--calibration",
-        required=True,
-        help=(
-            "Pfad zu einer JSON-Datei mit Kalibrierungsdaten. "
-            "Erwartet entweder ein dict mit manual_points oder einen einzelnen Record."
-        ),
-    )
-    parser.add_argument(
-        "--camera-index",
-        type=int,
-        default=None,
-        help=(
-            "Optionaler Kameraindex für Store-Dateien mit mehreren Kameras. "
-            "Wenn gesetzt, wird versucht, den passenden Record aus einer Store-Struktur zu lesen."
-        ),
-    )
-    parser.add_argument(
-        "--board-polygon",
-        default=None,
-        help=(
-            "Optionaler Pfad zu einer JSON-Datei mit Polygonpunkten für die ROI. "
-            "Format: [[x1, y1], [x2, y2], ...]"
-        ),
-    )
-    parser.add_argument(
-        "--output-dir",
-        default="debug_output/single_cam",
-        help="Ausgabeordner für Overlay, Debugbilder und JSON-Ergebnis.",
-    )
-    parser.add_argument(
-        "--save-stage-images",
-        action="store_true",
-        help="Speichert alle von der Pipeline gelieferten Stage-Debugbilder.",
-    )
-    parser.add_argument(
-        "--no-stage-overlays",
-        action="store_true",
-        help="Deaktiviert zusätzlich erzeugte Stage-Overlay-Bilder.",
-    )
-    parser.add_argument(
-        "--score-all-estimates",
-        action="store_true",
-        help="Scort mehrere Impact-Schätzungen statt nur der besten.",
-    )
-    parser.add_argument(
-        "--max-estimates-to-score",
-        type=int,
-        default=3,
-        help="Maximale Anzahl an Impact-Schätzungen, die gescort werden.",
-    )
-    parser.add_argument(
-        "--min-impact-confidence",
-        type=float,
-        default=0.01,
-        help="Mindestkonfidenz für Impact-Schätzungen.",
-    )
-    parser.add_argument(
-        "--min-combined-confidence",
-        type=float,
-        default=0.01,
-        help="Mindestkonfidenz für finale gescorte Ergebnisse.",
-    )
-    parser.add_argument(
-        "--candidate-diff-threshold",
-        type=int,
-        default=24,
-        help="Threshold für die Differenzmaske im Candidate Detector.",
-    )
-    parser.add_argument(
-        "--candidate-min-area",
-        type=float,
-        default=25.0,
-        help="Minimale Konturfläche für Kandidaten.",
-    )
-    parser.add_argument(
-        "--candidate-min-confidence",
-        type=float,
-        default=0.18,
-        help="Minimale Kandidatenkonfidenz im Candidate Detector.",
-    )
+    parser.add_argument("--frame", required=True, help="Aktuelles Bild mit Dart.")
+    parser.add_argument("--reference", help="Referenzbild ohne Dart.")
+    parser.add_argument("--auto-board-mask", action="store_true", help="Grobes Board-ROI automatisch aus Kalibrierpunkten erzeugen.")
+    parser.add_argument("--auto-board-mask-scale", type=float, default=0.90, help="Skalierung der automatischen Board-Kreismaske.")
+    parser.add_argument("--calibration", required=True, help="Pfad zu calibration.json.")
+    parser.add_argument("--config", help="Pfad zu config.json.")
+    parser.add_argument("--camera-index", type=int, default=0, help="Kameraindex in calibration/config.")
+    parser.add_argument("--board-polygon", help="Optionales JSON-Polygon, z. B. [[x1,y1],[x2,y2],...].")
+    parser.add_argument("--output-dir", default="debug_output/single_cam_test", help="Ausgabeordner.")
+    parser.add_argument("--save-stage-images", action="store_true", help="Speichert Stage-Debugbilder aus CandidateDetector/SingleCam.")
+    parser.add_argument("--no-stage-overlays", action="store_true", help="Unterdrückt candidate/impact/single-cam overlays.")
+    parser.add_argument("--score-all-estimates", action="store_true", help="Scort alle ImpactEstimates statt nur die besten.")
+    parser.add_argument("--max-estimates-to-score", type=int, help="Begrenzt die Anzahl der weitergescorten Impacts.")
+    parser.add_argument("--min-impact-confidence", type=float, help="Mindest-Impact-Konfidenz.")
+    parser.add_argument("--min-combined-confidence", type=float, help="Mindest-Combined-Konfidenz.")
+    parser.add_argument("--candidate-diff-threshold", type=float, help="Override Candidate diff_threshold.")
+    parser.add_argument("--candidate-min-area", type=float, help="Override Candidate min_contour_area.")
+    parser.add_argument("--candidate-min-confidence", type=float, help="Override Candidate min_confidence.")
+
     parser.add_argument(
         "--impact-strategy",
         type=str,
@@ -160,6 +607,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "candidate_default",
             "lowest_contour_point",
             "major_axis_lower_endpoint",
+            "major_axis_centerward_endpoint",
+            "centerward_contour_tip",
             "directional_contour_tip",
         ],
         help="Strategie des Impact Estimators.",
@@ -168,365 +617,129 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-# -----------------------------------------------------------------------------
-# Laden / Validieren
-# -----------------------------------------------------------------------------
-
-def load_image(path: str) -> np.ndarray:
-    """
-    Lädt ein Bild robust von Platte.
-    """
-    image_path = Path(path)
-    if not image_path.exists():
-        raise FileNotFoundError(f"Bild nicht gefunden: {image_path}")
-
-    image = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
-    if image is None:
-        raise ValueError(f"Bild konnte nicht geladen werden: {image_path}")
-
-    return image
-
-
-def load_json(path: str) -> Any:
-    """
-    Lädt JSON von Platte.
-    """
-    json_path = Path(path)
-    if not json_path.exists():
-        raise FileNotFoundError(f"JSON-Datei nicht gefunden: {json_path}")
-
-    with json_path.open("r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def load_board_polygon(path: Optional[str]) -> Optional[list[list[float]]]:
-    """
-    Lädt optional ein Board-Polygon aus JSON.
-    """
-    if not path:
-        return None
-
-    data = load_json(path)
-
-    if not isinstance(data, list) or len(data) < 3:
-        raise ValueError(
-            "Board-Polygon muss eine Liste mit mindestens 3 Punkten sein."
-        )
-
-    normalized: list[list[float]] = []
-    for item in data:
-        if not isinstance(item, (list, tuple)) or len(item) != 2:
-            raise ValueError(f"Ungültiger Polygonpunkt: {item!r}")
-        normalized.append([float(item[0]), float(item[1])])
-
-    return normalized
-
-
-def resolve_calibration_record(data: Any, camera_index: Optional[int]) -> Any:
-    """
-    Extrahiert robust einen Kalibrierungs-Record aus einer JSON-Struktur.
-
-    Unterstützte grobe Formate:
-    - einzelner Record mit manual_points
-    - dict mit records
-    - dict mit cameras
-    - dict mit camera_configs
-    - dict keyed by camera index / string index
-
-    Wichtiger Punkt:
-    Das Script versucht bewusst mehrere Formate robust zu lesen, damit du
-    nicht gleich wieder an Dateiformaten hängen bleibst.
-    """
-    # Direkt ein einzelner Record
-    if isinstance(data, dict) and _looks_like_calibration_record(data):
-        return data
-
-    # Ohne camera_index: wenn genau ein Record erkennbar ist, nimm ihn
-    if camera_index is None:
-        single = _try_extract_single_record(data)
-        if single is not None:
-            return single
-
-    # Mit camera_index gezielt auflösen
-    if camera_index is not None:
-        resolved = _try_extract_record_by_index(data, camera_index)
-        if resolved is not None:
-            return resolved
-
-    raise ValueError(
-        "Kalibrierungs-JSON konnte nicht in einen einzelnen Kamera-Record aufgelöst werden. "
-        "Prüfe das Format oder verwende --camera-index."
-    )
-
-
-def _looks_like_calibration_record(value: Any) -> bool:
-    """
-    Grobe Heuristik, ob ein Objekt wie ein einzelner Calibration-Record aussieht.
-    """
-    if not isinstance(value, dict):
-        return False
-
-    if "manual_points" in value:
-        return True
-
-    point_keys = {"p1", "p2", "p3", "p4"}
-    if point_keys.issubset(set(value.keys())):
-        return True
-
-    marker_keys = {"marker_points", "markers", "image_points", "points"}
-    if marker_keys.intersection(set(value.keys())):
-        return True
-
-    return False
-
-
-def _try_extract_single_record(data: Any) -> Optional[Any]:
-    """
-    Versucht aus einer Struktur genau einen einzelnen Record zu extrahieren.
-    """
-    if isinstance(data, dict):
-        # records: [...]
-        if "records" in data and isinstance(data["records"], list) and len(data["records"]) == 1:
-            candidate = data["records"][0]
-            if _looks_like_calibration_record(candidate):
-                return candidate
-
-        # cameras / camera_configs als dict
-        for key in ("cameras", "camera_configs"):
-            if key in data and isinstance(data[key], dict) and len(data[key]) == 1:
-                only_value = next(iter(data[key].values()))
-                if _looks_like_calibration_record(only_value):
-                    return only_value
-
-        # cameras / camera_configs als list
-        for key in ("cameras", "camera_configs"):
-            if key in data and isinstance(data[key], list) and len(data[key]) == 1:
-                only_value = data[key][0]
-                if _looks_like_calibration_record(only_value):
-                    return only_value
-
-        # keyed dict mit genau einem record
-        matching_values = [
-            value for value in data.values()
-            if _looks_like_calibration_record(value)
-        ]
-        if len(matching_values) == 1:
-            return matching_values[0]
-
-    return None
-
-
-def _try_extract_record_by_index(data: Any, camera_index: int) -> Optional[Any]:
-    """
-    Versucht einen Record gezielt nach Kameraindex zu extrahieren.
-    """
-    index_str = str(camera_index)
-
-    if isinstance(data, dict):
-        # records: [...]
-        if "records" in data and isinstance(data["records"], list):
-            records = data["records"]
-            if 0 <= camera_index < len(records):
-                candidate = records[camera_index]
-                if _looks_like_calibration_record(candidate):
-                    return candidate
-
-        # cameras / camera_configs als list
-        for key in ("cameras", "camera_configs"):
-            if key in data and isinstance(data[key], list):
-                items = data[key]
-                if 0 <= camera_index < len(items):
-                    candidate = items[camera_index]
-                    if _looks_like_calibration_record(candidate):
-                        return candidate
-
-        # cameras / camera_configs als dict
-        for key in ("cameras", "camera_configs"):
-            if key in data and isinstance(data[key], dict):
-                container = data[key]
-                if index_str in container and _looks_like_calibration_record(container[index_str]):
-                    return container[index_str]
-                camera_key = f"cam_{camera_index}"
-                if camera_key in container and _looks_like_calibration_record(container[camera_key]):
-                    return container[camera_key]
-
-        # direkt keyed dict
-        if index_str in data and _looks_like_calibration_record(data[index_str]):
-            return data[index_str]
-
-        camera_key = f"cam_{camera_index}"
-        if camera_key in data and _looks_like_calibration_record(data[camera_key]):
-            return data[camera_key]
-
-    return None
-
-
-# -----------------------------------------------------------------------------
-# Debug / Speichern
-# -----------------------------------------------------------------------------
-
-def ensure_dir(path: Path) -> None:
-    """
-    Erstellt einen Ordner rekursiv, falls nötig.
-    """
-    path.mkdir(parents=True, exist_ok=True)
-
-
-def save_image(path: Path, image: np.ndarray) -> None:
-    """
-    Speichert ein Bild und wirft bei Fehlern eine klare Exception.
-    """
-    ok = cv2.imwrite(str(path), image)
-    if not ok:
-        raise RuntimeError(f"Bild konnte nicht gespeichert werden: {path}")
-
-
-def make_json_safe(value: Any) -> Any:
-    """
-    Wandelt komplexere Python-/NumPy-Werte in JSON-kompatible Strukturen um.
-    """
-    if value is None:
-        return None
-
-    if isinstance(value, (str, int, float, bool)):
-        return value
-
-    if isinstance(value, Path):
-        return str(value)
-
-    if isinstance(value, np.generic):
-        return value.item()
-
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-
-    if isinstance(value, dict):
-        return {str(k): make_json_safe(v) for k, v in value.items()}
-
-    if isinstance(value, (list, tuple)):
-        return [make_json_safe(v) for v in value]
-
-    if hasattr(value, "to_dict") and callable(value.to_dict):
-        return make_json_safe(value.to_dict())
-
-    return str(value)
-
-
-def print_console_summary(result: SingleCamDetectionResult) -> None:
-    """
-    Gibt eine kompakte, aber brauchbare Konsolenzusammenfassung aus.
-    """
-    print("\n===== SINGLE CAM DEBUG RESULT =====")
-    print(f"Best Label: {result.best_label}")
-    print(f"Best Score: {result.best_score}")
-    print(f"Scored Estimates: {len(result.scored_estimates)}")
-
-    best = result.best_estimate
-    if best is None:
-        print("Kein finales Ergebnis gefunden.")
-        return
-
-    print(f"Best Candidate ID: {best.candidate_id}")
-    print(f"Image Point: {best.image_point}")
-    print(f"Candidate Confidence: {best.candidate_confidence:.4f}")
-    print(f"Impact Confidence: {best.impact_confidence:.4f}")
-    print(f"Combined Confidence: {best.combined_confidence:.4f}")
-    print(f"Impact Method: {best.impact_estimate.method}")
-    print(f"Hypothesis Count: {best.impact_estimate.hypothesis_count}")
-
-    if result.candidate_result is not None:
-        print(f"Candidate Count: {len(result.candidate_result.candidates)}")
-
-    if result.impact_result is not None:
-        print(f"Impact Count: {len(result.impact_result.estimates)}")
-
-
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # Main
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 
 def main() -> int:
-    """
-    CLI-Einstieg.
-    """
     parser = build_arg_parser()
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
-    ensure_dir(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     frame = load_image(args.frame)
-    reference = load_image(args.reference)
+    reference_frame = load_image(args.reference) if args.reference else frame.copy()
 
     calibration_data = load_json(args.calibration)
-    calibration_record = resolve_calibration_record(
+    config_data = load_json(args.config) if args.config else {}
+
+    manual_points = _extract_manual_points_from_calibration_dict(calibration_data, int(args.camera_index))
+    image_size = _extract_image_size_from_calibration_dict(
         calibration_data,
-        camera_index=args.camera_index,
+        int(args.camera_index),
+        fallback_image=frame,
     )
 
-    board_polygon = load_board_polygon(args.board_polygon)
-
-    candidate_config = CandidateDetectorConfig(
-        diff_threshold=int(args.candidate_diff_threshold),
-        min_contour_area=float(args.candidate_min_area),
-        min_confidence=float(args.candidate_min_confidence),
-        keep_debug_images=bool(args.save_stage_images),
-    )
-
-    impact_config = ImpactEstimatorConfig(
-        strategy=str(args.impact_strategy),
-    )
-
-    single_cam_config = SingleCamDetectorConfig(
-        score_all_estimates=bool(args.score_all_estimates),
-        max_estimates_to_score=int(args.max_estimates_to_score),
-        min_impact_confidence=float(args.min_impact_confidence),
-        min_combined_confidence=float(args.min_combined_confidence),
-        keep_debug_images=bool(args.save_stage_images),
-        keep_stage_results=True,
-        render_stage_overlays=not bool(args.no_stage_overlays),
-    )
+    single_cam_config_dict = _extract_single_cam_config_dict(config_data)
+    single_cam_config = _build_single_cam_config(single_cam_config_dict)
 
     detector = SingleCamDetector(
         config=single_cam_config,
-        candidate_detector_config=candidate_config,
-        impact_estimator_config=impact_config,
-        calibration_record=calibration_record,
+        manual_points=manual_points,
+        image_size=image_size,
     )
+
+    _apply_runtime_overrides(detector, args)
+
+    board_polygon = _parse_board_polygon(args.board_polygon)
+
+    board_mask = None
+    if args.auto_board_mask:
+        board_mask = build_auto_board_mask(
+            frame,
+            manual_points=manual_points,
+            scale=float(args.auto_board_mask_scale),
+        )
+        save_image(output_dir / "board_mask.png", board_mask)
 
     result = detector.detect(
         frame=frame,
-        reference_frame=reference,
+        reference_frame=reference_frame,
+        board_mask=board_mask,
         board_polygon=board_polygon,
     )
 
-    print_console_summary(result)
-
-    # Finales Overlay speichern
-    final_overlay = result.render_debug_overlay(frame)
-    save_image(output_dir / "single_cam_overlay.png", final_overlay)
-
-    # Stage-Debugbilder optional speichern
+    # -----------------------------------------------------------------
+    # Stage-Bilder speichern
+    # -----------------------------------------------------------------
     if args.save_stage_images:
-        for name, image in result.debug_images.items():
-            suffix = ".png"
-            save_image(output_dir / f"{name}{suffix}", image)
+        # Candidate stage images
+        candidate_result = getattr(result, "candidate_result", None)
+        candidate_debug_images = getattr(candidate_result, "debug_images", {}) if candidate_result is not None else {}
+        if isinstance(candidate_debug_images, dict):
+            for name, image in candidate_debug_images.items():
+                if isinstance(image, np.ndarray):
+                    save_image(output_dir / f"candidate_stage_{name}.png", image)
 
-    # Ergebnis als JSON speichern
-    result_json = {
-        "frame_path": str(Path(args.frame).resolve()),
-        "reference_path": str(Path(args.reference).resolve()),
-        "calibration_path": str(Path(args.calibration).resolve()),
-        "board_polygon_path": None if not args.board_polygon else str(Path(args.board_polygon).resolve()),
-        "best_label": result.best_label,
-        "best_score": result.best_score,
-        "result": make_json_safe(result.to_dict()),
-    }
+        # SingleCam debug images
+        result_debug_images = getattr(result, "debug_images", {}) or {}
+        if isinstance(result_debug_images, dict):
+            for name, image in result_debug_images.items():
+                if isinstance(image, np.ndarray):
+                    save_image(output_dir / f"single_cam_stage_{name}.png", image)
 
+    # -----------------------------------------------------------------
+    # Overlays speichern
+    # -----------------------------------------------------------------
+    if not args.no_stage_overlays:
+        candidate_result = getattr(result, "candidate_result", None)
+        impact_result = getattr(result, "impact_result", None)
+
+        if candidate_result is not None and hasattr(candidate_result, "render_debug_overlay"):
+            try:
+                candidate_overlay = candidate_result.render_debug_overlay(frame.copy())
+                save_image(output_dir / "candidate_overlay.png", candidate_overlay)
+            except Exception as exc:
+                print(f"Warnung: candidate_overlay konnte nicht erzeugt werden: {exc}")
+
+        if impact_result is not None and hasattr(impact_result, "render_debug_overlay"):
+            try:
+                impact_overlay = impact_result.render_debug_overlay(frame.copy())
+                save_image(output_dir / "impact_overlay.png", impact_overlay)
+            except Exception as exc:
+                print(f"Warnung: impact_overlay konnte nicht erzeugt werden: {exc}")
+
+        if hasattr(result, "render_debug_overlay"):
+            try:
+                single_cam_overlay = result.render_debug_overlay(frame.copy())
+                save_image(output_dir / "single_cam_overlay.png", single_cam_overlay)
+            except Exception as exc:
+                print(f"Warnung: single_cam_overlay konnte nicht erzeugt werden: {exc}")
+
+        try:
+            score_mapper = _get_score_mapper(detector)
+            score_geometry_overlay = render_score_geometry_overlay(frame, score_mapper)
+            save_image(output_dir / "score_geometry_overlay.png", score_geometry_overlay)
+        except Exception as exc:
+            print(f"Warnung: score_geometry_overlay konnte nicht erzeugt werden: {exc}")
+
+    # -----------------------------------------------------------------
+    # Ergebnis JSON speichern
+    # -----------------------------------------------------------------
+    result_dict = result.to_dict() if hasattr(result, "to_dict") else {"result": str(result)}
     with (output_dir / "result.json").open("w", encoding="utf-8") as f:
-        json.dump(result_json, f, indent=2, ensure_ascii=False)
+        json.dump(result_dict, f, indent=2, ensure_ascii=False)
 
-    print(f"\nAusgabe gespeichert in: {output_dir.resolve()}")
+    print_result_summary(
+        result,
+        calibration_source="old_calibration_json",
+        camera_index=int(args.camera_index),
+        image_size=image_size,
+    )
+    print()
+    print(f"Ausgabe gespeichert in: {output_dir}")
+
     return 0
 
 

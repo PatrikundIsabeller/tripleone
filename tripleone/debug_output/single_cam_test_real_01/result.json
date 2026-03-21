@@ -1,0 +1,1638 @@
+{
+  "frame_path": "D:\\tripleone\\tripleone\\data\\test_images\\dart_01.JPG",
+  "reference_path": "D:\\tripleone\\tripleone\\data\\references\\camera_1_empty_board.JPG",
+  "calibration_path": "D:\\tripleone\\tripleone\\config\\calibration.json",
+  "config_path": "D:\\tripleone\\tripleone\\config\\config.json",
+  "board_polygon_path": null,
+  "camera_index": 0,
+  "auto_board_mask_enabled": true,
+  "auto_board_mask_scale": 0.9,
+  "calibration_info": {
+    "camera_index": 0,
+    "image_size": [
+      1280,
+      720
+    ],
+    "manual_points": [
+      {
+        "x_px": 693,
+        "y_px": 188
+      },
+      {
+        "x_px": 963,
+        "y_px": 380
+      },
+      {
+        "x_px": 527,
+        "y_px": 593
+      },
+      {
+        "x_px": 355,
+        "y_px": 288
+      }
+    ],
+    "empty_board_reference_path": "",
+    "source_format": "old_calibration_json",
+    "raw_record": {
+      "name": "Kamera 1",
+      "frame_width": 1280,
+      "frame_height": 720,
+      "overlay_alpha": 0.4,
+      "show_numbers": true,
+      "show_sector_lines": true,
+      "points": [
+        {
+          "x_px": 693,
+          "y_px": 188
+        },
+        {
+          "x_px": 963,
+          "y_px": 380
+        },
+        {
+          "x_px": 527,
+          "y_px": 593
+        },
+        {
+          "x_px": 355,
+          "y_px": 288
+        },
+        {
+          "x_px": 635,
+          "y_px": 330
+        }
+      ]
+    }
+  },
+  "best_label": "MISS",
+  "best_score": 0,
+  "result": {
+    "metadata": {
+      "input_shape": [
+        2835,
+        2887,
+        3
+      ],
+      "candidate_count": 8,
+      "impact_count": 8,
+      "scored_count": 1,
+      "best_label": "MISS",
+      "best_score": 0,
+      "config": {
+        "max_estimates_to_score": 3,
+        "score_all_estimates": false,
+        "min_impact_confidence": 0.01,
+        "min_combined_confidence": 0.01,
+        "weight_candidate_confidence": 0.4,
+        "weight_impact_confidence": 0.6,
+        "keep_debug_images": true,
+        "keep_stage_results": true,
+        "render_stage_overlays": true
+      }
+    },
+    "best_label": "MISS",
+    "best_score": 0,
+    "scored_estimates": [
+      {
+        "rank": 1,
+        "candidate_id": 79,
+        "image_point": [
+          565.2095796553085,
+          102.5247158942088
+        ],
+        "label": "MISS",
+        "score": 0,
+        "ring": "MISS",
+        "segment": null,
+        "multiplier": 0,
+        "candidate_confidence": 0.9602233601273404,
+        "impact_confidence": 0.9300883444655299,
+        "combined_confidence": 0.9421423507302541,
+        "bbox": [
+          563,
+          74,
+          10,
+          30
+        ],
+        "centroid": [
+          567.6087570621469,
+          87.58757062146891
+        ],
+        "impact_estimate": {
+          "candidate_id": 79,
+          "impact_point": [
+            565.2095796553085,
+            102.5247158942088
+          ],
+          "method": "blend",
+          "confidence": 0.9300883444655299,
+          "source_candidate_confidence": 0.9602233601273404,
+          "bbox": [
+            563,
+            74,
+            10,
+            30
+          ],
+          "centroid": [
+            567.6087570621469,
+            87.58757062146891
+          ],
+          "hypothesis_count": 4,
+          "hypotheses": [
+            {
+              "name": "candidate_default",
+              "point": [
+                565.0,
+                103.0
+              ],
+              "base_weight": 0.7,
+              "source_quality": 0.9821005120573032,
+              "consistency_score": 1.0,
+              "final_weight": 0.6874703584401122,
+              "metadata": {}
+            },
+            {
+              "name": "lowest_contour_point",
+              "point": [
+                565.0,
+                103.0
+              ],
+              "base_weight": 0.9,
+              "source_quality": 0.9880670080382021,
+              "consistency_score": 1.0,
+              "final_weight": 0.889260307234382,
+              "metadata": {}
+            },
+            {
+              "name": "major_axis_lower_endpoint",
+              "point": [
+                565.0,
+                103.0
+              ],
+              "base_weight": 1.0,
+              "source_quality": 1.0,
+              "consistency_score": 1.0,
+              "final_weight": 1.0,
+              "metadata": {}
+            },
+            {
+              "name": "directional_contour_tip",
+              "point": [
+                565.7871915538757,
+                101.2148093849116
+              ],
+              "base_weight": 1.1,
+              "source_quality": 1.0,
+              "consistency_score": 0.8499420806041489,
+              "final_weight": 0.9349362886645638,
+              "metadata": {
+                "upper_endpoint": [
+                  571.0,
+                  74.0
+                ],
+                "lower_endpoint": [
+                  565.0,
+                  103.0
+                ],
+                "max_projection": 29.61418578992169,
+                "min_projection": 0.0,
+                "band_threshold": 25.17205792143344,
+                "band_point_count": 5,
+                "top_k_count": 8
+              }
+            }
+          ],
+          "debug": {
+            "spread_px": 0.7622925120403514,
+            "aggregate_strength": 0.8779167385847645,
+            "strategy": "blend",
+            "candidate_area": 118.0,
+            "candidate_aspect_ratio": 3.8900520690324534,
+            "candidate_elongation": 3.8900520690324534
+          }
+        },
+        "scored_hit": {
+          "label": "MISS",
+          "score": 0,
+          "ring": "MISS",
+          "segment": null,
+          "multiplier": 0,
+          "source_space": "image",
+          "image_point": [
+            565.2095796553085,
+            102.5247158942088
+          ],
+          "topdown_point": null,
+          "is_miss": true,
+          "is_bull": false
+        },
+        "debug": {
+          "impact_method": "blend",
+          "hypothesis_count": 4
+        }
+      }
+    ],
+    "candidate_result": {
+      "reference_used": true,
+      "board_mask_used": true,
+      "board_polygon_used": false,
+      "metadata": {
+        "input_shape": [
+          2835,
+          2887,
+          3
+        ],
+        "reference_resized": true,
+        "total_contours": 82,
+        "rejected_contours": 58,
+        "accepted_candidates": 8,
+        "roi_pixel_count": 275205,
+        "config": {
+          "blur_kernel_size": 5,
+          "apply_clahe": false,
+          "clahe_clip_limit": 2.0,
+          "clahe_tile_grid_size": 8,
+          "diff_threshold": 24,
+          "use_otsu_threshold": false,
+          "open_kernel_size": 3,
+          "close_kernel_size": 5,
+          "dilate_kernel_size": 3,
+          "erode_iterations": 0,
+          "dilate_iterations": 1,
+          "min_contour_area": 25.0,
+          "max_contour_area_ratio": 0.1,
+          "min_aspect_ratio": 1.2,
+          "min_solidity": 0.1,
+          "min_extent": 0.03,
+          "max_extent": 0.95,
+          "min_confidence": 0.18,
+          "max_candidates": 8,
+          "impact_point_mode": "major_axis_lower_endpoint",
+          "allow_reference_resize": true,
+          "keep_debug_images": true,
+          "draw_candidate_ids": true,
+          "draw_confidence": true
+        }
+      },
+      "candidates": [
+        {
+          "candidate_id": 58,
+          "bbox": [
+            417,
+            236,
+            24,
+            61
+          ],
+          "centroid": [
+            429.13656040928765,
+            269.577725304998
+          ],
+          "impact_point": [
+            422.0,
+            296.0
+          ],
+          "area": 423.5,
+          "aspect_ratio": 3.039674687599406,
+          "solidity": 0.5114734299516909,
+          "extent": 0.289275956284153,
+          "circularity": 0.20667417021468024,
+          "angle_degrees": 9.272602081298828,
+          "major_axis_length": 60.18277359008789,
+          "minor_axis_length": 19.799083709716797,
+          "elongation": 3.039674687599406,
+          "confidence": 0.9659211687575093,
+          "debug": {
+            "perimeter": 160.46803629398346,
+            "min_area_rect_center": [
+              430.635498046875,
+              266.9200744628906
+            ],
+            "min_area_rect_size": [
+              19.799083709716797,
+              60.18277359008789
+            ],
+            "touches_image_border": false,
+            "contour_lowest_point": [
+              422.0,
+              296.0
+            ],
+            "contour_highest_point": [
+              428.0,
+              236.0
+            ],
+            "contour_leftmost_point": [
+              417.0,
+              289.0
+            ],
+            "contour_rightmost_point": [
+              440.0,
+              271.0
+            ],
+            "major_axis_endpoint_a": [
+              428.0,
+              236.0
+            ],
+            "major_axis_endpoint_b": [
+              422.0,
+              296.0
+            ],
+            "confidence_parts": {
+              "area_score": 0.9846114714485565,
+              "aspect_score": 1.0,
+              "solidity_score": 1.0,
+              "extent_score": 1.0,
+              "non_round_score": 0.7933258297853197,
+              "border_penalty": 0.0,
+              "weighted_confidence": 0.9659211687575093
+            },
+            "impact_point_mode": "major_axis_lower_endpoint"
+          }
+        },
+        {
+          "candidate_id": 79,
+          "bbox": [
+            563,
+            74,
+            10,
+            30
+          ],
+          "centroid": [
+            567.6087570621469,
+            87.58757062146891
+          ],
+          "impact_point": [
+            565.0,
+            103.0
+          ],
+          "area": 118.0,
+          "aspect_ratio": 3.8900520690324534,
+          "solidity": 0.6194225721784777,
+          "extent": 0.3933333333333333,
+          "circularity": 0.2594606487565098,
+          "angle_degrees": 6.842772960662842,
+          "major_axis_length": 29.508296966552734,
+          "minor_axis_length": 7.585578918457031,
+          "elongation": 3.8900520690324534,
+          "confidence": 0.9602233601273404,
+          "debug": {
+            "perimeter": 75.5979790687561,
+            "min_area_rect_center": [
+              566.6987915039062,
+              88.34385681152344
+            ],
+            "min_area_rect_size": [
+              7.585578918457031,
+              29.508296966552734
+            ],
+            "touches_image_border": false,
+            "contour_lowest_point": [
+              565.0,
+              103.0
+            ],
+            "contour_highest_point": [
+              567.0,
+              74.0
+            ],
+            "contour_leftmost_point": [
+              563.0,
+              101.0
+            ],
+            "contour_rightmost_point": [
+              572.0,
+              76.0
+            ],
+            "major_axis_endpoint_a": [
+              571.0,
+              74.0
+            ],
+            "major_axis_endpoint_b": [
+              565.0,
+              103.0
+            ],
+            "confidence_parts": {
+              "area_score": 0.9957122872040842,
+              "aspect_score": 1.0,
+              "solidity_score": 1.0,
+              "extent_score": 1.0,
+              "non_round_score": 0.7405393512434901,
+              "border_penalty": 0.0,
+              "weighted_confidence": 0.9602233601273404
+            },
+            "impact_point_mode": "major_axis_lower_endpoint"
+          }
+        },
+        {
+          "candidate_id": 60,
+          "bbox": [
+            364,
+            229,
+            17,
+            60
+          ],
+          "centroid": [
+            371.60861207227987,
+            258.15532487504805
+          ],
+          "impact_point": [
+            377.0,
+            288.0
+          ],
+          "area": 433.5,
+          "aspect_ratio": 4.205633265301277,
+          "solidity": 0.7135802469135802,
+          "extent": 0.425,
+          "circularity": 0.2689249428036878,
+          "angle_degrees": 83.1572265625,
+          "major_axis_length": 59.29459762573242,
+          "minor_axis_length": 14.098851203918457,
+          "elongation": 4.205633265301277,
+          "confidence": 0.9565108797709223,
+          "debug": {
+            "perimeter": 142.32590055465698,
+            "min_area_rect_center": [
+              370.25396728515625,
+              258.9495544433594
+            ],
+            "min_area_rect_size": [
+              59.29459762573242,
+              14.098851203918457
+            ],
+            "touches_image_border": false,
+            "contour_lowest_point": [
+              376.0,
+              288.0
+            ],
+            "contour_highest_point": [
+              371.0,
+              229.0
+            ],
+            "contour_leftmost_point": [
+              364.0,
+              259.0
+            ],
+            "contour_rightmost_point": [
+              380.0,
+              285.0
+            ],
+            "major_axis_endpoint_a": [
+              371.0,
+              229.0
+            ],
+            "major_axis_endpoint_b": [
+              377.0,
+              288.0
+            ],
+            "confidence_parts": {
+              "area_score": 0.9842481059573772,
+              "aspect_score": 1.0,
+              "solidity_score": 1.0,
+              "extent_score": 1.0,
+              "non_round_score": 0.7310750571963123,
+              "border_penalty": 0.0,
+              "weighted_confidence": 0.9565108797709223
+            },
+            "impact_point_mode": "major_axis_lower_endpoint"
+          }
+        },
+        {
+          "candidate_id": 63,
+          "bbox": [
+            452,
+            223,
+            9,
+            24
+          ],
+          "centroid": [
+            456.9322638146167,
+            235.09803921568624
+          ],
+          "impact_point": [
+            457.0,
+            246.0
+          ],
+          "area": 93.5,
+          "aspect_ratio": 3.066666530356507,
+          "solidity": 0.7333333333333333,
+          "extent": 0.43287037037037035,
+          "circularity": 0.37873437318038405,
+          "angle_degrees": 5.710593223571777,
+          "major_axis_length": 22.885854721069336,
+          "minor_axis_length": 7.4627790451049805,
+          "elongation": 3.066666530356507,
+          "confidence": 0.9425103505544371,
+          "debug": {
+            "perimeter": 55.69848418235779,
+            "min_area_rect_center": [
+              456.20794677734375,
+              234.4208221435547
+            ],
+            "min_area_rect_size": [
+              7.4627790451049805,
+              22.885854721069336
+            ],
+            "touches_image_border": false,
+            "contour_lowest_point": [
+              457.0,
+              246.0
+            ],
+            "contour_highest_point": [
+              457.0,
+              223.0
+            ],
+            "contour_leftmost_point": [
+              452.0,
+              239.0
+            ],
+            "contour_rightmost_point": [
+              460.0,
+              234.0
+            ],
+            "major_axis_endpoint_a": [
+              457.0,
+              223.0
+            ],
+            "major_axis_endpoint_b": [
+              457.0,
+              246.0
+            ],
+            "confidence_parts": {
+              "area_score": 0.9966025326574736,
+              "aspect_score": 1.0,
+              "solidity_score": 1.0,
+              "extent_score": 1.0,
+              "non_round_score": 0.621265626819616,
+              "border_penalty": 0.0,
+              "weighted_confidence": 0.9425103505544371
+            },
+            "impact_point_mode": "major_axis_lower_endpoint"
+          }
+        },
+        {
+          "candidate_id": 70,
+          "bbox": [
+            841,
+            187,
+            16,
+            10
+          ],
+          "centroid": [
+            849.0809061488673,
+            191.45954692556634
+          ],
+          "impact_point": [
+            841.0,
+            194.0
+          ],
+          "area": 51.5,
+          "aspect_ratio": 2.685185155874151,
+          "solidity": 0.7410071942446043,
+          "extent": 0.321875,
+          "circularity": 0.41064755791922125,
+          "angle_degrees": 57.9946174621582,
+          "major_axis_length": 15.369970321655273,
+          "minor_axis_length": 5.723989009857178,
+          "elongation": 2.685185155874151,
+          "confidence": 0.9380285998562022,
+          "debug": {
+            "perimeter": 39.69848418235779,
+            "min_area_rect_center": [
+              848.6966552734375,
+              191.81463623046875
+            ],
+            "min_area_rect_size": [
+              5.723989009857178,
+              15.369970321655273
+            ],
+            "touches_image_border": false,
+            "contour_lowest_point": [
+              843.0,
+              196.0
+            ],
+            "contour_highest_point": [
+              851.0,
+              187.0
+            ],
+            "contour_leftmost_point": [
+              841.0,
+              194.0
+            ],
+            "contour_rightmost_point": [
+              856.0,
+              189.0
+            ],
+            "major_axis_endpoint_a": [
+              856.0,
+              189.0
+            ],
+            "major_axis_endpoint_b": [
+              841.0,
+              194.0
+            ],
+            "confidence_parts": {
+              "area_score": 0.9981286677204266,
+              "aspect_score": 1.0,
+              "solidity_score": 1.0,
+              "extent_score": 1.0,
+              "non_round_score": 0.5893524420807787,
+              "border_penalty": 0.0,
+              "weighted_confidence": 0.9380285998562022
+            },
+            "impact_point_mode": "major_axis_lower_endpoint"
+          }
+        },
+        {
+          "candidate_id": 54,
+          "bbox": [
+            454,
+            254,
+            11,
+            28
+          ],
+          "centroid": [
+            458.1978494623655,
+            265.7344086021505
+          ],
+          "impact_point": [
+            457.0,
+            281.0
+          ],
+          "area": 155.0,
+          "aspect_ratio": 2.7,
+          "solidity": 0.7828282828282829,
+          "extent": 0.5032467532467533,
+          "circularity": 0.4061078563321408,
+          "angle_degrees": 90.0,
+          "major_axis_length": 27.0,
+          "minor_axis_length": 10.0,
+          "elongation": 2.7,
+          "confidence": 0.937957388527523,
+          "debug": {
+            "perimeter": 69.25483286380768,
+            "min_area_rect_center": [
+              459.0,
+              267.5
+            ],
+            "min_area_rect_size": [
+              27.0,
+              10.0
+            ],
+            "touches_image_border": false,
+            "contour_lowest_point": [
+              457.0,
+              281.0
+            ],
+            "contour_highest_point": [
+              456.0,
+              254.0
+            ],
+            "contour_leftmost_point": [
+              454.0,
+              256.0
+            ],
+            "contour_rightmost_point": [
+              464.0,
+              267.0
+            ],
+            "major_axis_endpoint_a": [
+              457.0,
+              254.0
+            ],
+            "major_axis_endpoint_b": [
+              457.0,
+              281.0
+            ],
+            "confidence_parts": {
+              "area_score": 0.9943678348867208,
+              "aspect_score": 1.0,
+              "solidity_score": 1.0,
+              "extent_score": 1.0,
+              "non_round_score": 0.5938921436678593,
+              "border_penalty": 0.0,
+              "weighted_confidence": 0.937957388527523
+            },
+            "impact_point_mode": "major_axis_lower_endpoint"
+          }
+        },
+        {
+          "candidate_id": 19,
+          "bbox": [
+            656,
+            452,
+            260,
+            206
+          ],
+          "centroid": [
+            781.6273625429553,
+            559.3782216494845
+          ],
+          "impact_point": [
+            656.0,
+            656.0
+          ],
+          "area": 7760.0,
+          "aspect_ratio": 3.225445300297185,
+          "solidity": 0.3709546345427602,
+          "extent": 0.14488424197162061,
+          "circularity": 0.07824252033521195,
+          "angle_degrees": 65.57807159423828,
+          "major_axis_length": 319.7571105957031,
+          "minor_axis_length": 99.13580322265625,
+          "elongation": 3.225445300297185,
+          "confidence": 0.9318692977186905,
+          "debug": {
+            "perimeter": 1116.385987997055,
+            "min_area_rect_center": [
+              789.0022583007812,
+              562.2131958007812
+            ],
+            "min_area_rect_size": [
+              99.13580322265625,
+              319.7571105957031
+            ],
+            "touches_image_border": false,
+            "contour_lowest_point": [
+              657.0,
+              657.0
+            ],
+            "contour_highest_point": [
+              914.0,
+              452.0
+            ],
+            "contour_leftmost_point": [
+              656.0,
+              656.0
+            ],
+            "contour_rightmost_point": [
+              915.0,
+              455.0
+            ],
+            "major_axis_endpoint_a": [
+              915.0,
+              453.0
+            ],
+            "major_axis_endpoint_b": [
+              656.0,
+              656.0
+            ],
+            "confidence_parts": {
+              "area_score": 0.7180283788448611,
+              "aspect_score": 1.0,
+              "solidity_score": 1.0,
+              "extent_score": 1.0,
+              "non_round_score": 0.921757479664788,
+              "border_penalty": 0.0,
+              "weighted_confidence": 0.9318692977186905
+            },
+            "impact_point_mode": "major_axis_lower_endpoint"
+          }
+        },
+        {
+          "candidate_id": 27,
+          "bbox": [
+            548,
+            438,
+            16,
+            12
+          ],
+          "centroid": [
+            554.6159420289855,
+            443.0748792270531
+          ],
+          "impact_point": [
+            548.0,
+            447.0
+          ],
+          "area": 69.0,
+          "aspect_ratio": 2.3802817223176262,
+          "solidity": 0.7752808988764045,
+          "extent": 0.359375,
+          "circularity": 0.4591584540370766,
+          "angle_degrees": 48.8140754699707,
+          "major_axis_length": 15.89818286895752,
+          "minor_axis_length": 6.6791181564331055,
+          "elongation": 2.3802817223176262,
+          "confidence": 0.9306247875166109,
+          "debug": {
+            "perimeter": 43.455843567848206,
+            "min_area_rect_center": [
+              554.9424438476562,
+              442.86285400390625
+            ],
+            "min_area_rect_size": [
+              6.6791181564331055,
+              15.89818286895752
+            ],
+            "touches_image_border": false,
+            "contour_lowest_point": [
+              550.0,
+              449.0
+            ],
+            "contour_highest_point": [
+              557.0,
+              438.0
+            ],
+            "contour_leftmost_point": [
+              548.0,
+              447.0
+            ],
+            "contour_rightmost_point": [
+              563.0,
+              440.0
+            ],
+            "major_axis_endpoint_a": [
+              563.0,
+              440.0
+            ],
+            "major_axis_endpoint_b": [
+              548.0,
+              447.0
+            ],
+            "confidence_parts": {
+              "area_score": 0.9974927781108628,
+              "aspect_score": 1.0,
+              "solidity_score": 1.0,
+              "extent_score": 1.0,
+              "non_round_score": 0.5408415459629234,
+              "border_penalty": 0.0,
+              "weighted_confidence": 0.9306247875166109
+            },
+            "impact_point_mode": "major_axis_lower_endpoint"
+          }
+        }
+      ]
+    },
+    "impact_result": {
+      "metadata": {
+        "input_candidates": 8,
+        "accepted_estimates": 8,
+        "config": {
+          "strategy": "blend",
+          "use_candidate_default": true,
+          "use_lowest_contour_point": true,
+          "use_major_axis_lower_endpoint": true,
+          "use_directional_contour_tip": true,
+          "weight_candidate_default": 0.7,
+          "weight_lowest_contour_point": 0.9,
+          "weight_major_axis_lower_endpoint": 1.0,
+          "weight_directional_contour_tip": 1.1,
+          "min_major_axis_length_for_axis_based_methods": 10.0,
+          "min_aspect_ratio_for_axis_based_methods": 1.15,
+          "min_candidate_confidence": 0.01,
+          "directional_tip_band_fraction": 0.15,
+          "directional_tip_top_k_points": 8,
+          "consistency_distance_scale_px": 12.0,
+          "weight_source_candidate_confidence": 0.6,
+          "weight_hypothesis_strength": 0.4,
+          "clamp_to_image_bounds": true,
+          "keep_debug_metadata": true
+        }
+      },
+      "estimates": [
+        {
+          "candidate_id": 79,
+          "impact_point": [
+            565.2095796553085,
+            102.5247158942088
+          ],
+          "method": "blend",
+          "confidence": 0.9300883444655299,
+          "source_candidate_confidence": 0.9602233601273404,
+          "bbox": [
+            563,
+            74,
+            10,
+            30
+          ],
+          "centroid": [
+            567.6087570621469,
+            87.58757062146891
+          ],
+          "hypothesis_count": 4,
+          "hypotheses": [
+            {
+              "name": "candidate_default",
+              "point": [
+                565.0,
+                103.0
+              ],
+              "base_weight": 0.7,
+              "source_quality": 0.9821005120573032,
+              "consistency_score": 1.0,
+              "final_weight": 0.6874703584401122,
+              "metadata": {}
+            },
+            {
+              "name": "lowest_contour_point",
+              "point": [
+                565.0,
+                103.0
+              ],
+              "base_weight": 0.9,
+              "source_quality": 0.9880670080382021,
+              "consistency_score": 1.0,
+              "final_weight": 0.889260307234382,
+              "metadata": {}
+            },
+            {
+              "name": "major_axis_lower_endpoint",
+              "point": [
+                565.0,
+                103.0
+              ],
+              "base_weight": 1.0,
+              "source_quality": 1.0,
+              "consistency_score": 1.0,
+              "final_weight": 1.0,
+              "metadata": {}
+            },
+            {
+              "name": "directional_contour_tip",
+              "point": [
+                565.7871915538757,
+                101.2148093849116
+              ],
+              "base_weight": 1.1,
+              "source_quality": 1.0,
+              "consistency_score": 0.8499420806041489,
+              "final_weight": 0.9349362886645638,
+              "metadata": {
+                "upper_endpoint": [
+                  571.0,
+                  74.0
+                ],
+                "lower_endpoint": [
+                  565.0,
+                  103.0
+                ],
+                "max_projection": 29.61418578992169,
+                "min_projection": 0.0,
+                "band_threshold": 25.17205792143344,
+                "band_point_count": 5,
+                "top_k_count": 8
+              }
+            }
+          ],
+          "debug": {
+            "spread_px": 0.7622925120403514,
+            "aggregate_strength": 0.8779167385847645,
+            "strategy": "blend",
+            "candidate_area": 118.0,
+            "candidate_aspect_ratio": 3.8900520690324534,
+            "candidate_elongation": 3.8900520690324534
+          }
+        },
+        {
+          "candidate_id": 58,
+          "impact_point": [
+            422.56018901593075,
+            295.5875319949521
+          ],
+          "method": "blend",
+          "confidence": 0.9230540068184293,
+          "source_candidate_confidence": 0.9659211687575093,
+          "bbox": [
+            417,
+            236,
+            24,
+            61
+          ],
+          "centroid": [
+            429.13656040928765,
+            269.577725304998
+          ],
+          "hypothesis_count": 4,
+          "hypotheses": [
+            {
+              "name": "candidate_default",
+              "point": [
+                422.0,
+                296.0
+              ],
+              "base_weight": 0.7,
+              "source_quality": 0.9846645259408793,
+              "consistency_score": 1.0,
+              "final_weight": 0.6892651681586155,
+              "metadata": {}
+            },
+            {
+              "name": "lowest_contour_point",
+              "point": [
+                422.0,
+                296.0
+              ],
+              "base_weight": 0.9,
+              "source_quality": 0.9897763506272528,
+              "consistency_score": 1.0,
+              "final_weight": 0.8907987155645275,
+              "metadata": {}
+            },
+            {
+              "name": "major_axis_lower_endpoint",
+              "point": [
+                422.0,
+                296.0
+              ],
+              "base_weight": 1.0,
+              "source_quality": 1.0,
+              "consistency_score": 1.0,
+              "final_weight": 1.0,
+              "metadata": {}
+            },
+            {
+              "name": "directional_contour_tip",
+              "point": [
+                424.2121219965462,
+                294.37121128603013
+              ],
+              "base_weight": 1.1,
+              "source_quality": 1.0,
+              "consistency_score": 0.7953896572966194,
+              "final_weight": 0.8749286230262814,
+              "metadata": {
+                "upper_endpoint": [
+                  428.0,
+                  236.0
+                ],
+                "lower_endpoint": [
+                  422.0,
+                  296.0
+                ],
+                "max_projection": 60.29925372672534,
+                "min_projection": 0.0,
+                "band_threshold": 51.25436566771654,
+                "band_point_count": 15,
+                "top_k_count": 8
+              }
+            }
+          ],
+          "debug": {
+            "spread_px": 1.0389862934282357,
+            "aggregate_strength": 0.8637481266873561,
+            "strategy": "blend",
+            "candidate_area": 423.5,
+            "candidate_aspect_ratio": 3.039674687599406,
+            "candidate_elongation": 3.039674687599406
+          }
+        },
+        {
+          "candidate_id": 60,
+          "impact_point": [
+            376.55135650831613,
+            287.51236426422474
+          ],
+          "method": "blend",
+          "confidence": 0.9200179396591449,
+          "source_candidate_confidence": 0.9565108797709223,
+          "bbox": [
+            364,
+            229,
+            17,
+            60
+          ],
+          "centroid": [
+            371.60861207227987,
+            258.15532487504805
+          ],
+          "hypothesis_count": 4,
+          "hypotheses": [
+            {
+              "name": "candidate_default",
+              "point": [
+                377.0,
+                288.0
+              ],
+              "base_weight": 0.7,
+              "source_quality": 0.9804298958969151,
+              "consistency_score": 0.9699187155092135,
+              "final_weight": 0.6656561136926175,
+              "metadata": {}
+            },
+            {
+              "name": "lowest_contour_point",
+              "point": [
+                376.0,
+                288.0
+              ],
+              "base_weight": 0.9,
+              "source_quality": 0.9869532639312766,
+              "consistency_score": 0.9485788859598344,
+              "final_weight": 0.8425827248349176,
+              "metadata": {}
+            },
+            {
+              "name": "major_axis_lower_endpoint",
+              "point": [
+                377.0,
+                288.0
+              ],
+              "base_weight": 1.0,
+              "source_quality": 1.0,
+              "consistency_score": 0.9699187155092135,
+              "final_weight": 0.9699187155092135,
+              "metadata": {}
+            },
+            {
+              "name": "directional_contour_tip",
+              "point": [
+                376.2669514824848,
+                286.23579657823177
+              ],
+              "base_weight": 1.1,
+              "source_quality": 1.0,
+              "consistency_score": 0.8605733779082032,
+              "final_weight": 0.9466307156990236,
+              "metadata": {
+                "upper_endpoint": [
+                  371.0,
+                  229.0
+                ],
+                "lower_endpoint": [
+                  377.0,
+                  288.0
+                ],
+                "max_projection": 59.30430001273095,
+                "min_projection": 0.0,
+                "band_threshold": 50.408655010821306,
+                "band_point_count": 10,
+                "top_k_count": 8
+              }
+            }
+          ],
+          "debug": {
+            "spread_px": 0.8590387189248201,
+            "aggregate_strength": 0.856197067433943,
+            "strategy": "blend",
+            "candidate_area": 433.5,
+            "candidate_aspect_ratio": 4.205633265301277,
+            "candidate_elongation": 4.205633265301277
+          }
+        },
+        {
+          "candidate_id": 54,
+          "impact_point": [
+            457.0000000210032,
+            280.411910973208
+          ],
+          "method": "blend",
+          "confidence": 0.9153777423915412,
+          "source_candidate_confidence": 0.937957388527523,
+          "bbox": [
+            454,
+            254,
+            11,
+            28
+          ],
+          "centroid": [
+            458.1978494623655,
+            265.7344086021505
+          ],
+          "hypothesis_count": 4,
+          "hypotheses": [
+            {
+              "name": "candidate_default",
+              "point": [
+                457.0,
+                281.0
+              ],
+              "base_weight": 0.7,
+              "source_quality": 0.9720808248373853,
+              "consistency_score": 1.0,
+              "final_weight": 0.6804565773861697,
+              "metadata": {}
+            },
+            {
+              "name": "lowest_contour_point",
+              "point": [
+                457.0,
+                281.0
+              ],
+              "base_weight": 0.9,
+              "source_quality": 0.9813872165582569,
+              "consistency_score": 1.0,
+              "final_weight": 0.8832484949024312,
+              "metadata": {}
+            },
+            {
+              "name": "major_axis_lower_endpoint",
+              "point": [
+                457.0,
+                281.0
+              ],
+              "base_weight": 1.0,
+              "source_quality": 1.0,
+              "consistency_score": 1.0,
+              "final_weight": 1.0,
+              "metadata": {}
+            },
+            {
+              "name": "directional_contour_tip",
+              "point": [
+                457.00000008,
+                278.7599994768001
+              ],
+              "base_weight": 1.1,
+              "source_quality": 1.0,
+              "consistency_score": 0.8297202275403972,
+              "final_weight": 0.912692250294437,
+              "metadata": {
+                "upper_endpoint": [
+                  457.0,
+                  254.0
+                ],
+                "lower_endpoint": [
+                  457.0,
+                  281.0
+                ],
+                "max_projection": 27.0,
+                "min_projection": 0.0,
+                "band_threshold": 22.95,
+                "band_point_count": 5,
+                "top_k_count": 8
+              }
+            }
+          ],
+          "debug": {
+            "spread_px": 0.8673846405010979,
+            "aggregate_strength": 0.8690993306457595,
+            "strategy": "blend",
+            "candidate_area": 155.0,
+            "candidate_aspect_ratio": 2.7,
+            "candidate_elongation": 2.7
+          }
+        },
+        {
+          "candidate_id": 63,
+          "impact_point": [
+            456.65509175898484,
+            245.34153872352985
+          ],
+          "method": "blend",
+          "confidence": 0.9088964237565357,
+          "source_candidate_confidence": 0.9425103505544371,
+          "bbox": [
+            452,
+            223,
+            9,
+            24
+          ],
+          "centroid": [
+            456.9322638146167,
+            235.09803921568624
+          ],
+          "hypothesis_count": 4,
+          "hypotheses": [
+            {
+              "name": "candidate_default",
+              "point": [
+                457.0,
+                246.0
+              ],
+              "base_weight": 0.7,
+              "source_quality": 0.9741296577494967,
+              "consistency_score": 1.0,
+              "final_weight": 0.6818907604246476,
+              "metadata": {}
+            },
+            {
+              "name": "lowest_contour_point",
+              "point": [
+                457.0,
+                246.0
+              ],
+              "base_weight": 0.9,
+              "source_quality": 0.9827531051663312,
+              "consistency_score": 1.0,
+              "final_weight": 0.8844777946496981,
+              "metadata": {}
+            },
+            {
+              "name": "major_axis_lower_endpoint",
+              "point": [
+                457.0,
+                246.0
+              ],
+              "base_weight": 1.0,
+              "source_quality": 1.0,
+              "consistency_score": 1.0,
+              "final_weight": 1.0,
+              "metadata": {}
+            },
+            {
+              "name": "directional_contour_tip",
+              "point": [
+                455.6249998750001,
+                243.37499940625025
+              ],
+              "base_weight": 1.1,
+              "source_quality": 1.0,
+              "consistency_score": 0.7811850908107149,
+              "final_weight": 0.8593035998917864,
+              "metadata": {
+                "upper_endpoint": [
+                  457.0,
+                  223.0
+                ],
+                "lower_endpoint": [
+                  457.0,
+                  246.0
+                ],
+                "max_projection": 23.0,
+                "min_projection": 0.0,
+                "band_threshold": 19.55,
+                "band_point_count": 3,
+                "top_k_count": 8
+              }
+            }
+          ],
+          "debug": {
+            "spread_px": 1.1137361424181778,
+            "aggregate_strength": 0.856418038741533,
+            "strategy": "blend",
+            "candidate_area": 93.5,
+            "candidate_aspect_ratio": 3.066666530356507,
+            "candidate_elongation": 3.066666530356507
+          }
+        },
+        {
+          "candidate_id": 19,
+          "impact_point": [
+            656.8187969373838,
+            656.1197774438078
+          ],
+          "method": "blend",
+          "confidence": 0.8986229201048935,
+          "source_candidate_confidence": 0.9318692977186905,
+          "bbox": [
+            656,
+            452,
+            260,
+            206
+          ],
+          "centroid": [
+            781.6273625429553,
+            559.3782216494845
+          ],
+          "hypothesis_count": 4,
+          "hypotheses": [
+            {
+              "name": "candidate_default",
+              "point": [
+                656.0,
+                656.0
+              ],
+              "base_weight": 0.7,
+              "source_quality": 0.9693411839734107,
+              "consistency_score": 0.9591894571091382,
+              "final_weight": 0.6508472908062896,
+              "metadata": {}
+            },
+            {
+              "name": "lowest_contour_point",
+              "point": [
+                657.0,
+                657.0
+              ],
+              "base_weight": 0.9,
+              "source_quality": 0.9795607893156071,
+              "consistency_score": 0.9110390669406164,
+              "final_weight": 0.803176332758734,
+              "metadata": {}
+            },
+            {
+              "name": "major_axis_lower_endpoint",
+              "point": [
+                656.0,
+                656.0
+              ],
+              "base_weight": 1.0,
+              "source_quality": 0.9733279006958008,
+              "consistency_score": 0.9591894571091382,
+              "final_weight": 0.9336058606575823,
+              "metadata": {}
+            },
+            {
+              "name": "directional_contour_tip",
+              "point": [
+                658.0520303380591,
+                655.5660228148005
+              ],
+              "base_weight": 1.1,
+              "source_quality": 0.9711052257537842,
+              "consistency_score": 0.8743304439307716,
+              "final_weight": 0.9339735494504783,
+              "metadata": {
+                "upper_endpoint": [
+                  915.0,
+                  453.0
+                ],
+                "lower_endpoint": [
+                  656.0,
+                  656.0
+                ],
+                "max_projection": 329.0744596592084,
+                "min_projection": 0.0,
+                "band_threshold": 279.71329071032716,
+                "band_point_count": 37,
+                "top_k_count": 8
+              }
+            }
+          ],
+          "debug": {
+            "spread_px": 0.9921557285235182,
+            "aggregate_strength": 0.830400758418271,
+            "strategy": "blend",
+            "candidate_area": 7760.0,
+            "candidate_aspect_ratio": 3.225445300297185,
+            "candidate_elongation": 3.225445300297185
+          }
+        },
+        {
+          "candidate_id": 27,
+          "impact_point": [
+            548.8835811402295,
+            447.4148211379852
+          ],
+          "method": "blend",
+          "confidence": 0.8881542781823022,
+          "source_candidate_confidence": 0.9306247875166109,
+          "bbox": [
+            548,
+            438,
+            16,
+            12
+          ],
+          "centroid": [
+            554.6159420289855,
+            443.0748792270531
+          ],
+          "hypothesis_count": 4,
+          "hypotheses": [
+            {
+              "name": "candidate_default",
+              "point": [
+                548.0,
+                447.0
+              ],
+              "base_weight": 0.7,
+              "source_quality": 0.9687811543824749,
+              "consistency_score": 0.9416997741710234,
+              "final_weight": 0.6386106960121839,
+              "metadata": {}
+            },
+            {
+              "name": "lowest_contour_point",
+              "point": [
+                550.0,
+                449.0
+              ],
+              "base_weight": 0.9,
+              "source_quality": 0.9791874362549833,
+              "consistency_score": 0.8205006571881212,
+              "final_weight": 0.7230815414618087,
+              "metadata": {}
+            },
+            {
+              "name": "major_axis_lower_endpoint",
+              "point": [
+                548.0,
+                447.0
+              ],
+              "base_weight": 1.0,
+              "source_quality": 0.9446254687309266,
+              "consistency_score": 0.9416997741710234,
+              "final_weight": 0.8895535905801106,
+              "metadata": {}
+            },
+            {
+              "name": "directional_contour_tip",
+              "point": [
+                549.4416249732778,
+                446.8883245745302
+              ],
+              "base_weight": 1.1,
+              "source_quality": 0.9400109244585038,
+              "consistency_score": 0.9410271412692358,
+              "final_weight": 0.9730333723055412,
+              "metadata": {
+                "upper_endpoint": [
+                  563.0,
+                  440.0
+                ],
+                "lower_endpoint": [
+                  548.0,
+                  447.0
+                ],
+                "max_projection": 16.55294535724685,
+                "min_projection": 0.0,
+                "band_threshold": 14.070003553659822,
+                "band_point_count": 4,
+                "top_k_count": 8
+              }
+            }
+          ],
+          "debug": {
+            "spread_px": 1.1289759186395572,
+            "aggregate_strength": 0.8060698000899111,
+            "strategy": "blend",
+            "candidate_area": 69.0,
+            "candidate_aspect_ratio": 2.3802817223176262,
+            "candidate_elongation": 2.3802817223176262
+          }
+        },
+        {
+          "candidate_id": 70,
+          "impact_point": [
+            842.00954677045,
+            194.53473360912687
+          ],
+          "method": "blend",
+          "confidence": 0.8870290870016297,
+          "source_candidate_confidence": 0.9380285998562022,
+          "bbox": [
+            841,
+            187,
+            16,
+            10
+          ],
+          "centroid": [
+            849.0809061488673,
+            191.45954692556634
+          ],
+          "hypothesis_count": 4,
+          "hypotheses": [
+            {
+              "name": "candidate_default",
+              "point": [
+                841.0,
+                194.0
+              ],
+              "base_weight": 0.7,
+              "source_quality": 0.972112869935291,
+              "consistency_score": 0.9258517021143623,
+              "final_weight": 0.6300226486938068,
+              "metadata": {}
+            },
+            {
+              "name": "lowest_contour_point",
+              "point": [
+                843.0,
+                196.0
+              ],
+              "base_weight": 0.9,
+              "source_quality": 0.9814085799568606,
+              "consistency_score": 0.8346090482132554,
+              "final_weight": 0.7371832327435062,
+              "metadata": {}
+            },
+            {
+              "name": "major_axis_lower_endpoint",
+              "point": [
+                841.0,
+                194.0
+              ],
+              "base_weight": 1.0,
+              "source_quality": 0.9374945993423462,
+              "consistency_score": 0.9258517021143623,
+              "final_weight": 0.8679809705241334,
+              "metadata": {}
+            },
+            {
+              "name": "directional_contour_tip",
+              "point": [
+                842.8333338798996,
+                194.2407405108359
+              ],
+              "base_weight": 1.1,
+              "source_quality": 0.9322858159542083,
+              "consistency_score": 0.9258452555836274,
+              "final_weight": 0.9494676395040261,
+              "metadata": {
+                "upper_endpoint": [
+                  856.0,
+                  189.0
+                ],
+                "lower_endpoint": [
+                  841.0,
+                  194.0
+                ],
+                "max_projection": 15.811388300841896,
+                "min_projection": 0.0,
+                "band_threshold": 13.439680055715613,
+                "band_point_count": 3,
+                "top_k_count": 8
+              }
+            }
+          ],
+          "debug": {
+            "spread_px": 1.2075471166185874,
+            "aggregate_strength": 0.7961636228663681,
+            "strategy": "blend",
+            "candidate_area": 51.5,
+            "candidate_aspect_ratio": 2.685185155874151,
+            "candidate_elongation": 2.685185155874151
+          }
+        }
+      ]
+    }
+  }
+}

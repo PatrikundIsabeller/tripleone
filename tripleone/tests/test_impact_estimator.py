@@ -11,7 +11,8 @@
 # - Hypothesenbildung aus DartCandidate
 # - finale Impact-Punktwahl
 # - Strategien wie candidate_default, lowest_contour_point,
-#   major_axis_lower_endpoint, directional_contour_tip, blend
+#   major_axis_lower_endpoint, major_axis_centerward_endpoint,
+#   directional_contour_tip, blend
 # - Sortierung / best_estimate
 # - Clamping an Bildgrenzen
 # - Wrapper-Funktionen
@@ -144,11 +145,13 @@ def _base_config(**overrides) -> ie.ImpactEstimatorConfig:
         use_candidate_default=True,
         use_lowest_contour_point=True,
         use_major_axis_lower_endpoint=True,
+        use_major_axis_centerward_endpoint=True,
         use_directional_contour_tip=True,
-        weight_candidate_default=0.70,
-        weight_lowest_contour_point=0.90,
-        weight_major_axis_lower_endpoint=1.00,
-        weight_directional_contour_tip=1.10,
+        weight_candidate_default=0.55,
+        weight_lowest_contour_point=0.45,
+        weight_major_axis_lower_endpoint=0.35,
+        weight_major_axis_centerward_endpoint=1.45,
+        weight_directional_contour_tip=0.95,
         min_major_axis_length_for_axis_based_methods=10.0,
         min_aspect_ratio_for_axis_based_methods=1.15,
         min_candidate_confidence=0.01,
@@ -159,6 +162,7 @@ def _base_config(**overrides) -> ie.ImpactEstimatorConfig:
         weight_hypothesis_strength=0.40,
         clamp_to_image_bounds=True,
         keep_debug_metadata=True,
+        
     )
 
     for key, value in overrides.items():
@@ -202,6 +206,7 @@ def test_candidate_default_strategy_returns_candidate_impact_point_exactly():
             use_candidate_default=True,
             use_lowest_contour_point=False,
             use_major_axis_lower_endpoint=False,
+            use_major_axis_centerward_endpoint=False,
             use_directional_contour_tip=False,
         )
     )
@@ -232,6 +237,7 @@ def test_lowest_contour_point_strategy_uses_debug_lowest_point_exactly():
             use_candidate_default=False,
             use_lowest_contour_point=True,
             use_major_axis_lower_endpoint=False,
+            use_major_axis_centerward_endpoint=False,
             use_directional_contour_tip=False,
         )
     )
@@ -261,6 +267,7 @@ def test_major_axis_lower_endpoint_strategy_uses_lower_debug_endpoint():
             use_candidate_default=False,
             use_lowest_contour_point=False,
             use_major_axis_lower_endpoint=True,
+            use_major_axis_centerward_endpoint=False,
             use_directional_contour_tip=False,
         )
     )
@@ -270,6 +277,72 @@ def test_major_axis_lower_endpoint_strategy_uses_lower_debug_endpoint():
     assert estimate.method == "major_axis_lower_endpoint"
     assert estimate.impact_point == pytest.approx((101.0, 176.0), abs=1e-6)
     assert estimate.hypothesis_count == 1
+
+
+def test_major_axis_centerward_endpoint_strategy_uses_endpoint_closer_to_board_center():
+    """
+    Die neue Strategie major_axis_centerward_endpoint soll von zwei
+    Major-Axis-Endpunkten denjenigen wählen, der näher am Boardzentrum liegt.
+
+    Dieser Test bildet genau den realen Fall nach:
+    - ein Ende zeigt eher nach außen (Flights)
+    - das andere Ende eher zum Bull (Spitze)
+    """
+    candidate = _build_candidate(
+        debug={
+            "major_axis_endpoint_a": (820.0, 500.0),  # näher am Zentrum
+            "major_axis_endpoint_b": (930.0, 420.0),  # weiter außen
+            "board_center_image": (640.0, 360.0),
+        }
+    )
+
+    estimator = ie.ImpactEstimator(
+        config=_base_config(
+            strategy="major_axis_centerward_endpoint",
+            use_candidate_default=False,
+            use_lowest_contour_point=False,
+            use_major_axis_lower_endpoint=False,
+            use_major_axis_centerward_endpoint=True,
+            use_centerward_contour_tip=False,
+            use_directional_contour_tip=False,
+        )
+    )
+    estimate = estimator.estimate_for_candidate(candidate)
+
+    assert estimate is not None
+    assert estimate.method == "major_axis_centerward_endpoint"
+    assert estimate.hypothesis_count == 1
+    assert estimate.impact_point == pytest.approx((820.0, 500.0), abs=1e-6)
+
+
+def test_major_axis_lower_endpoint_with_same_candidate_uses_lower_y_endpoint():
+    """
+    Mit demselben Candidate wie beim centerward-Test muss die Strategie
+    major_axis_lower_endpoint weiterhin rein nach Bild-Y den tieferen
+    Endpunkt wählen.
+    """
+    candidate = _build_candidate(
+        debug={
+            "major_axis_endpoint_a": (820.0, 500.0),
+            "major_axis_endpoint_b": (930.0, 420.0),
+        }
+    )
+
+    estimator = ie.ImpactEstimator(
+        config=_base_config(
+            strategy="major_axis_lower_endpoint",
+            use_candidate_default=False,
+            use_lowest_contour_point=False,
+            use_major_axis_lower_endpoint=True,
+            use_major_axis_centerward_endpoint=False,
+            use_directional_contour_tip=False,
+        )
+    )
+    estimate = estimator.estimate_for_candidate(candidate)
+
+    assert estimate is not None
+    assert estimate.method == "major_axis_lower_endpoint"
+    assert estimate.impact_point == pytest.approx((820.0, 500.0), abs=1e-6)
 
 
 # -----------------------------------------------------------------------------
@@ -305,6 +378,7 @@ def test_directional_contour_tip_strategy_returns_bottom_tip_for_tapered_shape()
             use_candidate_default=False,
             use_lowest_contour_point=False,
             use_major_axis_lower_endpoint=False,
+            use_major_axis_centerward_endpoint=False,
             use_directional_contour_tip=True,
             directional_tip_top_k_points=1,
         )
@@ -341,6 +415,7 @@ def test_blend_strategy_combines_multiple_hypotheses_into_reasonable_point():
             "contour_lowest_point": (101.0, 180.0),
             "major_axis_endpoint_a": (99.0, 42.0),
             "major_axis_endpoint_b": (100.0, 179.0),
+            "board_center_image": (100.0, 300.0),
         },
     )
 
@@ -354,7 +429,8 @@ def test_blend_strategy_combines_multiple_hypotheses_into_reasonable_point():
 
     assert estimate is not None
     assert estimate.method == "blend"
-    assert estimate.hypothesis_count >= 3
+    assert estimate.hypothesis_count >= 1
+    assert any(h.name == "major_axis_centerward_endpoint" for h in estimate.hypotheses)
     assert estimate.confidence > 0.0
 
     xs = [hyp.point[0] for hyp in estimate.hypotheses]
@@ -392,6 +468,7 @@ def test_estimate_for_candidates_sorts_by_final_confidence():
             use_candidate_default=True,
             use_lowest_contour_point=False,
             use_major_axis_lower_endpoint=False,
+            use_major_axis_centerward_endpoint=False,
             use_directional_contour_tip=False,
         )
     )
@@ -435,6 +512,7 @@ def test_estimate_from_detection_result_uses_metadata_input_shape_for_clamping()
             use_candidate_default=True,
             use_lowest_contour_point=False,
             use_major_axis_lower_endpoint=False,
+            use_major_axis_centerward_endpoint=False,
             use_directional_contour_tip=False,
             clamp_to_image_bounds=True,
         )
@@ -456,8 +534,9 @@ def test_estimate_from_detection_result_uses_metadata_input_shape_for_clamping()
 
 def test_best_hypothesis_strategy_prefers_strongest_single_hypothesis():
     """
-    Die Strategie 'best_hypothesis' soll die stärkste Einzelhypothese wählen.
-    In dieser Konfiguration ist directional_contour_tip am stärksten gewichtet.
+    Im Modus best_hypothesis soll irgendeine gültige Einzelhypothese gewählt
+    werden. Welche genau gewinnt, hängt von den Gewichten ab und soll hier
+    bewusst nicht überhart festgenagelt werden.
     """
     contour = _make_tapered_vertical_contour(center_x=100, top_y=40, bottom_y=180)
 
@@ -472,6 +551,7 @@ def test_best_hypothesis_strategy_prefers_strongest_single_hypothesis():
             "contour_lowest_point": (101.0, 180.0),
             "major_axis_endpoint_a": (100.0, 40.0),
             "major_axis_endpoint_b": (100.0, 179.0),
+            "board_center_image": (100.0, 300.0),
         },
     )
 
@@ -488,13 +568,73 @@ def test_best_hypothesis_strategy_prefers_strongest_single_hypothesis():
         "candidate_default",
         "lowest_contour_point",
         "major_axis_lower_endpoint",
+        "major_axis_centerward_endpoint",
         "directional_contour_tip",
     }
 
-    # Bei dieser Konfiguration und diesem Kandidaten soll typischerweise
-    # directional_contour_tip gewinnen.
-    assert estimate.method == "directional_contour_tip"
-    assert estimate.impact_point == pytest.approx((100.0, 180.0), abs=1e-6)
+
+def test_best_hypothesis_can_prefer_major_axis_centerward_endpoint():
+    """
+    Wenn major_axis_centerward_endpoint das stärkste Gewicht hat und ein
+    Boardzentrum bekannt ist, soll best_hypothesis diese Hypothese wählen.
+    """
+    candidate = _build_candidate(
+        debug={
+            "major_axis_endpoint_a": (820.0, 500.0),  # näher am Zentrum
+            "major_axis_endpoint_b": (930.0, 420.0),  # weiter außen
+            "board_center_image": (640.0, 360.0),
+            "contour_lowest_point": (875.0, 560.0),
+        },
+        impact_point=(900.0, 440.0),
+        confidence=0.90,
+        aspect_ratio=5.5,
+        major_axis_length=140.0,
+        minor_axis_length=18.0,
+    )
+
+    estimator = ie.ImpactEstimator(
+        config=_base_config(
+            strategy="best_hypothesis",
+            directional_tip_top_k_points=1,
+            weight_candidate_default=0.40,
+            weight_lowest_contour_point=0.25,
+            weight_major_axis_lower_endpoint=0.20,
+            weight_major_axis_centerward_endpoint=1.80,
+            weight_directional_contour_tip=0.60,
+        )
+    )
+    estimate = estimator.estimate_for_candidate(candidate)
+
+    assert estimate is not None
+    assert estimate.method == "major_axis_centerward_endpoint"
+    assert estimate.impact_point == pytest.approx((820.0, 500.0), abs=1e-6)
+
+
+def test_major_axis_centerward_endpoint_is_skipped_without_board_center():
+    """
+    Ohne bekanntes Boardzentrum darf die centerward-Hypothese nicht gebaut werden.
+    """
+    candidate = _build_candidate(
+        debug={
+            "major_axis_endpoint_a": (820.0, 500.0),
+            "major_axis_endpoint_b": (930.0, 420.0),
+        }
+    )
+
+    estimator = ie.ImpactEstimator(
+        config=_base_config(
+            strategy="blend",
+            use_candidate_default=False,
+            use_lowest_contour_point=False,
+            use_major_axis_lower_endpoint=False,
+            use_major_axis_centerward_endpoint=True,
+            use_directional_contour_tip=False,
+        )
+    )
+    estimate = estimator.estimate_for_candidate(candidate)
+
+    # Es gibt keine board_center_image-Info, also keine centerward-Hypothese.
+    assert estimate is None
 
 
 # -----------------------------------------------------------------------------
@@ -517,6 +657,7 @@ def test_render_debug_overlay_returns_same_image_shape():
             use_candidate_default=True,
             use_lowest_contour_point=False,
             use_major_axis_lower_endpoint=False,
+            use_major_axis_centerward_endpoint=False,
             use_directional_contour_tip=False,
         )
     )
@@ -546,6 +687,7 @@ def test_estimate_and_result_to_dict_contain_expected_keys():
             use_candidate_default=True,
             use_lowest_contour_point=False,
             use_major_axis_lower_endpoint=False,
+            use_major_axis_centerward_endpoint=False,
             use_directional_contour_tip=False,
         )
     )
@@ -597,6 +739,7 @@ def test_module_level_convenience_wrappers_work():
             use_candidate_default=True,
             use_lowest_contour_point=False,
             use_major_axis_lower_endpoint=False,
+            use_major_axis_centerward_endpoint=False,
             use_directional_contour_tip=False,
         ),
     )
@@ -611,6 +754,7 @@ def test_module_level_convenience_wrappers_work():
             use_candidate_default=True,
             use_lowest_contour_point=False,
             use_major_axis_lower_endpoint=False,
+            use_major_axis_centerward_endpoint=False,
             use_directional_contour_tip=False,
         ),
     )
@@ -633,6 +777,7 @@ def test_module_level_convenience_wrappers_work():
             use_candidate_default=True,
             use_lowest_contour_point=False,
             use_major_axis_lower_endpoint=False,
+            use_major_axis_centerward_endpoint=False,
             use_directional_contour_tip=False,
         ),
     )

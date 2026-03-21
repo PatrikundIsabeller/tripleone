@@ -1,19 +1,28 @@
 # vision/score_mapper.py
 # Zweck:
 # Diese Datei bildet eine saubere Scoring-Schicht auf Basis der zentralen Geometrie.
-# Sie enthält bewusst KEINE eigene Board-Geometrie, sondern verwendet ausschließlich
-# die Funktionen aus vision/calibration_geometry.py.
 #
-# Aufgaben dieser Datei:
-# - zentrale Treffer-Normalisierung (MISS, S20, D20, T20, SBULL, DBULL)
-# - Umrechnung von Hit-Labels in numerische Scores
-# - Scoring für Bildpunkte und Top-Down-Punkte
-# - optionale Projektion Bild <-> Top-Down für Debugging / UI
-# - dünne, robuste Wrapper-Schicht für andere Module
+# WICHTIG:
+# Diese Datei besitzt bewusst KEINE eigene Board-Geometrie.
+# Sie verwendet ausschließlich vision/calibration_geometry.py als Quelle der Wahrheit.
 #
-# Wichtige Regel:
-# Diese Datei darf niemals anfangen, eigene Ringgrenzen oder Sektorlogik zu berechnen.
-# Sobald das passiert, ist die "eine Wahrheit" wieder kaputt.
+# Verantwortlichkeiten:
+# - Aufbau / Halten eines Geometry-Kontexts ("pipeline")
+# - Projektion Bild <-> Top-Down
+# - Bildpunkt -> HitResult / Label / numerischer Score
+# - Label-Normalisierung
+# - stabile Ergebnisobjekte für Debugging und Weiterverarbeitung
+#
+# Wichtiger Kompatibilitätshinweis:
+# Die aktuelle echte calibration_geometry.py im Repo arbeitet noch mit einer
+# Legacy-Signatur wie:
+#   calculate_hit_from_image_point(x_px, y_px, points_like)
+#   project_image_points_to_topdown(points_like, image_points)
+#   project_topdown_points_to_image(points_like, topdown_points)
+#   build_pipeline_points(points_like)
+#
+# Deshalb hält score_mapper.py intern "pipeline" aktuell als points_like-kompatible
+# Struktur (Liste von {"x_px", "y_px"}), nicht als komplexes Pipeline-Objekt.
 
 from __future__ import annotations
 
@@ -23,11 +32,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional, Sequence
 
-logger = logging.getLogger(__name__)
+import numpy as np
 
-# Import robust halten:
-# - relative Importe für normalen Paketbetrieb
-# - absoluter Fallback für direkte Ausführung / Tests
 try:
     from .calibration_geometry import (
         build_pipeline_points,
@@ -45,26 +51,24 @@ except ImportError:  # pragma: no cover
         project_topdown_points_to_image,
     )
 
-
-# --------------------------------------------------------------------------------------
-# Basis-Typen
-# --------------------------------------------------------------------------------------
+logger = logging.getLogger(__name__)
 
 Point = tuple[float, float]
 
 
 # --------------------------------------------------------------------------------------
-# Kleine Hilfsfunktionen für robuste Punkt- und Daten-Normalisierung
+# Punkt-/Record-Normalisierung
 # --------------------------------------------------------------------------------------
 
 def _coerce_point(value: Any) -> Point:
     """
     Wandelt unterschiedliche Punktformate in ein (x, y)-Tuple um.
 
-    Unterstützte Formate:
+    Unterstützt:
     - (x, y)
     - [x, y]
     - {"x": ..., "y": ...}
+    - {"x_px": ..., "y_px": ...}
     - Objekt mit .x und .y
     """
     if value is None:
@@ -73,9 +77,13 @@ def _coerce_point(value: Any) -> Point:
     if isinstance(value, dict):
         if "x" in value and "y" in value:
             return float(value["x"]), float(value["y"])
-        raise ValueError(f"Point dict must contain 'x' and 'y', got: {value}")
+        if "x_px" in value and "y_px" in value:
+            return float(value["x_px"]), float(value["y_px"])
+        raise ValueError(
+            f"Point dict must contain either 'x'/'y' or 'x_px'/'y_px', got: {value}"
+        )
 
-    if isinstance(value, (tuple, list)):
+    if isinstance(value, (tuple, list, np.ndarray)):
         if len(value) != 2:
             raise ValueError(f"Point sequence must have length 2, got: {value}")
         return float(value[0]), float(value[1])
@@ -93,14 +101,29 @@ def _coerce_points(values: Iterable[Any]) -> list[Point]:
     return [_coerce_point(v) for v in values]
 
 
+def _points_to_legacy_point_dicts(values: Sequence[Any]) -> list[dict[str, int]]:
+    """
+    Wandelt Punktformate in das Legacy-Format der echten calibration_geometry.py um:
+    [{"x_px": ..., "y_px": ...}, ...]
+    """
+    pts = _coerce_points(values)
+    return [
+        {"x_px": int(round(x)), "y_px": int(round(y))}
+        for x, y in pts
+    ]
+
+
 def _extract_manual_points_from_record(record: Any) -> list[Point]:
     """
-    Extrahiert die 4 manuellen Marker aus einem CameraCalibrationRecord oder Dict.
+    Extrahiert die 4 manuellen Marker aus einem Calibration-Record oder Dict.
 
-    Wichtige Designentscheidung:
-    score_mapper.py normalisiert NICHT still heimlich alte Formate.
-    Dafür ist calibration_storage.py zuständig.
-    Hier wird absichtlich streng gearbeitet, damit Fehler früh sichtbar werden.
+    Unterstützte Quellen:
+    - manual_points
+    - marker_points
+    - markers
+    - image_points
+    - points
+    - p1..p4
     """
     candidate_names = [
         "manual_points",
@@ -110,19 +133,16 @@ def _extract_manual_points_from_record(record: Any) -> list[Point]:
         "points",
     ]
 
-    # Dict-Fall
     if isinstance(record, dict):
         for name in candidate_names:
             if name in record and record[name]:
                 points = _coerce_points(record[name])
-                if len(points) != 4:
+                if len(points) < 4:
                     raise ValueError(
-                        f"Expected exactly 4 manual points in record['{name}'], got {len(points)}. "
-                        "Normalize old formats in calibration_storage.py first."
+                        f"Expected at least 4 manual points in record['{name}'], got {len(points)}."
                     )
-                return points
+                return points[:4]
 
-        # Fallback: p1..p4
         p_names = ["p1", "p2", "p3", "p4"]
         if all(name in record for name in p_names):
             points = _coerce_points([record[name] for name in p_names])
@@ -132,18 +152,16 @@ def _extract_manual_points_from_record(record: Any) -> list[Point]:
 
         raise ValueError("Could not extract manual points from calibration record dict.")
 
-    # Objekt-Fall
     for name in candidate_names:
         if hasattr(record, name):
             value = getattr(record, name)
             if value:
                 points = _coerce_points(value)
-                if len(points) != 4:
+                if len(points) < 4:
                     raise ValueError(
-                        f"Expected exactly 4 manual points in record.{name}, got {len(points)}. "
-                        "Normalize old formats in calibration_storage.py first."
+                        f"Expected at least 4 manual points in record.{name}, got {len(points)}."
                     )
-                return points
+                return points[:4]
 
     p_names = ["p1", "p2", "p3", "p4"]
     if all(hasattr(record, name) for name in p_names):
@@ -158,7 +176,6 @@ def _extract_manual_points_from_record(record: Any) -> list[Point]:
 def _extract_optional_image_size(record: Any) -> Optional[tuple[int, int]]:
     """
     Extrahiert optional eine Bildgröße aus einem Record.
-    Diese Information wird nur weitergereicht, wenn build_pipeline_points sie unterstützt.
     """
     candidate_names = [
         "image_size",
@@ -173,8 +190,8 @@ def _extract_optional_image_size(record: Any) -> Optional[tuple[int, int]]:
                 if isinstance(value, (tuple, list)) and len(value) == 2:
                     return int(value[0]), int(value[1])
 
-        width = record.get("image_width")
-        height = record.get("image_height")
+        width = record.get("image_width", record.get("width", record.get("frame_width")))
+        height = record.get("image_height", record.get("height", record.get("frame_height")))
         if width is not None and height is not None:
             return int(width), int(height)
         return None
@@ -185,8 +202,8 @@ def _extract_optional_image_size(record: Any) -> Optional[tuple[int, int]]:
             if isinstance(value, (tuple, list)) and len(value) == 2:
                 return int(value[0]), int(value[1])
 
-    width = getattr(record, "image_width", None)
-    height = getattr(record, "image_height", None)
+    width = getattr(record, "image_width", getattr(record, "width", getattr(record, "frame_width", None)))
+    height = getattr(record, "image_height", getattr(record, "height", getattr(record, "frame_height", None)))
     if width is not None and height is not None:
         return int(width), int(height)
 
@@ -194,14 +211,12 @@ def _extract_optional_image_size(record: Any) -> Optional[tuple[int, int]]:
 
 
 # --------------------------------------------------------------------------------------
-# Robuste Funktionsaufrufe gegen calibration_geometry.py
+# Robuste Helfer für Funktionsaufrufe
 # --------------------------------------------------------------------------------------
 
 def _filter_supported_kwargs(func: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
     """
-    Filtert nur die kwargs, die eine Ziel-Funktion tatsächlich unterstützt.
-    Das macht score_mapper.py toleranter gegenüber kleinen API-Änderungen
-    in calibration_geometry.py.
+    Filtert nur kwargs, die eine Ziel-Funktion tatsächlich unterstützt.
     """
     sig = inspect.signature(func)
     supported = {}
@@ -223,8 +238,6 @@ def _try_named_then_positional(
 ) -> Any:
     """
     Versucht mehrere Call-Varianten nacheinander.
-    Das ist bewusst defensiv, damit kleine Signatur-Unterschiede nicht
-    die ganze Architektur blockieren.
     """
     last_error: Optional[Exception] = None
 
@@ -247,6 +260,10 @@ def _try_named_then_positional(
     )
 
 
+# --------------------------------------------------------------------------------------
+# Geometry-Adapter
+# --------------------------------------------------------------------------------------
+
 def _build_pipeline(
     *,
     manual_points: Sequence[Point],
@@ -256,9 +273,9 @@ def _build_pipeline(
     """
     Baut die zentrale Pipeline-Geometrie über calibration_geometry.build_pipeline_points().
 
-    Wichtig:
-    - diese Funktion rechnet NICHT selbst Geometrie
-    - sie reicht nur die 4 Marker an die zentrale Geometrie weiter
+    WICHTIG:
+    In deinem echten Repo liefert build_pipeline_points(points_like) aktuell ein
+    kompatibles 5-Punkte-Format zurück. Das behandeln wir hier als "pipeline".
     """
     if len(manual_points) != 4:
         raise ValueError(
@@ -267,6 +284,7 @@ def _build_pipeline(
         )
 
     manual_points = _coerce_points(manual_points)
+    legacy_manual_points = _points_to_legacy_point_dicts(manual_points)
     extra_kwargs = extra_kwargs or {}
 
     width = None
@@ -276,35 +294,35 @@ def _build_pipeline(
 
     named_candidates = [
         {
-            "manual_points": manual_points,
+            "manual_points": legacy_manual_points,
             "image_size": image_size,
             "image_width": width,
             "image_height": height,
             **extra_kwargs,
         },
         {
-            "image_points": manual_points,
+            "image_points": legacy_manual_points,
             "image_size": image_size,
             "image_width": width,
             "image_height": height,
             **extra_kwargs,
         },
         {
-            "marker_points": manual_points,
+            "marker_points": legacy_manual_points,
             "image_size": image_size,
             "image_width": width,
             "image_height": height,
             **extra_kwargs,
         },
         {
-            "markers": manual_points,
+            "markers": legacy_manual_points,
             "image_size": image_size,
             "image_width": width,
             "image_height": height,
             **extra_kwargs,
         },
         {
-            "points": manual_points,
+            "points": legacy_manual_points,
             "image_size": image_size,
             "image_width": width,
             "image_height": height,
@@ -313,7 +331,7 @@ def _build_pipeline(
     ]
 
     positional_candidates = [
-        (manual_points,),
+        (legacy_manual_points,),
     ]
 
     return _try_named_then_positional(
@@ -328,21 +346,31 @@ def _project_image_points(
     pipeline: Any,
 ) -> Any:
     """
-    Projiziert Bildpunkte nach Top-Down über die zentrale Geometrie.
+    Projiziert Bildpunkte nach Top-Down.
+
+    Unterstützt die echte Triple-One-Signatur:
+    project_image_points_to_topdown(points_like, image_points)
     """
+    pts = np.asarray(points, dtype=np.float32)
+
+    try:
+        return project_image_points_to_topdown(pipeline, pts)
+    except TypeError:
+        pass
+
     named_candidates = [
-        {"image_points": points, "pipeline": pipeline},
-        {"points": points, "pipeline": pipeline},
-        {"pts": points, "pipeline": pipeline},
-        {"image_points": points, "geometry": pipeline},
-        {"points": points, "geometry": pipeline},
-        {"image_points": points, "context": pipeline},
-        {"points": points, "context": pipeline},
+        {"image_points": pts, "pipeline": pipeline},
+        {"points": pts, "pipeline": pipeline},
+        {"pts": pts, "pipeline": pipeline},
+        {"image_points": pts, "geometry": pipeline},
+        {"points": pts, "geometry": pipeline},
+        {"image_points": pts, "context": pipeline},
+        {"points": pts, "context": pipeline},
     ]
 
     positional_candidates = [
-        (points, pipeline),
-        (pipeline, points),
+        (pts, pipeline),
+        (pipeline, pts),
     ]
 
     return _try_named_then_positional(
@@ -357,21 +385,31 @@ def _project_topdown_points(
     pipeline: Any,
 ) -> Any:
     """
-    Projiziert Top-Down-Punkte zurück ins Kamerabild über die zentrale Geometrie.
+    Projiziert Top-Down-Punkte zurück ins Bild.
+
+    Unterstützt die echte Triple-One-Signatur:
+    project_topdown_points_to_image(points_like, topdown_points)
     """
+    pts = np.asarray(points, dtype=np.float32)
+
+    try:
+        return project_topdown_points_to_image(pipeline, pts)
+    except TypeError:
+        pass
+
     named_candidates = [
-        {"topdown_points": points, "pipeline": pipeline},
-        {"points": points, "pipeline": pipeline},
-        {"pts": points, "pipeline": pipeline},
-        {"topdown_points": points, "geometry": pipeline},
-        {"points": points, "geometry": pipeline},
-        {"topdown_points": points, "context": pipeline},
-        {"points": points, "context": pipeline},
+        {"topdown_points": pts, "pipeline": pipeline},
+        {"points": pts, "pipeline": pipeline},
+        {"pts": pts, "pipeline": pipeline},
+        {"topdown_points": pts, "geometry": pipeline},
+        {"points": pts, "geometry": pipeline},
+        {"topdown_points": pts, "context": pipeline},
+        {"points": pts, "context": pipeline},
     ]
 
     positional_candidates = [
-        (points, pipeline),
-        (pipeline, points),
+        (pts, pipeline),
+        (pipeline, pts),
     ]
 
     return _try_named_then_positional(
@@ -386,8 +424,18 @@ def _calculate_hit_from_image(
     pipeline: Any,
 ) -> Any:
     """
-    Berechnet einen Treffer für einen Bildpunkt ausschließlich über calibration_geometry.
+    Berechnet einen Treffer für einen Bildpunkt.
+
+    Unterstützt die echte Triple-One-Signatur:
+    calculate_hit_from_image_point(x_px, y_px, points_like)
     """
+    x, y = float(point[0]), float(point[1])
+
+    try:
+        return calculate_hit_from_image_point(x, y, pipeline)
+    except TypeError:
+        pass
+
     named_candidates = [
         {"image_point": point, "pipeline": pipeline},
         {"point": point, "pipeline": pipeline},
@@ -415,8 +463,18 @@ def _calculate_hit_from_topdown(
     pipeline: Any,
 ) -> Any:
     """
-    Berechnet einen Treffer für einen Top-Down-Punkt ausschließlich über calibration_geometry.
+    Berechnet einen Treffer für einen Top-Down-Punkt.
+
+    Unterstützt die echte Triple-One-Signatur:
+    calculate_hit_from_topdown_point(x_px, y_px)
     """
+    x, y = float(point[0]), float(point[1])
+
+    try:
+        return calculate_hit_from_topdown_point(x, y)
+    except TypeError:
+        pass
+
     named_candidates = [
         {"topdown_point": point, "pipeline": pipeline},
         {"point": point, "pipeline": pipeline},
@@ -440,7 +498,7 @@ def _calculate_hit_from_topdown(
 
 
 # --------------------------------------------------------------------------------------
-# Hit-Label-Normalisierung und Score-Umrechnung
+# Label-Normalisierung / Score
 # --------------------------------------------------------------------------------------
 
 _HIT_RE = re.compile(r"^(S|D|T)?(\d{1,2})$")
@@ -448,21 +506,13 @@ _HIT_RE = re.compile(r"^(S|D|T)?(\d{1,2})$")
 
 def normalize_hit_label(label: str) -> str:
     """
-    Normalisiert Hit-Labels auf das interne Standardformat.
-
-    Erlaubte Zielformate:
+    Normalisiert Hit-Labels auf:
     - MISS
     - SBULL
     - DBULL
     - S1..S20
     - D1..D20
     - T1..T20
-
-    Beispiele:
-    - "20" -> "S20"
-    - "d20" -> "D20"
-    - "double20" -> "D20"
-    - "bull" -> "SBULL"
     """
     if label is None:
         raise ValueError("Hit label is None.")
@@ -497,9 +547,6 @@ def normalize_hit_label(label: str) -> str:
 
 
 def hit_label_to_score(label: str) -> int:
-    """
-    Rechnet ein Hit-Label in den numerischen Dart-Score um.
-    """
     normalized = normalize_hit_label(label)
 
     if normalized == "MISS":
@@ -523,9 +570,6 @@ def hit_label_to_score(label: str) -> int:
 
 
 def hit_label_to_multiplier(label: str) -> int:
-    """
-    Liefert den Multiplikator für ein Hit-Label.
-    """
     normalized = normalize_hit_label(label)
 
     if normalized == "MISS":
@@ -547,9 +591,6 @@ def hit_label_to_multiplier(label: str) -> int:
 
 
 def hit_label_to_ring(label: str) -> str:
-    """
-    Liefert den Ring-Typ aus einem Hit-Label.
-    """
     normalized = normalize_hit_label(label)
 
     if normalized == "MISS":
@@ -563,10 +604,6 @@ def hit_label_to_ring(label: str) -> str:
 
 
 def hit_label_to_segment(label: str) -> Optional[int]:
-    """
-    Liefert die Sektorzahl für ein Hit-Label.
-    Für MISS / Bulls gibt es keinen normalen Sektor.
-    """
     normalized = normalize_hit_label(label)
 
     if normalized in {"MISS", "SBULL", "DBULL"}:
@@ -575,25 +612,27 @@ def hit_label_to_segment(label: str) -> Optional[int]:
     return int(normalized[1:])
 
 
+# --------------------------------------------------------------------------------------
+# Raw-Hit-Extraktion
+# --------------------------------------------------------------------------------------
+
 def _extract_label_from_raw_hit(raw_hit: Any) -> str:
     """
-    Extrahiert best-effort ein Hit-Label aus unterschiedlichen Rückgabeformaten
-    von calibration_geometry.py.
+    Extrahiert robust ein Hit-Label aus unterschiedlichen Rückgabeformaten.
 
-    Unterstützte typische Formen:
+    Unterstützt unter anderem:
     - "D20"
     - {"label": "D20"}
-    - {"hit": "D20"}
     - {"ring": "D", "segment": 20}
-    - {"multiplier": 2, "segment": 20}
     - ("D", 20)
-    - Objekt mit .label / .ring / .segment / .multiplier
+    - HitResult-Objekt aus calibration_geometry.py
     """
-    # Direktes Label
+    if raw_hit is None:
+        raise ValueError("Raw hit result is None.")
+
     if isinstance(raw_hit, str):
         return normalize_hit_label(raw_hit)
 
-    # Tuple / Liste
     if isinstance(raw_hit, (tuple, list)):
         if len(raw_hit) == 1:
             return normalize_hit_label(str(raw_hit[0]))
@@ -608,7 +647,6 @@ def _extract_label_from_raw_hit(raw_hit: Any) -> str:
                     return normalize_hit_label(f"{first_clean}{int(second)}")
                 return normalize_hit_label(first_clean)
 
-    # Dict
     if isinstance(raw_hit, dict):
         for key in ("label", "hit", "code", "result", "field"):
             if key in raw_hit and raw_hit[key] is not None:
@@ -632,20 +670,30 @@ def _extract_label_from_raw_hit(raw_hit: Any) -> str:
             if multiplier == 3:
                 return normalize_hit_label(f"T{segment}")
 
-    # Objekt mit Attributen
+    # Objekt-Attribute
     for attr in ("label", "hit", "code", "result", "field"):
         if hasattr(raw_hit, attr):
             value = getattr(raw_hit, attr)
             if value is not None:
                 return normalize_hit_label(str(value))
 
-    ring = getattr(raw_hit, "ring", None)
-    segment = getattr(raw_hit, "segment", getattr(raw_hit, "number", None))
+    ring = getattr(raw_hit, "ring", getattr(raw_hit, "ring_name", None))
+    segment = getattr(raw_hit, "segment", getattr(raw_hit, "segment_value", getattr(raw_hit, "number", None)))
+
+    # Falls ring_name aus alter Geometry kommt:
+    # "DOUBLE"/"TRIPLE"/"SINGLE" + segment_value -> D/T/S
     if ring is not None and segment is not None:
-        return normalize_hit_label(f"{str(ring)}{int(segment)}")
+        ring_str = str(ring).strip().upper()
+        if ring_str in {"DOUBLE", "D"}:
+            return normalize_hit_label(f"D{int(segment)}")
+        if ring_str in {"TRIPLE", "T"}:
+            return normalize_hit_label(f"T{int(segment)}")
+        if ring_str in {"SINGLE", "S"}:
+            return normalize_hit_label(f"S{int(segment)}")
+        return normalize_hit_label(f"{ring_str}{int(segment)}")
 
     multiplier = getattr(raw_hit, "multiplier", None)
-    segment = getattr(raw_hit, "segment", getattr(raw_hit, "number", None))
+    segment = getattr(raw_hit, "segment", getattr(raw_hit, "segment_value", getattr(raw_hit, "number", None)))
     if multiplier is not None and segment is not None:
         multiplier = int(multiplier)
         segment = int(segment)
@@ -660,7 +708,7 @@ def _extract_label_from_raw_hit(raw_hit: Any) -> str:
 
 
 # --------------------------------------------------------------------------------------
-# Ergebnis-Modell
+# Ergebnisobjekt
 # --------------------------------------------------------------------------------------
 
 @dataclass(slots=True)
@@ -687,9 +735,6 @@ class ScoredHit:
         return self.label in {"SBULL", "DBULL"}
 
     def to_dict(self) -> dict[str, Any]:
-        """
-        Praktische Debug-/API-Darstellung.
-        """
         return {
             "label": self.label,
             "score": self.score,
@@ -711,9 +756,6 @@ def _build_scored_hit(
     image_point: Optional[Point] = None,
     topdown_point: Optional[Point] = None,
 ) -> ScoredHit:
-    """
-    Baut aus einem Roh-Resultat ein stabiles ScoredHit-Objekt.
-    """
     label = _extract_label_from_raw_hit(raw_hit)
 
     return ScoredHit(
@@ -730,21 +772,15 @@ def _build_scored_hit(
 
 
 # --------------------------------------------------------------------------------------
-# Hauptklasse: ScoreMapper
+# Hauptklasse
 # --------------------------------------------------------------------------------------
 
 class ScoreMapper:
     """
     Dünne Mapping-Schicht auf Basis der zentralen Geometrie.
 
-    Diese Klasse cached die Pipeline-Geometrie und bietet stabile Methoden für:
-    - Bildpunkt -> Treffer
-    - Top-Down-Punkt -> Treffer
-    - Bildpunkt -> Top-Down
-    - Top-Down -> Bildpunkt
-
-    Wichtige Architekturregel:
-    ScoreMapper besitzt keine eigene Board-Logik.
+    Aktuell hält self._pipeline eine points_like-kompatible Struktur, die zur
+    echten calibration_geometry.py passt.
     """
 
     def __init__(
@@ -782,72 +818,25 @@ class ScoreMapper:
             extra_kwargs=self._pipeline_kwargs,
         )
 
-    # ------------------------------------------------------------------
-    # Öffentliche Properties
-    # ------------------------------------------------------------------
-
     @property
     def pipeline(self) -> Any:
-        """
-        Gibt die gecachte zentrale Pipeline-Geometrie zurück.
-        """
         return self._pipeline
 
     @property
     def manual_points(self) -> Optional[list[Point]]:
-        """
-        Gibt die 4 verwendeten manuellen Marker zurück, falls bekannt.
-        """
         if self._manual_points is None:
             return None
         return list(self._manual_points)
 
     @property
     def image_size(self) -> Optional[tuple[int, int]]:
-        """
-        Optionale Bildgröße, falls beim Erzeugen vorhanden.
-        """
         return self._image_size
-
-    @property
-    def bull_topdown(self) -> Optional[Point]:
-        """
-        Best-effort Zugriff auf den Bullpunkt im Top-Down-System.
-        """
-        pipeline = self._pipeline
-
-        if isinstance(pipeline, dict):
-            for key in ("bull_topdown", "bull", "bull_center", "center"):
-                value = pipeline.get(key)
-                if value is not None:
-                    try:
-                        return _coerce_point(value)
-                    except Exception:
-                        pass
-
-        for attr in ("bull_topdown", "bull", "bull_center", "center"):
-            if hasattr(pipeline, attr):
-                value = getattr(pipeline, attr)
-                if value is not None:
-                    try:
-                        return _coerce_point(value)
-                    except Exception:
-                        pass
-
-        return None
-
-    # ------------------------------------------------------------------
-    # Rebuild / Update
-    # ------------------------------------------------------------------
 
     def rebuild_from_manual_points(
         self,
         manual_points: Sequence[Any],
         image_size: Optional[tuple[int, int]] = None,
     ) -> None:
-        """
-        Baut die Pipeline mit 4 neuen Markern neu auf.
-        """
         self._manual_points = _coerce_points(manual_points)
         self._image_size = image_size or self._image_size
         self._pipeline = _build_pipeline(
@@ -857,12 +846,8 @@ class ScoreMapper:
         )
 
     def rebuild_from_record(self, calibration_record: Any) -> None:
-        """
-        Baut die Pipeline aus einem Calibration-Record neu auf.
-        """
         manual_points = _extract_manual_points_from_record(calibration_record)
         image_size = _extract_optional_image_size(calibration_record)
-
         self.rebuild_from_manual_points(manual_points, image_size=image_size)
 
     # ------------------------------------------------------------------
@@ -870,24 +855,33 @@ class ScoreMapper:
     # ------------------------------------------------------------------
 
     def image_point_to_topdown(self, point: Any) -> Point:
-        """
-        Projiziert genau einen Bildpunkt ins Top-Down-System.
-        """
         point_xy = _coerce_point(point)
         result = _project_image_points([point_xy], self._pipeline)
+
+        if result is None:
+            raise ValueError("Projection image -> topdown returned None.")
+
+        if isinstance(result, np.ndarray):
+            if result.ndim == 2 and len(result) > 0:
+                return _coerce_point(result[0])
+            return _coerce_point(result)
 
         if isinstance(result, (list, tuple)) and len(result) > 0:
             return _coerce_point(result[0])
 
-        # Falls die Geometrie-Funktion direkt nur einen Punkt zurückgibt
         return _coerce_point(result)
 
     def topdown_point_to_image(self, point: Any) -> Point:
-        """
-        Projiziert genau einen Top-Down-Punkt zurück ins Bild.
-        """
         point_xy = _coerce_point(point)
         result = _project_topdown_points([point_xy], self._pipeline)
+
+        if result is None:
+            raise ValueError("Projection topdown -> image returned None.")
+
+        if isinstance(result, np.ndarray):
+            if result.ndim == 2 and len(result) > 0:
+                return _coerce_point(result[0])
+            return _coerce_point(result)
 
         if isinstance(result, (list, tuple)) and len(result) > 0:
             return _coerce_point(result[0])
@@ -895,11 +889,16 @@ class ScoreMapper:
         return _coerce_point(result)
 
     def image_points_to_topdown(self, points: Sequence[Any]) -> list[Point]:
-        """
-        Projiziert mehrere Bildpunkte ins Top-Down-System.
-        """
         points_xy = _coerce_points(points)
         result = _project_image_points(points_xy, self._pipeline)
+
+        if result is None:
+            return []
+
+        if isinstance(result, np.ndarray):
+            if result.ndim == 2:
+                return [_coerce_point(p) for p in result.tolist()]
+            return [_coerce_point(result.tolist())]
 
         if isinstance(result, (list, tuple)):
             return [_coerce_point(p) for p in result]
@@ -907,11 +906,16 @@ class ScoreMapper:
         return [_coerce_point(result)]
 
     def topdown_points_to_image(self, points: Sequence[Any]) -> list[Point]:
-        """
-        Projiziert mehrere Top-Down-Punkte zurück ins Bild.
-        """
         points_xy = _coerce_points(points)
         result = _project_topdown_points(points_xy, self._pipeline)
+
+        if result is None:
+            return []
+
+        if isinstance(result, np.ndarray):
+            if result.ndim == 2:
+                return [_coerce_point(p) for p in result.tolist()]
+            return [_coerce_point(result.tolist())]
 
         if isinstance(result, (list, tuple)):
             return [_coerce_point(p) for p in result]
@@ -923,11 +927,14 @@ class ScoreMapper:
     # ------------------------------------------------------------------
 
     def score_image_point(self, point: Any) -> ScoredHit:
-        """
-        Bewertet einen Bildpunkt und liefert ein einheitliches ScoredHit-Ergebnis.
-        """
         image_point = _coerce_point(point)
         raw_hit = _calculate_hit_from_image(image_point, self._pipeline)
+
+        if raw_hit is None:
+            raise ValueError(
+                f"Geometry returned None for image point {image_point}. "
+                "This usually indicates a points_like/pipeline format mismatch."
+            )
 
         topdown_point = None
         try:
@@ -943,11 +950,13 @@ class ScoreMapper:
         )
 
     def score_topdown_point(self, point: Any) -> ScoredHit:
-        """
-        Bewertet einen Top-Down-Punkt und liefert ein einheitliches ScoredHit-Ergebnis.
-        """
         topdown_point = _coerce_point(point)
         raw_hit = _calculate_hit_from_topdown(topdown_point, self._pipeline)
+
+        if raw_hit is None:
+            raise ValueError(
+                f"Geometry returned None for topdown point {topdown_point}."
+            )
 
         image_point = None
         try:
@@ -963,43 +972,25 @@ class ScoreMapper:
         )
 
     def score_image_points(self, points: Sequence[Any]) -> list[ScoredHit]:
-        """
-        Bewertet mehrere Bildpunkte.
-        """
         return [self.score_image_point(p) for p in points]
 
     def score_topdown_points(self, points: Sequence[Any]) -> list[ScoredHit]:
-        """
-        Bewertet mehrere Top-Down-Punkte.
-        """
         return [self.score_topdown_point(p) for p in points]
 
     # ------------------------------------------------------------------
-    # Kompakte Convenience-Methoden
+    # Convenience
     # ------------------------------------------------------------------
 
     def score_image_point_label(self, point: Any) -> str:
-        """
-        Liefert nur das Label für einen Bildpunkt.
-        """
         return self.score_image_point(point).label
 
     def score_image_point_value(self, point: Any) -> int:
-        """
-        Liefert nur den numerischen Score für einen Bildpunkt.
-        """
         return self.score_image_point(point).score
 
     def score_topdown_point_label(self, point: Any) -> str:
-        """
-        Liefert nur das Label für einen Top-Down-Punkt.
-        """
         return self.score_topdown_point(point).label
 
     def score_topdown_point_value(self, point: Any) -> int:
-        """
-        Liefert nur den numerischen Score für einen Top-Down-Punkt.
-        """
         return self.score_topdown_point(point).score
 
 
@@ -1015,9 +1006,6 @@ def build_score_mapper(
     image_size: Optional[tuple[int, int]] = None,
     pipeline_kwargs: Optional[dict[str, Any]] = None,
 ) -> ScoreMapper:
-    """
-    Praktischer Builder für einen ScoreMapper.
-    """
     return ScoreMapper(
         manual_points=manual_points,
         calibration_record=calibration_record,
@@ -1036,9 +1024,6 @@ def score_image_point(
     image_size: Optional[tuple[int, int]] = None,
     pipeline_kwargs: Optional[dict[str, Any]] = None,
 ) -> ScoredHit:
-    """
-    Stateless Convenience-Wrapper für genau einen Bildpunkt.
-    """
     mapper = build_score_mapper(
         manual_points=manual_points,
         calibration_record=calibration_record,
@@ -1058,9 +1043,6 @@ def score_topdown_point(
     image_size: Optional[tuple[int, int]] = None,
     pipeline_kwargs: Optional[dict[str, Any]] = None,
 ) -> ScoredHit:
-    """
-    Stateless Convenience-Wrapper für genau einen Top-Down-Punkt.
-    """
     mapper = build_score_mapper(
         manual_points=manual_points,
         calibration_record=calibration_record,
@@ -1071,10 +1053,6 @@ def score_topdown_point(
     return mapper.score_topdown_point(point)
 
 
-# --------------------------------------------------------------------------------------
-# Kompatibilitäts-Wrapper für ältere Modulaufrufe
-# --------------------------------------------------------------------------------------
-
 def map_image_point_to_hit(
     point: Any,
     *,
@@ -1084,10 +1062,6 @@ def map_image_point_to_hit(
     image_size: Optional[tuple[int, int]] = None,
     pipeline_kwargs: Optional[dict[str, Any]] = None,
 ) -> str:
-    """
-    Kompatibilitätsfunktion:
-    Gibt nur das normalisierte Hit-Label für einen Bildpunkt zurück.
-    """
     return score_image_point(
         point,
         manual_points=manual_points,
@@ -1107,10 +1081,6 @@ def map_topdown_point_to_hit(
     image_size: Optional[tuple[int, int]] = None,
     pipeline_kwargs: Optional[dict[str, Any]] = None,
 ) -> str:
-    """
-    Kompatibilitätsfunktion:
-    Gibt nur das normalisierte Hit-Label für einen Top-Down-Punkt zurück.
-    """
     return score_topdown_point(
         point,
         manual_points=manual_points,

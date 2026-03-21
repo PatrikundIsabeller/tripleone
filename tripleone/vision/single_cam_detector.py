@@ -363,6 +363,10 @@ class SingleCamDetector:
                 pipeline_kwargs=self._pipeline_kwargs,
             )
 
+    @property
+    def score_mapper(self):
+        return self._score_mapper 
+
     # -------------------------------------------------------------------------
     # ScoreMapper-Verwaltung
     # -------------------------------------------------------------------------
@@ -442,9 +446,6 @@ class SingleCamDetector:
 
         image_shape = frame.shape[:2]
 
-        # --------------------------------------------------------------
-        # Schritt 1: Kandidaten finden
-        # --------------------------------------------------------------
         candidate_result = self.candidate_detector.detect_candidates(
             frame=frame,
             reference_frame=reference_frame,
@@ -452,9 +453,27 @@ class SingleCamDetector:
             board_polygon=board_polygon,
         )
 
-        # --------------------------------------------------------------
-        # Schritt 2: finale Impact-Punkte schätzen
-        # --------------------------------------------------------------
+        # Kandidaten mit Geometrie-/Pipeline-Infos anreichern,
+        # damit der ImpactEstimator centerward arbeiten kann.
+        if self._score_mapper is not None:
+            mapper_pipeline = getattr(self._score_mapper, "pipeline", None)
+            has_topdown_to_image = hasattr(self._score_mapper, "topdown_point_to_image")
+
+            for candidate in candidate_result.candidates:
+                candidate.debug = dict(getattr(candidate, "debug", {}) or {})
+
+                if mapper_pipeline is not None:
+                    candidate.debug["pipeline"] = mapper_pipeline
+                    candidate.debug["points_like"] = mapper_pipeline
+
+                if has_topdown_to_image:
+                    try:
+                        board_center_image = self._score_mapper.topdown_point_to_image((450.0, 450.0))
+                        candidate.debug["board_center_image"] = board_center_image
+                    except Exception as exc:
+                        candidate.debug["board_center_image_error"] = str(exc)
+
+
         impact_result = self.impact_estimator.estimate_from_detection_result(
             detection_result=candidate_result,
             image_shape=image_shape,
