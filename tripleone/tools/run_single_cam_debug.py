@@ -9,10 +9,11 @@
 # - score_geometry_overlay.png auf das reale Bild rendern
 # - Segment-/Winkel-/Radius-Debug als TXT + JSON speichern
 #
-# Wichtige Kompatibilität:
-# - unterstützt dein aktuelles Legacy-calibration.json-Format
-# - unterstützt CameraCalibrationRecord mit manual_points
-# - gibt rohe config.json NICHT mehr blind als dict an den Detector weiter
+# WICHTIG:
+# Diese Version ist bewusst auf den AKTUELLEN Repo-Stand angepasst:
+# - calibration_geometry.py arbeitet aktuell mit legacy "points_like"
+# - ScoreMapper kann sich aus calibration_record selbst korrekt aufbauen
+# - score_mapper.pipeline ist dann das kompatible points_like-Format
 # ------------------------------------------------------------
 
 from __future__ import annotations
@@ -47,6 +48,10 @@ from vision.calibration_geometry import (
     build_pipeline_points,
     calculate_hit_from_image_point,
     calculate_hit_from_topdown_point,
+    compute_bull_from_manual_points,
+    generate_number_positions_image,
+    generate_ring_polylines_image,
+    generate_sector_lines_image,
     project_image_points_to_topdown,
     project_topdown_points_to_image,
 )
@@ -138,14 +143,6 @@ def _json_dump_safe(obj: Any) -> Any:
 # Punkt-Normalisierung
 # ------------------------------------------------------------
 def _to_point_tuple(value: Any) -> Optional[tuple[float, float]]:
-    """
-    Unterstützt u. a.:
-    - [x, y]
-    - (x, y)
-    - {"x": ..., "y": ...}
-    - {"x_px": ..., "y_px": ...}
-    - Objekte mit .x/.y oder .x_px/.y_px
-    """
     if value is None:
         return None
 
@@ -173,19 +170,6 @@ def _to_point_tuple(value: Any) -> Optional[tuple[float, float]]:
             except Exception:
                 return None
 
-        if "px" in value and isinstance(value["px"], dict):
-            nested = value["px"]
-            if "x" in nested and "y" in nested:
-                try:
-                    return float(nested["x"]), float(nested["y"])
-                except Exception:
-                    return None
-            if "x_px" in nested and "y_px" in nested:
-                try:
-                    return float(nested["x_px"]), float(nested["y_px"])
-                except Exception:
-                    return None
-
     if hasattr(value, "x") and hasattr(value, "y"):
         try:
             return float(value.x), float(value.y)
@@ -206,8 +190,7 @@ def _to_point_array(points: Any) -> np.ndarray:
         return np.empty((0, 2), dtype=np.float32)
 
     if isinstance(points, np.ndarray):
-        arr = points.astype(np.float32).reshape(-1, 2)
-        return arr
+        return points.astype(np.float32).reshape(-1, 2)
 
     normalized: list[tuple[float, float]] = []
     for item in points:
@@ -306,19 +289,15 @@ def _extract_attr(obj: Any, candidate_names: Iterable[str], default: Any = None)
     return default
 
 
-def _flatten_named_geometry(container: Any) -> dict[str, Any]:
-    if container is None:
+def _flatten_object(obj: Any) -> dict[str, Any]:
+    if obj is None:
         return {}
-
-    if isinstance(container, dict):
-        return dict(container)
-
-    if is_dataclass(container):
-        return asdict(container)
-
-    if hasattr(container, "__dict__"):
-        return dict(vars(container))
-
+    if isinstance(obj, dict):
+        return dict(obj)
+    if is_dataclass(obj):
+        return asdict(obj)
+    if hasattr(obj, "__dict__"):
+        return dict(vars(obj))
     return {}
 
 
@@ -326,12 +305,6 @@ def _flatten_named_geometry(container: Any) -> dict[str, Any]:
 # Calibration / Record
 # ------------------------------------------------------------
 def _normalize_marker_list(markers: Any) -> list[tuple[float, float]]:
-    """
-    Normalisiert auf genau 4 Primärmarker.
-    Legacy-5-Punkt-Format wird unterstützt:
-    - Punkte 0..3 = Marker
-    - Punkt 4 = alter Bull -> wird ignoriert
-    """
     arr = _to_point_array(markers)
 
     if arr.shape[0] < 4:
@@ -342,21 +315,6 @@ def _normalize_marker_list(markers: Any) -> list[tuple[float, float]]:
         )
 
     return [(float(x), float(y)) for x, y in arr[:4]]
-
-
-def _extract_record_markers(record: Any) -> list[tuple[float, float]]:
-    if hasattr(record, "markers"):
-        return _normalize_marker_list(getattr(record, "markers"))
-
-    if hasattr(record, "manual_points"):
-        return _normalize_marker_list(getattr(record, "manual_points"))
-
-    if hasattr(record, "points"):
-        return _normalize_marker_list(getattr(record, "points"))
-
-    raise AttributeError(
-        "CameraCalibrationRecord enthält weder 'markers' noch 'manual_points' noch 'points'."
-    )
 
 
 def _extract_camera_payload(raw: dict[str, Any], camera_index: int) -> dict[str, Any]:
@@ -381,12 +339,6 @@ def _extract_camera_payload(raw: dict[str, Any], camera_index: int) -> dict[str,
 
 
 def _make_calibration_record(camera_payload: dict[str, Any], camera_index: int) -> CameraCalibrationRecord:
-    """
-    Baut den Record exakt passend zu deinem lokalen Signature-Stand:
-    (camera_index, name, enabled, device_id, width, height, fps, rotation, flip,
-     overlay_alpha, show_numbers, show_sector_lines, manual_points,
-     empty_board_reference_path='')
-    """
     raw_points = (
         camera_payload.get("markers")
         or camera_payload.get("marker_points")
@@ -442,14 +394,18 @@ def _load_calibration_record(calibration_path: Path, camera_index: int) -> Camer
     return _make_calibration_record(camera_payload, camera_index)
 
 
+def _extract_record_marker_dicts(record: Any) -> list[dict[str, int]]:
+    manual_points = getattr(record, "manual_points", None)
+    if not manual_points:
+        raise ValueError("Calibration record enthält keine manual_points.")
+    points = _normalize_marker_list(manual_points)
+    return [{"x_px": int(round(x)), "y_px": int(round(y))} for x, y in points]
+
+
 # ------------------------------------------------------------
 # Config-Objekte robust aus dict bauen
 # ------------------------------------------------------------
 def _coerce_config_object(config_cls: Any, data: Any) -> Any:
-    """
-    Wandelt dict -> Config-Objekt um, falls eine passende Config-Klasse existiert.
-    Gibt None zurück, wenn nichts Sinnvolles gebaut werden kann.
-    """
     if config_cls is None or data is None:
         return None
 
@@ -462,7 +418,6 @@ def _coerce_config_object(config_cls: Any, data: Any) -> Any:
         kwargs = {k: v for k, v in data.items() if k in accepted}
         return config_cls(**kwargs)
     except Exception:
-        # Fallback: Default-Objekt erzeugen und bekannte Felder setzen
         try:
             obj = config_cls()
             for key, value in data.items():
@@ -477,153 +432,46 @@ def _coerce_config_object(config_cls: Any, data: Any) -> Any:
 
 
 # ------------------------------------------------------------
-# Pipeline / Geometrie
+# Geometry-Aufrufe exakt passend zum aktuellen Repo
 # ------------------------------------------------------------
-def _call_build_pipeline_points(record: CameraCalibrationRecord, image_shape: tuple[int, int, int]) -> Any:
-    h, w = image_shape[:2]
-    sig = inspect.signature(build_pipeline_points)
-    params = sig.parameters
-
-    kwargs: dict[str, Any] = {}
-    record_markers = _extract_record_markers(record)
-
-    if "calibration_record" in params:
-        kwargs["calibration_record"] = record
-    if "record" in params:
-        kwargs["record"] = record
-    if "camera_calibration_record" in params:
-        kwargs["camera_calibration_record"] = record
-
-    if "markers" in params:
-        kwargs["markers"] = record_markers
-    if "image_points" in params:
-        kwargs["image_points"] = record_markers
-    if "manual_points" in params:
-        kwargs["manual_points"] = record_markers
-    if "points" in params:
-        kwargs["points"] = record_markers
-
-    if "image_size" in params:
-        kwargs["image_size"] = (w, h)
-    if "frame_size" in params:
-        kwargs["frame_size"] = (w, h)
-    if "width" in params:
-        kwargs["width"] = w
-    if "height" in params:
-        kwargs["height"] = h
-
-    try:
-        return build_pipeline_points(**kwargs)
-    except TypeError:
-        try:
-            return build_pipeline_points(record)
-        except TypeError:
-            return build_pipeline_points(record_markers)
-
-
-def _call_project_topdown_points_to_image(points_topdown: Any, pipeline: Any) -> np.ndarray:
-    arr = _to_point_array(points_topdown)
-    if arr.size == 0:
-        return arr
-
-    try:
-        result = project_topdown_points_to_image(arr, pipeline)
-        return _to_point_array(result)
-    except TypeError:
-        result = project_topdown_points_to_image(points=arr, pipeline=pipeline)
-        return _to_point_array(result)
-
-
-def _call_project_image_points_to_topdown(points_image: Any, pipeline: Any) -> np.ndarray:
-    arr = _to_point_array(points_image)
-    if arr.size == 0:
-        return arr
-
-    try:
-        result = project_image_points_to_topdown(arr, pipeline)
-        return _to_point_array(result)
-    except TypeError:
-        result = project_image_points_to_topdown(points=arr, pipeline=pipeline)
-        return _to_point_array(result)
-
-
-def _call_calculate_hit_from_image_point(point_image: Any, pipeline: Any) -> Any:
-    point = _to_point_tuple(point_image)
-    if point is None:
+def _project_image_points(points_like: Any, image_points: Any) -> Optional[np.ndarray]:
+    pts = _to_point_array(image_points)
+    if pts.size == 0:
         return None
-
-    try:
-        return calculate_hit_from_image_point(point, pipeline)
-    except TypeError:
-        try:
-            return calculate_hit_from_image_point(point=point, pipeline=pipeline)
-        except TypeError:
-            return calculate_hit_from_image_point(point, points_like=pipeline)
+    return project_image_points_to_topdown(points_like, pts)
 
 
-def _call_calculate_hit_from_topdown_point(point_topdown: Any, pipeline: Any) -> Any:
-    point = _to_point_tuple(point_topdown)
-    if point is None:
+def _project_topdown_points(points_like: Any, topdown_points: Any) -> Optional[np.ndarray]:
+    pts = _to_point_array(topdown_points)
+    if pts.size == 0:
         return None
-
-    try:
-        return calculate_hit_from_topdown_point(point, pipeline)
-    except TypeError:
-        try:
-            return calculate_hit_from_topdown_point(point=point, pipeline=pipeline)
-        except TypeError:
-            return calculate_hit_from_topdown_point(point, points_like=pipeline)
+    return project_topdown_points_to_image(points_like, pts)
 
 
-# ------------------------------------------------------------
-# Pipeline-Geometrie lesen
-# ------------------------------------------------------------
-def _extract_geometry_from_pipeline(pipeline: Any) -> dict[str, Any]:
-    src = _flatten_named_geometry(pipeline)
+def _calculate_hit_from_image(point: Any, points_like: Any) -> Any:
+    pt = _to_point_tuple(point)
+    if pt is None:
+        return None
+    return calculate_hit_from_image_point(float(pt[0]), float(pt[1]), points_like)
 
-    nested_geometry = _extract_attr(pipeline, ["geometry", "board_geometry", "overlay_geometry"], None)
-    if nested_geometry is not None:
-        nested_dict = _flatten_named_geometry(nested_geometry)
-        for k, v in nested_dict.items():
-            src.setdefault(k, v)
 
-    ring_polylines = src.get("ring_polylines") or src.get("rings") or src.get("ring_lines") or {}
-    segment_lines = src.get("segment_lines") or src.get("sector_lines") or src.get("radial_lines") or []
-    number_positions = src.get("number_positions") or src.get("label_positions") or src.get("segment_label_positions") or {}
-    bull_position = src.get("bull") or src.get("bull_center") or src.get("board_center") or None
-
-    return {
-        "ring_polylines": ring_polylines,
-        "segment_lines": segment_lines,
-        "number_positions": number_positions,
-        "bull_position": bull_position,
-    }
+def _calculate_hit_from_topdown(point: Any) -> Any:
+    pt = _to_point_tuple(point)
+    if pt is None:
+        return None
+    return calculate_hit_from_topdown_point(float(pt[0]), float(pt[1]))
 
 
 # ------------------------------------------------------------
 # ScoreMapper / Detector
 # ------------------------------------------------------------
-def _create_score_mapper(pipeline: Any, record: CameraCalibrationRecord) -> ScoreMapper:
-    sig = inspect.signature(ScoreMapper)
-    params = sig.parameters
-    kwargs: dict[str, Any] = {}
-
-    if "pipeline" in params:
-        kwargs["pipeline"] = pipeline
-    if "points_like" in params:
-        kwargs["points_like"] = pipeline
-    if "calibration_record" in params:
-        kwargs["calibration_record"] = record
-    if "record" in params:
-        kwargs["record"] = record
-
-    try:
-        return ScoreMapper(**kwargs)
-    except TypeError:
-        try:
-            return ScoreMapper(pipeline)
-        except TypeError:
-            return ScoreMapper(points_like=pipeline)
+def _create_score_mapper(record: CameraCalibrationRecord) -> ScoreMapper:
+    width = int(getattr(record, "width", 1280))
+    height = int(getattr(record, "height", 720))
+    return ScoreMapper(
+        calibration_record=record,
+        image_size=(width, height),
+    )
 
 
 def _set_impact_strategy_on_object(obj: Any, impact_strategy: str) -> None:
@@ -655,33 +503,20 @@ def _set_impact_strategy_on_detector(detector: Any, impact_strategy: str) -> Non
 
 
 def _create_single_cam_detector(
-    pipeline: Any,
     score_mapper: ScoreMapper,
     record: CameraCalibrationRecord,
-    frame_shape: tuple[int, int, int],
     config_json: Optional[dict[str, Any]],
     impact_strategy: str,
 ) -> SingleCamDetector:
-    h, w = frame_shape[:2]
     sig = inspect.signature(SingleCamDetector)
     params = sig.parameters
     kwargs: dict[str, Any] = {}
 
     if "score_mapper" in params:
         kwargs["score_mapper"] = score_mapper
-    if "pipeline" in params:
-        kwargs["pipeline"] = pipeline
     if "calibration_record" in params:
         kwargs["calibration_record"] = record
-    if "image_size" in params:
-        kwargs["image_size"] = (w, h)
 
-    if "pipeline_kwargs" in params:
-        kwargs["pipeline_kwargs"] = {}
-
-    # WICHTIG:
-    # config.json NICHT blind als dict an config= geben.
-    # Erst versuchen, echte Config-Objekte zu bauen.
     if config_json is not None and isinstance(config_json, dict):
         detector_cfg_raw = (
             config_json.get("single_cam_detector_config")
@@ -705,18 +540,7 @@ def _create_single_cam_detector(
         if "impact_estimator_config" in params and impact_cfg_obj is not None:
             kwargs["impact_estimator_config"] = impact_cfg_obj
 
-    try:
-        detector = SingleCamDetector(**kwargs)
-    except TypeError:
-        fallback_kwargs = {}
-        if "score_mapper" in params:
-            fallback_kwargs["score_mapper"] = score_mapper
-        if "pipeline" in params:
-            fallback_kwargs["pipeline"] = pipeline
-        if "calibration_record" in params:
-            fallback_kwargs["calibration_record"] = record
-        detector = SingleCamDetector(**fallback_kwargs)
-
+    detector = SingleCamDetector(**kwargs)
     _set_impact_strategy_on_detector(detector, impact_strategy)
     return detector
 
@@ -763,6 +587,22 @@ def _find_first_candidate(result: Any) -> Any:
 
 
 def _extract_final_impact_point(result: Any) -> Optional[tuple[float, float]]:
+    # Neuer Hauptpfad: scored_estimates[0].impact_estimate.impact_point
+    scored_estimates = _extract_attr(result, ["scored_estimates"], None)
+    if scored_estimates and len(scored_estimates) > 0:
+        first = scored_estimates[0]
+
+        impact_estimate = _extract_attr(first, ["impact_estimate"], None)
+        if impact_estimate is not None:
+            point = _to_point_tuple(_extract_attr(impact_estimate, ["impact_point"], None))
+            if point is not None:
+                return point
+
+        point = _to_point_tuple(_extract_attr(first, ["image_point"], None))
+        if point is not None:
+            return point
+
+    # Alte Fallbacks
     direct_candidates = [
         _extract_attr(result, ["final_point_image", "impact_point_image", "final_impact_point", "point_image"], None),
         _extract_attr(result, ["impact_point", "final_point"], None),
@@ -807,6 +647,15 @@ def _extract_final_impact_point(result: Any) -> Optional[tuple[float, float]]:
 
 
 def _extract_scored_hit(result: Any) -> Any:
+    # Neuer Hauptpfad: scored_estimates[0].scored_hit
+    scored_estimates = _extract_attr(result, ["scored_estimates"], None)
+    if scored_estimates and len(scored_estimates) > 0:
+        first = scored_estimates[0]
+        scored_hit = _extract_attr(first, ["scored_hit"], None)
+        if scored_hit is not None:
+            return scored_hit
+
+    # Alte Fallbacks
     for name in ("scored_hit", "best_scored_hit", "hit", "score", "final_hit"):
         value = _extract_attr(result, [name], None)
         if value is not None:
@@ -861,6 +710,44 @@ def _extract_hypotheses(result: Any) -> list[dict[str, Any]]:
 
     return hypotheses_output
 
+
+def _extract_scored_estimates(result: Any) -> list[dict[str, Any]]:
+    """
+    Holt die scored_estimates robust aus dem Result-Objekt und normalisiert sie
+    für das Kandidaten-Overlay.
+
+    Erwarteter Hauptpfad:
+    result.scored_estimates oder result["scored_estimates"]
+    """
+    scored_estimates = _extract_attr(result, ["scored_estimates"], None)
+    if not scored_estimates:
+        return []
+
+    normalized: list[dict[str, Any]] = []
+
+    for item in scored_estimates:
+        impact_estimate = _extract_attr(item, ["impact_estimate"], None) or {}
+        scored_hit = _extract_attr(item, ["scored_hit"], None) or {}
+        candidate = _extract_attr(impact_estimate, ["candidate"], None) or {}
+
+        normalized.append(
+            {
+                "rank": _extract_attr(item, ["rank"], None),
+                "candidate_id": _extract_attr(item, ["candidate_id"], _extract_attr(candidate, ["candidate_id"], None)),
+                "image_point": _to_point_tuple(_extract_attr(item, ["image_point"], None)),
+                "combined_confidence": _extract_attr(item, ["combined_confidence"], None),
+                "candidate_confidence": _extract_attr(item, ["candidate_confidence"], _extract_attr(candidate, ["confidence"], None)),
+                "impact_confidence": _extract_attr(item, ["impact_confidence"], _extract_attr(impact_estimate, ["confidence"], None)),
+                "label": _extract_attr(scored_hit, ["label"], None),
+                "score": _extract_attr(scored_hit, ["score"], None),
+                "ring": _extract_attr(scored_hit, ["ring"], None),
+                "bbox": _extract_attr(candidate, ["bbox"], _extract_attr(impact_estimate, ["bbox"], None)),
+                "centroid": _to_point_tuple(_extract_attr(candidate, ["centroid"], _extract_attr(impact_estimate, ["centroid"], None))),
+                "impact_point": _to_point_tuple(_extract_attr(impact_estimate, ["impact_point"], None)),
+            }
+        )
+
+    return normalized
 
 # ------------------------------------------------------------
 # Numerischer Segment-Debug
@@ -938,16 +825,19 @@ def _hit_obj_to_dict(hit_obj: Any) -> dict[str, Any]:
     result = {}
     for attr_name in (
         "label",
-        "ring",
+        "ring_name",
         "multiplier",
         "segment",
-        "segment_number",
-        "sector",
+        "segment_value",
         "score",
-        "value",
-        "is_miss",
-        "topdown_point",
-        "image_point",
+        "radius",
+        "angle_deg",
+        "board_x",
+        "board_y",
+        "topdown_x_px",
+        "topdown_y_px",
+        "image_x_px",
+        "image_y_px",
     ):
         if hasattr(hit_obj, attr_name):
             result[attr_name] = _json_dump_safe(getattr(hit_obj, attr_name))
@@ -959,98 +849,71 @@ def _hit_obj_to_dict(hit_obj: Any) -> dict[str, Any]:
 
 
 # ------------------------------------------------------------
-# Overlay
+# Overlay - direkt auf Basis der echten calibration_geometry-Helfer
 # ------------------------------------------------------------
 def _render_score_geometry_overlay(
     frame: np.ndarray,
-    pipeline: Any,
+    points_like: Any,
     record: CameraCalibrationRecord,
     final_impact_point: Optional[tuple[float, float]],
     hypotheses: list[dict[str, Any]],
 ) -> np.ndarray:
     overlay = frame.copy()
-    geometry = _extract_geometry_from_pipeline(pipeline)
-
-    ring_polylines = geometry["ring_polylines"]
-    segment_lines = geometry["segment_lines"]
-    number_positions = geometry["number_positions"]
-    bull_position = geometry["bull_position"]
 
     ring_color_default = (180, 180, 180)
-    color_map = {
-        "double_outer": (0, 0, 255),
-        "double_inner": (0, 80, 255),
-        "triple_outer": (0, 200, 0),
-        "triple_inner": (0, 150, 0),
-        "outer": (160, 160, 160),
-        "inner": (160, 160, 160),
-        "single_outer": (160, 160, 160),
-        "single_inner": (160, 160, 160),
-        "sbull": (255, 255, 0),
-        "dbull": (255, 255, 0),
-        "bull_outer": (255, 255, 0),
-        "bull_inner": (0, 255, 255),
-    }
 
-    if isinstance(ring_polylines, dict):
-        items = ring_polylines.items()
-    else:
-        items = enumerate(ring_polylines)
-
-    for key, polyline_topdown in items:
-        poly_td = _to_point_array(polyline_topdown)
-        if poly_td.shape[0] < 2:
+    ring_polylines = generate_ring_polylines_image(points_like)
+    for idx, poly in enumerate(ring_polylines):
+        poly_arr = _to_point_array(poly)
+        if poly_arr.shape[0] < 2:
             continue
 
-        poly_img = _call_project_topdown_points_to_image(poly_td, pipeline)
-        color = color_map.get(str(key), ring_color_default)
-        thickness = 2 if "double" in str(key) or "triple" in str(key) or "bull" in str(key) else 1
-        _draw_polyline(overlay, poly_img, color=color, thickness=thickness, closed=True)
+        # Indizes laut RING_RADII_REL:
+        # 0 outer double, 1 inner double, 2 outer triple, 3 inner triple, 4 outer bull, 5 inner bull
+        if idx in (0, 1):
+            color = (0, 0, 255)
+            thickness = 2
+        elif idx in (2, 3):
+            color = (0, 200, 0)
+            thickness = 2
+        elif idx in (4, 5):
+            color = (0, 255, 255)
+            thickness = 2
+        else:
+            color = ring_color_default
+            thickness = 1
 
-    for line_topdown in segment_lines:
-        line_td = _to_point_array(line_topdown)
-        if line_td.shape[0] < 2:
-            continue
+        _draw_polyline(overlay, poly_arr, color=color, thickness=thickness, closed=True)
 
-        line_img = _call_project_topdown_points_to_image(line_td, pipeline)
-        _draw_polyline(overlay, line_img, color=(120, 120, 120), thickness=1, closed=False)
+    sector_lines = generate_sector_lines_image(points_like)
+    for line in sector_lines:
+        line_arr = _to_point_array(line)
+        if line_arr.shape[0] >= 2:
+            _draw_polyline(overlay, line_arr, color=(120, 120, 120), thickness=1, closed=False)
 
-    if isinstance(number_positions, dict):
-        label_items = number_positions.items()
-    else:
-        label_items = enumerate(number_positions)
+    number_positions = generate_number_positions_image(points_like)
+    for label, pos in number_positions:
+        pt = _to_point_tuple(pos)
+        if pt is not None:
+            _draw_label(
+                overlay,
+                str(label),
+                pt,
+                color=(255, 255, 255),
+                scale=0.45,
+                thickness=1,
+                with_bg=True,
+            )
 
-    for key, pos_topdown in label_items:
-        pos_td = _to_point_tuple(pos_topdown)
-        if pos_td is None:
-            continue
+    bull = compute_bull_from_manual_points(points_like)
+    bull_pt = _to_point_tuple(bull)
+    if bull_pt is not None:
+        _draw_circle_point(overlay, bull_pt, (0, 255, 255), radius=6, thickness=-1)
+        _draw_cross(overlay, bull_pt, (0, 255, 255), size=10, thickness=2)
+        _draw_label(overlay, "Bull", bull_pt, (0, 255, 255), scale=0.45)
 
-        pos_img_arr = _call_project_topdown_points_to_image([pos_td], pipeline)
-        if pos_img_arr.shape[0] == 0:
-            continue
-
-        pos_img = tuple(float(v) for v in pos_img_arr[0])
-        _draw_label(
-            overlay,
-            str(key),
-            pos_img,
-            color=(255, 255, 255),
-            scale=0.45,
-            thickness=1,
-            with_bg=True,
-        )
-
-    bull_td = _to_point_tuple(bull_position)
-    if bull_td is not None:
-        bull_img_arr = _call_project_topdown_points_to_image([bull_td], pipeline)
-        if bull_img_arr.shape[0] > 0:
-            bull_img = tuple(float(v) for v in bull_img_arr[0])
-            _draw_circle_point(overlay, bull_img, (0, 255, 255), radius=6, thickness=-1)
-            _draw_cross(overlay, bull_img, (0, 255, 255), size=10, thickness=2)
-            _draw_label(overlay, "Bull", bull_img, (0, 255, 255), scale=0.45)
-
-    record_markers = _extract_record_markers(record)
-    for idx, marker in enumerate(record_markers):
+    marker_dicts = _extract_record_marker_dicts(record)
+    for idx, marker in enumerate(marker_dicts):
         pt = _to_point_tuple(marker)
         if pt is None:
             continue
@@ -1118,41 +981,238 @@ def _render_score_geometry_overlay(
 
     return overlay
 
+def _render_candidate_ranking_overlay(
+    frame: np.ndarray,
+    scored_estimates: list[dict[str, Any]],
+) -> np.ndarray:
+    """
+    Zeichnet alle scored_estimates direkt auf das Bild:
+    - Bounding Box
+    - Rank
+    - candidate_id
+    - Candidate-/Combined-Confidence
+    - Centroid
+    - Impact-Punkt
+    - Label / Score
+
+    Farbkonzept:
+    - Rank 1 = rot
+    - Rank 2 = orange
+    - Rank 3 = gelb
+    - weitere = grau
+    """
+    overlay = frame.copy()
+
+    def color_for_rank(rank: Any) -> tuple[int, int, int]:
+        if rank == 1:
+            return (0, 0, 255)       # rot
+        if rank == 2:
+            return (0, 165, 255)     # orange
+        if rank == 3:
+            return (0, 255, 255)     # gelb
+        return (180, 180, 180)       # grau
+
+    for est in scored_estimates:
+        rank = est.get("rank")
+        candidate_id = est.get("candidate_id")
+        bbox = est.get("bbox")
+        centroid = est.get("centroid")
+        impact_point = est.get("impact_point")
+        label = est.get("label")
+        score = est.get("score")
+        ring = est.get("ring")
+        candidate_conf = est.get("candidate_confidence")
+        combined_conf = est.get("combined_confidence")
+
+        color = color_for_rank(rank)
+
+        # ----------------------------------------------------
+        # Bounding Box
+        # ----------------------------------------------------
+        if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+            try:
+                x, y, w, h = [int(round(float(v))) for v in bbox[:4]]
+                cv2.rectangle(overlay, (x, y), (x + w, y + h), color, 2)
+
+                title = f"#{rank}  id={candidate_id}"
+                _draw_label(
+                    overlay,
+                    title,
+                    (x, max(18, y - 8)),
+                    color,
+                    scale=0.5,
+                    thickness=1,
+                    with_bg=True,
+                )
+
+                detail_parts = []
+                if candidate_conf is not None:
+                    try:
+                        detail_parts.append(f"c={float(candidate_conf):.3f}")
+                    except Exception:
+                        detail_parts.append(f"c={candidate_conf}")
+                if combined_conf is not None:
+                    try:
+                        detail_parts.append(f"comb={float(combined_conf):.3f}")
+                    except Exception:
+                        detail_parts.append(f"comb={combined_conf}")
+                if label is not None:
+                    detail_parts.append(str(label))
+                if score is not None:
+                    detail_parts.append(f"s={score}")
+                if ring is not None:
+                    detail_parts.append(str(ring))
+
+                if detail_parts:
+                    _draw_label(
+                        overlay,
+                        " | ".join(detail_parts),
+                        (x, y + h + 18),
+                        color,
+                        scale=0.45,
+                        thickness=1,
+                        with_bg=True,
+                    )
+            except Exception:
+                pass
+
+        # ----------------------------------------------------
+        # Centroid
+        # ----------------------------------------------------
+        if centroid is not None:
+            _draw_circle_point(overlay, centroid, color, radius=4, thickness=-1)
+            _draw_label(
+                overlay,
+                "centroid",
+                (int(round(centroid[0])) + 8, int(round(centroid[1])) - 8),
+                color,
+                scale=0.4,
+                thickness=1,
+                with_bg=True,
+            )
+
+        # ----------------------------------------------------
+        # Impact-Punkt
+        # ----------------------------------------------------
+        if impact_point is not None:
+            _draw_circle_point(overlay, impact_point, (255, 255, 255), radius=5, thickness=-1)
+            _draw_cross(overlay, impact_point, color, size=10, thickness=2)
+            _draw_label(
+                overlay,
+                f"impact #{rank}",
+                (int(round(impact_point[0])) + 8, int(round(impact_point[1])) - 8),
+                color,
+                scale=0.42,
+                thickness=1,
+                with_bg=True,
+            )
+
+    return overlay
+
 
 # ------------------------------------------------------------
-# Optional existierende Debugbilder aus Result speichern
+# Optional vorhandene Debugbilder aus Result speichern
 # ------------------------------------------------------------
 def _maybe_save_stage_images(output_dir: Path, result: Any) -> None:
+    """
+    Speichert alle verfügbaren Stage-/Debugbilder robust aus dem Result.
+
+    Wichtig:
+    - bevorzugt echte debug_images-Felder aus candidate_result / impact_result
+    - fällt zusätzlich auf dicts / __dict__ zurück
+    """
+    saved_count = 0
+    saved_names: set[str] = set()
+
+    def save_debug_dict(prefix: str, debug_dict: Any) -> None:
+        nonlocal saved_count
+
+        if not isinstance(debug_dict, dict):
+            return
+
+        for key, value in debug_dict.items():
+            if value is None:
+                continue
+
+            if isinstance(value, np.ndarray) and value.ndim in (2, 3):
+                filename_key = f"{prefix}{key}" if prefix else key
+                if filename_key in saved_names:
+                    continue
+
+                filename = output_dir / f"{filename_key}.png"
+                cv2.imwrite(str(filename), value)
+                saved_names.add(filename_key)
+                saved_count += 1
+
+    # ----------------------------------------------------------
+    # 1) Direkt vom Hauptresult
+    # ----------------------------------------------------------
+    result_debug = _extract_attr(result, ["debug_images"], None)
+    save_debug_dict("", result_debug)
+
+    # ----------------------------------------------------------
+    # 2) candidate_result.debug_images
+    # ----------------------------------------------------------
+    candidate_result = _extract_attr(result, ["candidate_result"], None)
+    if candidate_result is not None:
+        save_debug_dict("", _extract_attr(candidate_result, ["debug_images"], None))
+
+    # ----------------------------------------------------------
+    # 3) impact_result.debug_images
+    # ----------------------------------------------------------
+    impact_result = _extract_attr(result, ["impact_result", "impact_estimation_result", "estimation_result"], None)
+    if impact_result is not None:
+        save_debug_dict("", _extract_attr(impact_result, ["debug_images"], None))
+
+    # ----------------------------------------------------------
+    # 4) scored_estimates / nested debug_images durchsuchen
+    # ----------------------------------------------------------
+    scored_estimates = _extract_attr(result, ["scored_estimates"], None)
+    if isinstance(scored_estimates, list):
+        for idx, estimate in enumerate(scored_estimates):
+            estimate_debug = _extract_attr(estimate, ["debug"], None)
+            if isinstance(estimate_debug, dict):
+                for key, value in estimate_debug.items():
+                    if isinstance(value, dict):
+                        save_debug_dict(f"estimate_{idx}_", value)
+
+    # ----------------------------------------------------------
+    # 5) Fallback: generische Suche in bekannten Spaces
+    # ----------------------------------------------------------
     debug_spaces = [
         _extract_attr(result, ["debug"], None),
-        _extract_attr(result, ["candidate_result"], None),
-        _extract_attr(result, ["impact_result", "impact_estimation_result", "estimation_result"], None),
+        candidate_result,
+        impact_result,
         _find_first_candidate(result),
     ]
 
-    saved_count = 0
     for space in debug_spaces:
         if space is None:
             continue
 
-        candidates = []
         if isinstance(space, dict):
-            candidates.append(space)
-        else:
-            candidates.append(_flatten_named_geometry(space))
-            nested_debug = _extract_attr(space, ["debug"], None)
-            if isinstance(nested_debug, dict):
-                candidates.append(nested_debug)
+            save_debug_dict("", space)
+            continue
 
-        for debug_dict in candidates:
-            for key, value in debug_dict.items():
-                if isinstance(value, np.ndarray) and value.ndim in (2, 3):
-                    filename = output_dir / f"{key}.png"
-                    cv2.imwrite(str(filename), value)
-                    saved_count += 1
+        # echtes Objekt -> debug_images + debug prüfen
+        save_debug_dict("", _extract_attr(space, ["debug_images"], None))
+        save_debug_dict("", _extract_attr(space, ["debug"], None))
+
+        # __dict__ fallback
+        raw = _flatten_object(space)
+        for key, value in raw.items():
+            if isinstance(value, np.ndarray) and value.ndim in (2, 3):
+                if key in saved_names:
+                    continue
+                filename = output_dir / f"{key}.png"
+                cv2.imwrite(str(filename), value)
+                saved_names.add(key)
+                saved_count += 1
 
     if saved_count > 0:
         _log(f"[INFO] {saved_count} Stage-/Debugbilder gespeichert.")
+    else:
+        _log("[INFO] Keine zusätzlichen Stage-/Debugbilder gefunden.")
 
 
 # ------------------------------------------------------------
@@ -1176,18 +1236,20 @@ def run_debug(args: argparse.Namespace) -> None:
     _log("[INFO] Lade Kalibrierung ...")
     record = _load_calibration_record(calibration_path, args.camera_index)
 
-    _log("[INFO] Erzeuge zentrale Pipeline-Geometrie ...")
-    pipeline = _call_build_pipeline_points(record, frame.shape)
+    _log("[INFO] Erzeuge ScoreMapper direkt aus calibration_record ...")
+    score_mapper = _create_score_mapper(record)
 
-    _log("[INFO] Erzeuge ScoreMapper ...")
-    score_mapper = _create_score_mapper(pipeline, record)
+    # DAS ist jetzt der echte kompatible points_like-Kontext
+    points_like = score_mapper.pipeline
+
+    # Optionaler früher Check
+    if not points_like:
+        raise ValueError("ScoreMapper.pipeline ist leer oder ungültig.")
 
     _log("[INFO] Erzeuge SingleCamDetector ...")
     detector = _create_single_cam_detector(
-        pipeline=pipeline,
         score_mapper=score_mapper,
         record=record,
-        frame_shape=frame.shape,
         config_json=config_json,
         impact_strategy=args.impact_strategy,
     )
@@ -1198,15 +1260,16 @@ def run_debug(args: argparse.Namespace) -> None:
     final_impact_point = _extract_final_impact_point(result)
     scored_hit = _extract_scored_hit(result)
     hypotheses = _extract_hypotheses(result)
+    scored_estimates = _extract_scored_estimates(result)
 
     topdown_point = None
     if final_impact_point is not None:
-        td = _call_project_image_points_to_topdown([final_impact_point], pipeline)
-        if td.shape[0] > 0:
+        td = _project_image_points(points_like, [final_impact_point])
+        if td is not None and len(td) > 0:
             topdown_point = tuple(float(v) for v in td[0])
 
-    image_hit = _call_calculate_hit_from_image_point(final_impact_point, pipeline) if final_impact_point else None
-    topdown_hit = _call_calculate_hit_from_topdown_point(topdown_point, pipeline) if topdown_point else None
+    image_hit = _calculate_hit_from_image(final_impact_point, points_like) if final_impact_point else None
+    topdown_hit = _calculate_hit_from_topdown(topdown_point) if topdown_point else None
     manual_segment_debug = _compute_manual_segment_debug(topdown_point) if topdown_point else {}
 
     result_summary = {
@@ -1218,9 +1281,11 @@ def run_debug(args: argparse.Namespace) -> None:
             "camera_index": args.camera_index,
             "impact_strategy": args.impact_strategy,
         },
+        "points_like_pipeline": _json_dump_safe(points_like),
         "final_impact_point_image": final_impact_point,
         "final_impact_point_topdown": topdown_point,
         "scored_hit_from_detector": _scored_hit_to_debug_dict(scored_hit),
+        "scored_estimates_compact": scored_estimates,
         "recomputed_hit_from_image_point": _hit_obj_to_dict(image_hit),
         "recomputed_hit_from_topdown_point": _hit_obj_to_dict(topdown_hit),
         "manual_segment_debug": manual_segment_debug,
@@ -1231,7 +1296,7 @@ def run_debug(args: argparse.Namespace) -> None:
     _log("[INFO] Rendere score_geometry_overlay.png ...")
     score_overlay = _render_score_geometry_overlay(
         frame=frame,
-        pipeline=pipeline,
+        points_like=points_like,
         record=record,
         final_impact_point=final_impact_point,
         hypotheses=hypotheses,
@@ -1239,6 +1304,15 @@ def run_debug(args: argparse.Namespace) -> None:
 
     overlay_path = output_dir / "score_geometry_overlay.png"
     cv2.imwrite(str(overlay_path), score_overlay)
+
+    _log("[INFO] Rendere candidate_ranking_overlay.png ...")
+    candidate_overlay = _render_candidate_ranking_overlay(
+        frame=frame,
+        scored_estimates=scored_estimates,
+    )
+
+    candidate_overlay_path = output_dir / "candidate_ranking_overlay.png"
+    cv2.imwrite(str(candidate_overlay_path), candidate_overlay)
 
     impact_only = frame.copy()
     if final_impact_point is not None:
@@ -1300,9 +1374,10 @@ def run_debug(args: argparse.Namespace) -> None:
     lines.append("")
     lines.append("OUTPUT FILES")
     lines.append("-" * 60)
-    lines.append(f"score_geometry_overlay.png : {overlay_path}")
-    lines.append(f"impact_only_overlay.png    : {impact_only_path}")
-    lines.append(f"segment_debug.json         : {result_json_path}")
+    lines.append(f"score_geometry_overlay.png    : {overlay_path}")
+    lines.append(f"candidate_ranking_overlay.png : {candidate_overlay_path}")
+    lines.append(f"impact_only_overlay.png       : {impact_only_path}")
+    lines.append(f"segment_debug.json            : {result_json_path}")
 
     result_txt_path = output_dir / "segment_debug.txt"
     _write_text(result_txt_path, "\n".join(lines))
@@ -1310,6 +1385,7 @@ def run_debug(args: argparse.Namespace) -> None:
     _log("")
     _log("[DONE] Debuglauf abgeschlossen.")
     _log(f"[DONE] Overlay: {overlay_path}")
+    _log(f"[DONE] Candidate Overlay: {candidate_overlay_path}")
     _log(f"[DONE] Text-Debug: {result_txt_path}")
     _log(f"[DONE] JSON-Debug: {result_json_path}")
 
@@ -1359,7 +1435,6 @@ def parse_args() -> argparse.Namespace:
         help="Speichert zusätzlich vorhandene Stage-/Debugbilder aus den Result-Objekten",
     )
 
-    # Nur als Kompatibilitätsflags akzeptiert
     parser.add_argument("--auto-board-mask", action="store_true", help="Kompatibilitätsflag")
     parser.add_argument("--auto-board-mask-scale", type=float, default=0.90, help="Kompatibilitätsflag")
 
@@ -1383,4 +1458,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

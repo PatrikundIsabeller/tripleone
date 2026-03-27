@@ -20,8 +20,7 @@
 #   - best_hypothesis
 #   - blend
 
-from __future__ import annotations
-
+import math
 from dataclasses import dataclass, field
 from typing import Any, Optional, Sequence
 
@@ -243,6 +242,28 @@ class ImpactEstimatorConfig:
     clamp_to_image_bounds: bool = True
     keep_debug_metadata: bool = True
 
+    # --------------------------------------------------------------
+    # NEU: boardnahe Konturspitze für große Dartkonturen
+    # --------------------------------------------------------------
+    use_board_near_contour_tip: bool = True
+
+    # Nur die konturpunkte betrachten, die grob in Richtung Boardzentrum liegen
+    board_near_tip_top_k_points: int = 3
+
+    # Wie stark Punkte bevorzugt werden, die näher am Boardzentrum liegen
+    board_near_tip_distance_weight: float = 1.40
+
+    # Wie stark Punkte bevorzugt werden, die entlang der Dart-Richtung "nach vorne"
+    # in Richtung Boardzentrum zeigen
+    board_near_tip_forward_weight: float = 2.20
+
+    # Maximal erlaubter Abstand zur Hauptachsen-Referenz, damit wir nicht auf
+    # völlig irrelevante Konturäste springen
+    board_near_tip_max_distance_from_axis_px: float = 18.0
+
+    # Gewicht dieser Hypothese im Blend
+    weight_board_near_contour_tip: float = 0.35
+
 
 # -----------------------------------------------------------------------------
 # Kleine Helpers
@@ -332,6 +353,7 @@ def _hypothesis_color(name: str) -> tuple[int, int, int]:
         "major_axis_centerward_endpoint": (255, 128, 0),# Orange
         "centerward_contour_tip": (0, 165, 255),        # Dunkelorange
         "directional_contour_tip": (0, 255, 0),         # Grün
+        "board_near_contour_tip": (0, 0, 255),          # Rot
     }
     return mapping.get(name, (200, 200, 200))
 
@@ -700,6 +722,169 @@ class ImpactEstimator:
         length_part = _clip01(float(major_axis_length) / 150.0)
         return _clip01(0.5 * ratio_part + 0.5 * length_part)
 
+    def _extract_board_center_image(
+        self,
+        candidate: DartCandidate,
+    ) -> Optional[PointF]:
+        """
+        Holt das Boardzentrum aus candidate.debug, falls vorhanden.
+        """
+        debug = getattr(candidate, "debug", {}) or {}
+        board_center = debug.get("board_center_image")
+        return _safe_extract_point(board_center)
+
+    def _point_to_line_distance_px(
+        self,
+        point: PointF,
+        line_a: PointF,
+        line_b: PointF,
+    ) -> float:
+        """
+        Abstand eines Punktes zu einer Linie in Pixeln.
+        """
+        px, py = point
+        ax, ay = line_a
+        bx, by = line_b
+
+        dx = bx - ax
+        dy = by - ay
+
+        denom = math.hypot(dx, dy)
+        if denom <= 1e-9:
+            return math.hypot(px - ax, py - ay)
+
+        num = abs(dy * px - dx * py + bx * ay - by * ax)
+        return float(num / denom)
+
+    def _estimate_board_near_contour_tip(
+        self,
+        candidate: DartCandidate,
+    ) -> Optional[tuple[PointF, dict[str, Any]]]:
+        """
+        Sucht auf der Kontur gezielt die boardnahe Spitze.
+
+        Idee:
+        - Konturpunkte nehmen
+        - Boardzentrum aus candidate.debug lesen
+        - Punkte bevorzugen, die:
+          1) näher zum Boardzentrum liegen
+          2) entlang der Hauptachse plausibel liegen
+          3) nicht weit seitlich von der Dartachse abweichen
+        """
+        if not self.config.use_board_near_contour_tip:
+            return None
+
+        contour = getattr(candidate, "contour", None)
+        if contour is None:
+            return None
+
+        points = np.asarray(contour, dtype=np.float32).reshape(-1, 2)
+        if len(points) < 3:
+            return None
+
+        board_center = self._extract_board_center_image(candidate)
+        if board_center is None:
+            return None
+
+        debug = getattr(candidate, "debug", {}) or {}
+
+        axis_a = _safe_extract_point(debug.get("major_axis_endpoint_a"))
+        axis_b = _safe_extract_point(debug.get("major_axis_endpoint_b"))
+
+        has_axis = axis_a is not None and axis_b is not None
+
+        scored_points: list[tuple[float, PointF]] = []
+        centerward_axis: Optional[PointF] = None
+
+        if has_axis:
+            da = math.hypot(axis_a[0] - board_center[0], axis_a[1] - board_center[1])
+            db = math.hypot(axis_b[0] - board_center[0], axis_b[1] - board_center[1])
+            centerward_axis = axis_a if da <= db else axis_b
+
+        axis_vec = None
+        axis_len_sq = None
+        if has_axis:
+            axis_vec = (axis_b[0] - axis_a[0], axis_b[1] - axis_a[1])
+            axis_len_sq = axis_vec[0] * axis_vec[0] + axis_vec[1] * axis_vec[1]
+
+        for pt in points:
+            point = (float(pt[0]), float(pt[1]))
+
+            dist_to_center = math.hypot(point[0] - board_center[0], point[1] - board_center[1])
+            center_score = 1.0 / max(dist_to_center, 1.0)
+
+            axis_score = 1.0
+            forward_score = 1.0
+
+            if has_axis and axis_vec is not None and axis_len_sq is not None and axis_len_sq > 1e-9:
+                axis_distance = self._point_to_line_distance_px(point, axis_a, axis_b)
+                if axis_distance > float(self.config.board_near_tip_max_distance_from_axis_px):
+                    continue
+
+                # Nur Punkte auf der boardnahen Achsenhälfte zulassen.
+                # Damit fliegen obere/flight-nahe Punkte raus.
+                rel = (point[0] - axis_a[0], point[1] - axis_a[1])
+                t = (rel[0] * axis_vec[0] + rel[1] * axis_vec[1]) / axis_len_sq
+
+                da = math.hypot(axis_a[0] - board_center[0], axis_a[1] - board_center[1])
+                db = math.hypot(axis_b[0] - board_center[0], axis_b[1] - board_center[1])
+
+                # Wenn axis_b boardnaher ist, wollen wir nur den unteren/boardnahen Teil.
+                if db <= da:
+                    if t < 0.55:
+                        continue
+                else:
+                    if t > 0.45:
+                        continue
+
+                axis_score = 1.0 / (1.0 + axis_distance)
+
+                if centerward_axis is not None:
+                    forward_dist = math.hypot(
+                        point[0] - centerward_axis[0],
+                        point[1] - centerward_axis[1],
+                    )
+                    forward_score = 1.0 / (1.0 + forward_dist)
+
+            score = (
+                float(self.config.board_near_tip_distance_weight) * center_score
+                + float(self.config.board_near_tip_forward_weight) * forward_score
+                + 0.75 * axis_score
+            )
+
+            scored_points.append((score, point))
+
+        if not scored_points:
+            return None
+
+        scored_points.sort(key=lambda item: item[0], reverse=True)
+
+        top_k = max(1, int(self.config.board_near_tip_top_k_points))
+        selected = scored_points[:top_k]
+
+        # Für die boardnahe Spitze darf nicht zu stark über die ganze Kontur gemittelt werden.
+        # Deshalb nehmen wir den besten Punkt direkt, oder nur ein sehr lokales Mittel
+        # der wenigen besten Punkte.
+        if top_k <= 1 or len(selected) == 1:
+            best_point = selected[0][1]
+        else:
+            total_weight = sum(score for score, _ in selected)
+            if total_weight <= 1e-9:
+                best_point = selected[0][1]
+            else:
+                x = sum(score * point[0] for score, point in selected) / total_weight
+                y = sum(score * point[1] for score, point in selected) / total_weight
+                best_point = (float(x), float(y))
+
+        metadata = {
+            "board_center_image": board_center,
+            "top_k_points": top_k,
+            "selected_points": [point for _, point in selected[:8]],
+            "best_raw_point": selected[0][1],
+            "axis_reference_point": centerward_axis,
+        }
+        return best_point, metadata
+
     def _collect_hypotheses(
         self,
         candidate: DartCandidate,
@@ -910,6 +1095,33 @@ class ImpactEstimator:
                     )
                 )
 
+        # ------------------------------------------------------------------
+        # 5) Board-nahe Konturspitze
+        # ------------------------------------------------------------------
+        if self.config.use_board_near_contour_tip:
+            board_near_tip_result = self._estimate_board_near_contour_tip(candidate)
+
+            if board_near_tip_result is not None:
+                board_near_tip_point, board_near_tip_metadata = board_near_tip_result
+
+                axis_quality = self._axis_based_quality(
+                    aspect_ratio=aspect_ratio,
+                    major_axis_length=major_axis_length,
+                )
+                source_quality = _clip01(0.45 + 0.55 * axis_quality)
+
+                hypotheses.append(
+                    ImpactHypothesis(
+                        name="board_near_contour_tip",
+                        point=board_near_tip_point,
+                        base_weight=float(self.config.weight_board_near_contour_tip),
+                        source_quality=source_quality,
+                        consistency_score=1.0,
+                        final_weight=float(self.config.weight_board_near_contour_tip) * source_quality,
+                        metadata=board_near_tip_metadata,
+                    )
+                )
+
         return hypotheses
 
     def _choose_final_point(
@@ -934,6 +1146,7 @@ class ImpactEstimator:
             "major_axis_centerward_endpoint",
             "centerward_contour_tip",
             "directional_contour_tip",
+            "board_near_contour_tip",
         }
 
         if strategy in supported_direct_strategies:
@@ -960,6 +1173,7 @@ class ImpactEstimator:
                 "'major_axis_centerward_endpoint', "
                 "'centerward_contour_tip', "
                 "'directional_contour_tip'."
+                "'board_near_contour_tip'."
             )
 
         # Blend nur aus den spitzenrelevanten Hypothesen bilden.

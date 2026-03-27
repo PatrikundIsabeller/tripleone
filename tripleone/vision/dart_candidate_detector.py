@@ -42,7 +42,6 @@ BBox = tuple[int, int, int, int]
 # -----------------------------------------------------------------------------
 # Konfiguration
 # -----------------------------------------------------------------------------
-
 @dataclass(slots=True)
 class CandidateDetectorConfig:
     """
@@ -52,7 +51,6 @@ class CandidateDetectorConfig:
     Diese Werte sind bewusst konservative Startwerte.
     Sie sind dafür gedacht, stabil debugbar zu sein und nicht "magisch"
     auf jeden Fall irgendetwas zu erraten.
-
     Die Feineinstellung kommt später anhand echter Testbilder/Videos.
     """
 
@@ -97,16 +95,41 @@ class CandidateDetectorConfig:
     draw_candidate_ids: bool = True
     draw_confidence: bool = True
 
+    # --------------------------------------------------------------
+    # NEU: erweiterter Debug
+    # --------------------------------------------------------------
+    keep_intermediate_debug_images: bool = True
+    render_all_contours_overlay: bool = True
+    render_rejected_contours_overlay: bool = True
+    render_accepted_contours_overlay: bool = True
+    max_rejection_reason_labels: int = 200
+
+    # --------------------------------------------------------------
+    # NEU: boardnahe Impact-Heuristik
+    # --------------------------------------------------------------
+    prefer_centerward_major_axis_endpoint: bool = True
+
+    # Wenn ein board_center_image verfügbar ist, wird der Endpunkt der
+    # Hauptachse bevorzugt, der näher am Boardzentrum liegt.
+    use_board_center_for_impact_point: bool = True
+
+    # Große Gesamtkonturen (z. B. kompletter Dart inkl. Flight) können
+    # leicht abgewertet werden, damit kleine boardnahe Fragmente nicht
+    # automatisch gewinnen, aber auch nicht alles dominieren.
+    penalize_very_large_candidates: bool = True
+    large_candidate_area_penalty_start: float = 1200.0
+    large_candidate_area_penalty_max: float = 0.20
+
 
 # -----------------------------------------------------------------------------
 # Datenmodelle für Kandidaten und Ergebnisse
 # -----------------------------------------------------------------------------
-
 @dataclass(slots=True)
 class ContourMetrics:
     """
     Interne, strukturierte Metriken einer einzelnen Kontur.
     """
+
     area: float
     perimeter: float
     bbox: BBox
@@ -139,6 +162,7 @@ class DartCandidate:
     'impact_point' ist hier nur eine Hypothese auf Kandidaten-Ebene,
     noch NICHT das finale Trefferfeld.
     """
+
     candidate_id: int
     bbox: BBox
     centroid: PointF
@@ -177,10 +201,8 @@ class DartCandidate:
             "confidence": self.confidence,
             "debug": self.debug,
         }
-
         if include_contour and self.contour is not None:
             data["contour"] = self.contour.reshape(-1, 2).tolist()
-
         return data
 
 
@@ -189,6 +211,7 @@ class CandidateDetectionResult:
     """
     Gesamtergebnis eines Kandidaten-Detektionslaufs.
     """
+
     candidates: list[DartCandidate]
     reference_used: bool
     board_mask_used: bool
@@ -235,7 +258,7 @@ class CandidateDetectionResult:
 
         count = len(self.candidates) if max_candidates is None else min(len(self.candidates), max_candidates)
 
-        for idx, candidate in enumerate(self.candidates[:count]):
+        for candidate in self.candidates[:count]:
             x, y, w, h = candidate.bbox
             cv2.rectangle(canvas, (x, y), (x + w, y + h), (0, 255, 255), 1)
 
@@ -264,7 +287,6 @@ class CandidateDetectionResult:
             if candidate.contour is not None:
                 cv2.drawContours(canvas, [candidate.contour], -1, (0, 255, 0), 1)
 
-            # Debug-Linie entlang der Major Axis, falls vorhanden
             a = candidate.debug.get("major_axis_endpoint_a")
             b = candidate.debug.get("major_axis_endpoint_b")
             if a is not None and b is not None:
@@ -277,15 +299,7 @@ class CandidateDetectionResult:
                     cv2.LINE_AA,
                 )
 
-            # Linie vom Schwerpunkt zum Impact-Punkt
-            cv2.line(
-                canvas,
-                (cx, cy),
-                (ix, iy),
-                (0, 165, 255),
-                1,
-                cv2.LINE_AA,
-            )
+            cv2.line(canvas, (cx, cy), (ix, iy), (0, 165, 255), 1, cv2.LINE_AA)
 
         return canvas
 
@@ -293,7 +307,6 @@ class CandidateDetectionResult:
 # -----------------------------------------------------------------------------
 # Hauptklasse
 # -----------------------------------------------------------------------------
-
 class DartCandidateDetector:
     """
     Reine Kandidaten-Detektion auf Basis von Bilddifferenzen.
@@ -316,7 +329,6 @@ class DartCandidateDetector:
     # -------------------------------------------------------------------------
     # Öffentliche API
     # -------------------------------------------------------------------------
-
     def detect_candidates(
         self,
         frame: np.ndarray,
@@ -324,24 +336,19 @@ class DartCandidateDetector:
         *,
         board_mask: Optional[np.ndarray] = None,
         board_polygon: Optional[np.ndarray | list[PointI] | list[PointF]] = None,
+        board_center_image: Optional[PointF] = None,
     ) -> CandidateDetectionResult:
         """
-        Hauptmethode:
-        Findet plausible Dart-/Impact-Kandidaten in 'frame' im Vergleich zu
-        'reference_frame'.
+        Hauptmethode: Findet plausible Dart-/Impact-Kandidaten in 'frame'
+        im Vergleich zu 'reference_frame'.
 
         Parameter:
-        - frame:
-            aktuelles Bild mit möglichem Dart
-        - reference_frame:
-            Referenzbild des leeren Boards
-        - board_mask:
-            optionale Binärmaske (ROI), 0/255
-        - board_polygon:
-            optionale ROI als Polygon; daraus wird intern eine Maske erzeugt
+        - frame: aktuelles Bild mit möglichem Dart
+        - reference_frame: Referenzbild des leeren Boards
+        - board_mask: optionale Binärmaske (ROI), 0/255
+        - board_polygon: optionale ROI als Polygon; daraus wird intern eine Maske erzeugt
 
-        Wichtig:
-        Es wird KEIN Trefferfeld berechnet.
+        Wichtig: Es wird KEIN Trefferfeld berechnet.
         """
         _validate_frame(frame, name="frame")
         _validate_frame(reference_frame, name="reference_frame")
@@ -370,23 +377,56 @@ class DartCandidateDetector:
         if board_mask_prepared is not None:
             cleaned_mask = cv2.bitwise_and(cleaned_mask, cleaned_mask, mask=board_mask_prepared)
 
-        contours = _find_external_contours(cleaned_mask)
-        roi_pixel_count = int(np.count_nonzero(board_mask_prepared)) if board_mask_prepared is not None else int(cleaned_mask.shape[0] * cleaned_mask.shape[1])
+        candidate_mask = cleaned_mask.copy()
+        contours = _find_external_contours(candidate_mask)
+
+        roi_pixel_count = (
+            int(np.count_nonzero(board_mask_prepared))
+            if board_mask_prepared is not None
+            else int(candidate_mask.shape[0] * candidate_mask.shape[1])
+        )
 
         candidates: list[DartCandidate] = []
         rejected_count = 0
 
+        rejected_contours: list[np.ndarray] = []
+        rejected_labels: list[str] = []
+
+        accepted_contours: list[np.ndarray] = []
+        accepted_labels: list[str] = []
+
+        all_contour_labels: list[str] = []
+
         for contour_index, contour in enumerate(contours):
-            candidate = self._build_candidate_from_contour(
+            x, y, w, h = _safe_bbox_from_contour(contour)
+            area = float(cv2.contourArea(contour))
+            all_contour_labels.append(f"#{contour_index} a={area:.1f} {w}x{h}")
+
+            candidate, rejection_reason = self._build_candidate_from_contour_with_reason(
                 contour=contour,
                 contour_index=contour_index,
                 image_shape=current_bgr.shape[:2],
                 roi_pixel_count=roi_pixel_count,
+                board_center_image=board_center_image,
             )
+
             if candidate is None:
                 rejected_count += 1
+                rejected_contours.append(contour)
+                if len(rejected_labels) < int(self.config.max_rejection_reason_labels):
+                    rejected_labels.append(
+                        f"rej#{contour_index} {rejection_reason or 'unknown'} "
+                        f"a={area:.1f} box={w}x{h}"
+                    )
                 continue
+
             candidates.append(candidate)
+            accepted_contours.append(contour)
+            accepted_labels.append(
+                f"ok#{contour_index} id={candidate.candidate_id} "
+                f"c={candidate.confidence:.3f} a={candidate.area:.1f} "
+                f"box={candidate.bbox[2]}x{candidate.bbox[3]}"
+            )
 
         candidates.sort(key=lambda c: c.confidence, reverse=True)
         candidates = candidates[: self.config.max_candidates]
@@ -398,6 +438,12 @@ class DartCandidateDetector:
             "rejected_contours": rejected_count,
             "accepted_candidates": len(candidates),
             "roi_pixel_count": roi_pixel_count,
+            "raw_contour_count": len(contours),
+            "rejected_contour_count": len(rejected_contours),
+            "accepted_contour_count": len(accepted_contours),
+            "final_candidate_count": len(candidates),
+            "rejection_examples": rejected_labels[:20],
+            "accepted_examples": accepted_labels[:20],
             "config": _dataclass_to_dict(self.config),
         }
 
@@ -409,8 +455,42 @@ class DartCandidateDetector:
             debug_images["difference_masked"] = diff_masked
             debug_images["binary_mask"] = binary_mask
             debug_images["cleaned_mask"] = cleaned_mask
+
             if board_mask_prepared is not None:
                 debug_images["board_mask"] = board_mask_prepared
+
+            if self.config.keep_intermediate_debug_images:
+                debug_images["candidate_mask"] = candidate_mask
+
+            if self.config.render_all_contours_overlay:
+                debug_images["all_contours_overlay"] = _render_contours_overlay(
+                    base_image=current_bgr,
+                    contours=list(contours),
+                    labels=all_contour_labels,
+                    color=(255, 255, 0),
+                    draw_bbox=True,
+                    draw_centroid=True,
+                )
+
+            if self.config.render_rejected_contours_overlay:
+                debug_images["rejected_contours_overlay"] = _render_contours_overlay(
+                    base_image=current_bgr,
+                    contours=rejected_contours,
+                    labels=rejected_labels,
+                    color=(0, 0, 255),
+                    draw_bbox=True,
+                    draw_centroid=True,
+                )
+
+            if self.config.render_accepted_contours_overlay:
+                debug_images["accepted_contours_overlay"] = _render_contours_overlay(
+                    base_image=current_bgr,
+                    contours=accepted_contours,
+                    labels=accepted_labels,
+                    color=(0, 255, 0),
+                    draw_bbox=True,
+                    draw_centroid=True,
+                )
 
         result = CandidateDetectionResult(
             candidates=candidates,
@@ -420,13 +500,11 @@ class DartCandidateDetector:
             metadata=metadata,
             debug_images=debug_images,
         )
-
         return result
 
     # -------------------------------------------------------------------------
     # Interne Frame-/Masken-Vorbereitung
     # -------------------------------------------------------------------------
-
     def _align_frames(
         self,
         frame: np.ndarray,
@@ -512,7 +590,10 @@ class DartCandidateDetector:
         if self.config.apply_clahe:
             clahe = cv2.createCLAHE(
                 clipLimit=self.config.clahe_clip_limit,
-                tileGridSize=(self.config.clahe_tile_grid_size, self.config.clahe_tile_grid_size),
+                tileGridSize=(
+                    self.config.clahe_tile_grid_size,
+                    self.config.clahe_tile_grid_size,
+                ),
             )
             gray = clahe.apply(gray)
 
@@ -577,7 +658,6 @@ class DartCandidateDetector:
     # -------------------------------------------------------------------------
     # Interne Kandidatenbildung
     # -------------------------------------------------------------------------
-
     def _build_candidate_from_contour(
         self,
         *,
@@ -585,38 +665,63 @@ class DartCandidateDetector:
         contour_index: int,
         image_shape: tuple[int, int],
         roi_pixel_count: int,
+        board_center_image: Optional[PointF] = None,
     ) -> Optional[DartCandidate]:
         """
-        Baut aus einer Kontur einen DartCandidate, sofern die Kontur die
-        Mindestanforderungen erfüllt.
+        Baut aus einer Kontur einen DartCandidate, sofern die Kontur
+        die Mindestanforderungen erfüllt.
+        """
+        candidate, _reason = self._build_candidate_from_contour_with_reason(
+            contour=contour,
+            contour_index=contour_index,
+            image_shape=image_shape,
+            roi_pixel_count=roi_pixel_count,
+            board_center_image=board_center_image,
+        )
+        return candidate
+
+    def _build_candidate_from_contour_with_reason(
+        self,
+        *,
+        contour: np.ndarray,
+        contour_index: int,
+        image_shape: tuple[int, int],
+        roi_pixel_count: int,
+        board_center_image: Optional[PointF] = None,
+    ) -> tuple[Optional[DartCandidate], Optional[str]]:
+        """
+        Wie _build_candidate_from_contour(...), aber zusätzlich mit Rejection-Grund.
         """
         metrics = _compute_contour_metrics(contour=contour, image_shape=image_shape)
         if metrics is None:
-            return None
+            return None, "metrics_none"
 
         max_contour_area = float(max(1, roi_pixel_count)) * float(self.config.max_contour_area_ratio)
 
         # Harte Basisfilter, damit grober Müll früh rausfliegt.
         if metrics.area < self.config.min_contour_area:
-            return None
-
+            return None, f"area<{self.config.min_contour_area}"
         if metrics.area > max_contour_area:
-            return None
-
+            return None, f"area>{max_contour_area:.1f}"
         if metrics.aspect_ratio < self.config.min_aspect_ratio:
-            return None
-
+            return None, f"aspect<{self.config.min_aspect_ratio}"
         if metrics.solidity < self.config.min_solidity:
-            return None
-
+            return None, f"solidity<{self.config.min_solidity}"
         if metrics.extent < self.config.min_extent or metrics.extent > self.config.max_extent:
-            return None
+            return None, f"extent_outside[{self.config.min_extent},{self.config.max_extent}]"
 
-        impact_point = self._estimate_candidate_impact_point(metrics)
-        confidence, confidence_debug = self._score_candidate(metrics, max_contour_area=max_contour_area)
+        impact_point = self._estimate_candidate_impact_point(
+            metrics,
+            board_center_image=board_center_image,
+        )
+
+        confidence, confidence_debug = self._score_candidate(
+            metrics,
+            max_contour_area=max_contour_area,
+        )
 
         if confidence < self.config.min_confidence:
-            return None
+            return None, f"confidence<{self.config.min_confidence}"
 
         candidate = DartCandidate(
             candidate_id=contour_index,
@@ -647,20 +752,50 @@ class DartCandidateDetector:
                 "major_axis_endpoint_b": metrics.major_axis_endpoint_b,
                 "confidence_parts": confidence_debug,
                 "impact_point_mode": self.config.impact_point_mode,
+                "impact_point_mode_effective": (
+                    "centerward_major_axis_endpoint"
+                    if (
+                        self.config.use_board_center_for_impact_point
+                        and self.config.prefer_centerward_major_axis_endpoint
+                        and board_center_image is not None
+                    )
+                    else self.config.impact_point_mode
+                ),
+                "board_center_image": board_center_image,
             },
         )
+        return candidate, None
 
-        return candidate
-
-    def _estimate_candidate_impact_point(self, metrics: ContourMetrics) -> PointF:
+    def _estimate_candidate_impact_point(
+        self,
+        metrics: ContourMetrics,
+        board_center_image: Optional[PointF] = None,
+    ) -> PointF:
         """
         Liefert eine Impact-Hypothese auf Kandidaten-Ebene.
 
-        Wichtig:
-        Das ist bewusst noch KEINE finale Dart-Spitze im fachlichen Sinn,
-        sondern nur eine kontrollierte Heuristik für den nächsten Pipeline-Schritt.
+        Neue Logik:
+        - Wenn board_center_image verfügbar ist und aktiviert wurde,
+        nehmen wir bevorzugt den Endpunkt der Hauptachse, der näher am
+        Boardzentrum liegt.
+        - Das ist für einen steckenden Dart meist deutlich plausibler als
+        der gesamte Dartkörper oder der Flight-Bereich.
+        - Fallback bleibt kompatibel zu den alten Modi.
         """
         mode = self.config.impact_point_mode.strip().lower()
+
+        if (
+            self.config.use_board_center_for_impact_point
+            and self.config.prefer_centerward_major_axis_endpoint
+            and board_center_image is not None
+        ):
+            a = metrics.major_axis_endpoint_a
+            b = metrics.major_axis_endpoint_b
+
+            da = math.hypot(a[0] - board_center_image[0], a[1] - board_center_image[1])
+            db = math.hypot(b[0] - board_center_image[0], b[1] - board_center_image[1])
+
+            return a if da <= db else b
 
         if mode == "lowest_contour_point":
             return metrics.contour_lowest_point
@@ -671,8 +806,8 @@ class DartCandidateDetector:
             return a if a[1] >= b[1] else b
 
         raise ValueError(
-            "Unsupported impact_point_mode. Expected 'lowest_contour_point' "
-            "or 'major_axis_lower_endpoint'."
+            "Unsupported impact_point_mode. "
+            "Expected 'lowest_contour_point' or 'major_axis_lower_endpoint'."
         )
 
     def _score_candidate(
@@ -684,22 +819,14 @@ class DartCandidateDetector:
         """
         Bewertet, wie plausibel eine Kontur als Dart-/Impact-Kandidat ist.
 
-        Wichtig:
-        'confidence' bedeutet hier NICHT:
-        "Dieses Feld ist sicher getroffen."
-
-        Sondern nur:
-        "Diese Kontur sieht eher dart-ähnlich aus als andere Konturen."
+        Neue Logik:
+        - große Gesamtkonturen werden leicht bestraft
+        - nicht hart verworfen, aber sie dominieren das Ranking nicht mehr blind
         """
-        # 1) Flächenscore:
-        # Zu klein = eher Rauschen
-        # Zu groß = eher globale Bewegung / falsche Maske
         area_ratio = metrics.area / max(max_contour_area, 1.0)
         area_score = _clip01(1.0 - area_ratio) if metrics.area <= max_contour_area else 0.0
         area_score = max(area_score, 0.10)
 
-        # 2) Aspektverhältnis:
-        # Darts / Schaft-/Spitzenbereiche sind typischerweise eher länglich als rund.
         aspect_score = _soft_range_score(
             value=metrics.aspect_ratio,
             good_min=1.8,
@@ -708,8 +835,6 @@ class DartCandidateDetector:
             hard_max=20.0,
         )
 
-        # 3) Solidity:
-        # Nicht zu zerfranst / nicht zu löchrig.
         solidity_score = _soft_range_score(
             value=metrics.solidity,
             good_min=0.25,
@@ -718,8 +843,6 @@ class DartCandidateDetector:
             hard_max=1.0,
         )
 
-        # 4) Extent:
-        # Sehr quadratische/kompakte Flächen sind eher schlechter.
         extent_score = _soft_range_score(
             value=metrics.extent,
             good_min=0.08,
@@ -728,13 +851,18 @@ class DartCandidateDetector:
             hard_max=0.99,
         )
 
-        # 5) Nicht-rund-Score:
-        # Ein Dartkandidat soll tendenziell nicht stark kreisförmig sein.
         non_round_score = _clip01(1.0 - min(metrics.circularity, 1.0))
-
-        # 6) Border-Penalty:
-        # Kandidaten am Bildrand sind oft Artefakte.
         border_penalty = 0.20 if metrics.touches_image_border else 0.0
+
+        large_candidate_penalty = 0.0
+        if self.config.penalize_very_large_candidates:
+            start = float(self.config.large_candidate_area_penalty_start)
+            max_penalty = float(self.config.large_candidate_area_penalty_max)
+
+            if metrics.area > start:
+                over = metrics.area - start
+                scale = max(start, 1.0)
+                large_candidate_penalty = min(max_penalty, (over / scale) * max_penalty)
 
         weighted = (
             0.20 * area_score
@@ -742,10 +870,9 @@ class DartCandidateDetector:
             + 0.18 * solidity_score
             + 0.15 * extent_score
             + 0.15 * non_round_score
-        ) - border_penalty
+        ) - border_penalty - large_candidate_penalty
 
         confidence = _clip01(weighted)
-
         confidence_debug = {
             "area_score": float(area_score),
             "aspect_score": float(aspect_score),
@@ -753,16 +880,15 @@ class DartCandidateDetector:
             "extent_score": float(extent_score),
             "non_round_score": float(non_round_score),
             "border_penalty": float(border_penalty),
+            "large_candidate_penalty": float(large_candidate_penalty),
             "weighted_confidence": float(confidence),
         }
-
         return confidence, confidence_debug
 
 
 # -----------------------------------------------------------------------------
 # Modulweite Convenience-Funktionen
 # -----------------------------------------------------------------------------
-
 def build_candidate_detector(
     config: Optional[CandidateDetectorConfig] = None,
 ) -> DartCandidateDetector:
@@ -778,6 +904,7 @@ def detect_dart_candidates(
     *,
     board_mask: Optional[np.ndarray] = None,
     board_polygon: Optional[np.ndarray | list[PointI] | list[PointF]] = None,
+    board_center_image: Optional[PointF] = None,
     config: Optional[CandidateDetectorConfig] = None,
 ) -> CandidateDetectionResult:
     """
@@ -789,28 +916,23 @@ def detect_dart_candidates(
         reference_frame=reference_frame,
         board_mask=board_mask,
         board_polygon=board_polygon,
+        board_center_image=board_center_image,
     )
 
 
 # -----------------------------------------------------------------------------
 # Interne Hilfsfunktionen
 # -----------------------------------------------------------------------------
-
 def _validate_frame(frame: np.ndarray, *, name: str) -> None:
     """
     Prüft, ob ein Eingabebild grundsätzlich gültig ist.
     """
     if frame is None:
         raise ValueError(f"{name} must not be None.")
-
     if not isinstance(frame, np.ndarray):
         raise TypeError(f"{name} must be a numpy.ndarray, got {type(frame)!r}.")
-
     if frame.ndim not in (2, 3):
-        raise ValueError(
-            f"{name} must have ndim 2 or 3, got {frame.ndim}."
-        )
-
+        raise ValueError(f"{name} must have ndim 2 or 3, got {frame.ndim}.")
     if frame.size == 0:
         raise ValueError(f"{name} must not be empty.")
 
@@ -821,13 +943,10 @@ def _validate_mask(mask: np.ndarray, *, expected_shape: tuple[int, int], name: s
     """
     if mask is None:
         raise ValueError(f"{name} must not be None.")
-
     if not isinstance(mask, np.ndarray):
         raise TypeError(f"{name} must be a numpy.ndarray, got {type(mask)!r}.")
-
     if mask.ndim != 2:
         raise ValueError(f"{name} must be a single-channel mask.")
-
     if mask.shape != expected_shape:
         raise ValueError(
             f"{name} shape mismatch. Expected {expected_shape}, got {mask.shape}."
@@ -840,16 +959,11 @@ def _ensure_bgr(frame: np.ndarray) -> np.ndarray:
     """
     if frame.ndim == 2:
         return cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-
     if frame.ndim == 3 and frame.shape[2] == 3:
         return frame.copy()
-
     if frame.ndim == 3 and frame.shape[2] == 4:
         return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-
-    raise ValueError(
-        f"Unsupported frame shape for BGR conversion: {frame.shape}"
-    )
+    raise ValueError(f"Unsupported frame shape for BGR conversion: {frame.shape}")
 
 
 def _normalize_mask(mask: np.ndarray) -> np.ndarray:
@@ -976,6 +1090,7 @@ def _compute_contour_metrics(
     elongation = float(major_axis_length / max(minor_axis_length, 1e-6))
 
     points = contour.reshape(-1, 2).astype(np.float32)
+
     contour_lowest_point = tuple(points[np.argmax(points[:, 1])].tolist())
     contour_highest_point = tuple(points[np.argmin(points[:, 1])].tolist())
     contour_leftmost_point = tuple(points[np.argmin(points[:, 0])].tolist())
@@ -985,7 +1100,10 @@ def _compute_contour_metrics(
 
     height, width = image_shape
     touches_image_border = (
-        x <= 0 or y <= 0 or (x + w) >= (width - 1) or (y + h) >= (height - 1)
+        x <= 0
+        or y <= 0
+        or (x + w) >= (width - 1)
+        or (y + h) >= (height - 1)
     )
 
     metrics = ContourMetrics(
@@ -1011,7 +1129,6 @@ def _compute_contour_metrics(
         major_axis_endpoint_b=major_axis_endpoint_b,
         touches_image_border=touches_image_border,
     )
-
     return metrics
 
 
@@ -1035,7 +1152,6 @@ def _compute_major_axis_endpoints(points: np.ndarray) -> tuple[PointF, PointF]:
 
     mean = np.mean(points, axis=0)
     centered = points - mean
-
     cov = np.cov(centered.T)
     eigenvalues, eigenvectors = np.linalg.eigh(cov)
 
@@ -1065,8 +1181,85 @@ def _dataclass_to_dict(value: Any) -> dict[str, Any]:
         for field_name in value.__dataclass_fields__:
             result[field_name] = getattr(value, field_name)
         return result
-
     raise TypeError(f"Expected dataclass instance, got {type(value)!r}.")
+
+
+def _draw_debug_label(
+    image: np.ndarray,
+    text: str,
+    origin: tuple[int, int],
+    color: tuple[int, int, int],
+    scale: float = 0.45,
+    thickness: int = 1,
+) -> None:
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    x, y = origin
+
+    (w, h), baseline = cv2.getTextSize(text, font, scale, thickness)
+    cv2.rectangle(
+        image,
+        (x - 2, y - h - 4),
+        (x + w + 4, y + baseline + 2),
+        (0, 0, 0),
+        -1,
+    )
+    cv2.putText(
+        image,
+        text,
+        (x, y),
+        font,
+        scale,
+        color,
+        thickness,
+        cv2.LINE_AA,
+    )
+
+
+def _safe_bbox_from_contour(contour: np.ndarray) -> tuple[int, int, int, int]:
+    x, y, w, h = cv2.boundingRect(contour)
+    return int(x), int(y), int(w), int(h)
+
+
+def _safe_centroid_from_moments(contour: np.ndarray) -> tuple[float, float]:
+    m = cv2.moments(contour)
+    if abs(m["m00"]) < 1e-9:
+        x, y, w, h = cv2.boundingRect(contour)
+        return float(x + w / 2.0), float(y + h / 2.0)
+    return float(m["m10"] / m["m00"]), float(m["m01"] / m["m00"])
+
+
+def _render_contours_overlay(
+    base_image: np.ndarray,
+    contours: list[np.ndarray],
+    labels: list[str] | None = None,
+    color: tuple[int, int, int] = (0, 255, 255),
+    draw_bbox: bool = True,
+    draw_centroid: bool = True,
+) -> np.ndarray:
+    overlay = base_image.copy()
+
+    for idx, contour in enumerate(contours):
+        cv2.drawContours(overlay, [contour], -1, color, 2, cv2.LINE_AA)
+
+        x, y, w, h = _safe_bbox_from_contour(contour)
+        if draw_bbox:
+            cv2.rectangle(overlay, (x, y), (x + w, y + h), color, 1)
+
+        if draw_centroid:
+            cx, cy = _safe_centroid_from_moments(contour)
+            cv2.circle(overlay, (int(round(cx)), int(round(cy))), 3, color, -1, cv2.LINE_AA)
+
+        if labels and idx < len(labels):
+            _draw_debug_label(
+                overlay,
+                labels[idx],
+                (x, max(18, y - 6)),
+                color,
+                scale=0.42,
+                thickness=1,
+            )
+
+    return overlay
 
 
 __all__ = [

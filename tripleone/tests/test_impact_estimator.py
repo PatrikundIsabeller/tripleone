@@ -570,6 +570,7 @@ def test_best_hypothesis_strategy_prefers_strongest_single_hypothesis():
         "major_axis_lower_endpoint",
         "major_axis_centerward_endpoint",
         "directional_contour_tip",
+        "board_near_contour_tip",
     }
 
 
