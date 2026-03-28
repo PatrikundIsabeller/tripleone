@@ -131,12 +131,9 @@ class MainWindow(QMainWindow):
                 record = records[idx]
 
                 try:
-                    if not record.manual_points or len(record.manual_points) < 4:
-                        detectors.append(None)
-                        continue
-
-                    score_mapper = build_score_mapper(calibration_record=record)
-                    detector = SingleCamDetector(score_mapper=score_mapper)
+                    if record.manual_points and len(record.manual_points) >= 4:
+                        score_mapper = build_score_mapper(calibration_record=record)
+                        detector = SingleCamDetector(score_mapper=score_mapper)
                 except Exception as exc:
                     print(f"[WARN] Detector für Kamera {idx} konnte nicht gebaut werden: {exc}")
                     detector = None
@@ -224,9 +221,12 @@ class MainWindow(QMainWindow):
         max_scan = self.config_data.get("app", {}).get("max_camera_scan", 10)
         self.available_cameras = probe_available_cameras(max_devices=max_scan)
 
+        #self.dashboard_page.update_camera_count(len(self.available_cameras))
+        #self.cameras_page.set_available_cameras(self.available_cameras)
+        #self.cameras_page.apply_config_to_ui_device_selection()
+
         self.dashboard_page.update_camera_count(len(self.available_cameras))
         self.cameras_page.set_available_cameras(self.available_cameras)
-        self.cameras_page.apply_config_to_ui_device_selection()
 
         # Wichtig: Kalibrierungsseite muss bei geänderter Kamerakonfiguration mitziehen
         self.calibration_page.update_camera_config(self.config_data)
@@ -245,9 +245,7 @@ class MainWindow(QMainWindow):
 
         # Detectoren neu bauen und an Kameraseite weiterreichen
         self._rebuild_camera_detectors()
-        self.cameras_page.detectors = self.camera_detectors
-        for idx, card in enumerate(self.cameras_page.cards):
-            card.set_detector(self.camera_detectors[idx] if idx < len(self.camera_detectors) else None)
+        self.cameras_page.set_detectors(self.camera_detectors)
 
     def handle_save_calibration(self, new_calibration: dict) -> None:
         """Speichert die Kalibrierungsdaten zentral."""
@@ -256,9 +254,7 @@ class MainWindow(QMainWindow):
 
         # Detectoren mit neuer Kalibrierung neu bauen
         self._rebuild_camera_detectors()
-        self.cameras_page.detectors = self.camera_detectors
-        for idx, card in enumerate(self.cameras_page.cards):
-            card.set_detector(self.camera_detectors[idx] if idx < len(self.camera_detectors) else None)
+        self.cameras_page.set_detectors(self.camera_detectors)
 
     def closeEvent(self, event) -> None:
         """Stoppt beim Schließen des Fensters alle Kamera-Threads sauber."""

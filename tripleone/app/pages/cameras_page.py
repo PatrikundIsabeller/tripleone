@@ -265,13 +265,23 @@ class CameraCard(QFrame):
         self.detector = detector
         self.vision_service.set_default_detector(detector)
 
+        if detector is None:
+            self.vision_status_label.setText("Vision: kein Detector gesetzt")
+        else:
+            self.vision_status_label.setText("Vision: Detector gesetzt")
+
     def save_reference_frame(self) -> None:
         if self._last_raw_frame is None:
             QMessageBox.warning(self, "Referenz", "Noch kein Kameraframe verfügbar.")
             return
 
         self.vision_service.set_reference_frame(self.camera_index, self._last_raw_frame)
-        self.vision_status_label.setText("Vision: Referenz gespeichert")
+
+        if self.detector is None:
+            self.vision_status_label.setText("Vision: Referenz gespeichert, aber kein Detector gesetzt")
+        else:
+            self.vision_status_label.setText("Vision: Referenz gespeichert")
+
         self.hit_label.setText("Treffer: -")
 
     def arm_detection(self) -> None:
@@ -334,10 +344,17 @@ class CameraCard(QFrame):
         if self.worker is not None:
             self.worker.stop()
             self.worker = None
+
+        self._last_raw_frame = None
+        self._last_detection_result = None
         self.set_status("gestoppt")
+        self.vision_status_label.setText("Vision: gestoppt")
 
     def start_worker(self, config: Dict) -> None:
         self.stop_worker()
+
+        self.hit_label.setText("Treffer: -")
+        self.vision_status_label.setText("Vision: starte Kamera ...")
 
         if not config.get("enabled", True):
             self.clear_preview("Deaktiviert")
@@ -495,6 +512,14 @@ class CamerasPage(QWidget):
         for index, card in enumerate(self.cards):
             if index < len(cameras_config):
                 card.set_config(cameras_config[index])
+
+    def set_detectors(self, detectors: List[Optional[SingleCamDetector]]) -> None:
+        self.detectors = list(detectors)
+        while len(self.detectors) < 3:
+            self.detectors.append(None)
+
+        for idx, card in enumerate(self.cards):
+            card.set_detector(self.detectors[idx])
 
     def apply_config_to_ui_device_selection(self) -> None:
         cameras_config = self.config_data.get("cameras", [])
