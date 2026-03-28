@@ -27,6 +27,9 @@ from vision.camera_manager import probe_available_cameras
 from app.pages.dashboard_page import DashboardPage
 from app.pages.cameras_page import CamerasPage
 from app.pages.calibration_page import CalibrationPage
+from vision.single_cam_detector import SingleCamDetector
+from vision.score_mapper import build_score_mapper
+from vision.calibration_storage import CalibrationStorage
 
 
 class MainWindow(QMainWindow):
@@ -45,6 +48,10 @@ class MainWindow(QMainWindow):
         self.config_data = load_config()
         self.calibration_data = load_calibration()
         self.available_cameras = []
+
+        self.calibration_storage = CalibrationStorage()
+        self.camera_detectors = [None, None, None]
+        self._rebuild_camera_detectors()
 
         self.setWindowTitle(self.config_data.get("app", {}).get("title", "TripleOne"))
         self.resize(1600, 900)
@@ -77,7 +84,8 @@ class MainWindow(QMainWindow):
         self.cameras_page = CamerasPage(
             config_data=deepcopy(self.config_data),
             save_callback=self.handle_save_config,
-            refresh_cameras_callback=self.refresh_available_cameras
+            refresh_cameras_callback=self.refresh_available_cameras,
+            detectors=self.camera_detectors,
         )
 
         self.calibration_page = CalibrationPage(
@@ -99,6 +107,46 @@ class MainWindow(QMainWindow):
         self.sidebar.setCurrentRow(self.PAGE_DASHBOARD)
 
         self.refresh_available_cameras()
+
+    def _rebuild_camera_detectors(self) -> None:
+        """
+        Baut pro Kamera einen SingleCamDetector aus:
+        - config_data
+        - calibration_data
+
+        Wenn für eine Kamera noch keine saubere Kalibrierung vorhanden ist,
+        bleibt der Detector für diese Kamera None.
+        """
+        detectors = []
+
+        records = self.calibration_storage.build_records_from_app_configs(
+            camera_config=self.config_data,
+            calibration_config=self.calibration_data,
+        )
+
+        for idx in range(3):
+            detector = None
+
+            if idx < len(records):
+                record = records[idx]
+
+                try:
+                    if not record.manual_points or len(record.manual_points) < 4:
+                        detectors.append(None)
+                        continue
+
+                    score_mapper = build_score_mapper(calibration_record=record)
+                    detector = SingleCamDetector(score_mapper=score_mapper)
+                except Exception as exc:
+                    print(f"[WARN] Detector für Kamera {idx} konnte nicht gebaut werden: {exc}")
+                    detector = None
+
+            detectors.append(detector)
+
+        while len(detectors) < 3:
+            detectors.append(None)
+
+        self.camera_detectors = detectors[:3]
 
     def _build_ui(self) -> None:
         """Erstellt das Hauptlayout des Fensters."""
@@ -195,10 +243,22 @@ class MainWindow(QMainWindow):
         # Kalibrierungsseite muss die neuen Kameradaten direkt übernehmen
         self.calibration_page.update_camera_config(self.config_data)
 
+        # Detectoren neu bauen und an Kameraseite weiterreichen
+        self._rebuild_camera_detectors()
+        self.cameras_page.detectors = self.camera_detectors
+        for idx, card in enumerate(self.cameras_page.cards):
+            card.set_detector(self.camera_detectors[idx] if idx < len(self.camera_detectors) else None)
+
     def handle_save_calibration(self, new_calibration: dict) -> None:
         """Speichert die Kalibrierungsdaten zentral."""
         self.calibration_data = deepcopy(new_calibration)
         save_calibration(self.calibration_data)
+
+        # Detectoren mit neuer Kalibrierung neu bauen
+        self._rebuild_camera_detectors()
+        self.cameras_page.detectors = self.camera_detectors
+        for idx, card in enumerate(self.cameras_page.cards):
+            card.set_detector(self.camera_detectors[idx] if idx < len(self.camera_detectors) else None)
 
     def closeEvent(self, event) -> None:
         """Stoppt beim Schließen des Fensters alle Kamera-Threads sauber."""

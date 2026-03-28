@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPixmap, QImage
@@ -26,6 +26,19 @@ from PyQt6.QtWidgets import (
 )
 
 from vision.camera_manager import CameraWorker
+from vision.vision_service import (
+    STATUS_BOARD_NOT_REFERENCED,
+    STATUS_COOLDOWN,
+    STATUS_DISARMED,
+    STATUS_ERROR,
+    STATUS_HIT_DETECTED,
+    STATUS_NO_HIT,
+    STATUS_READY,
+    STATUS_WAITING_FOR_CLEAR,
+    VisionService,
+    VisionServiceConfig,
+)
+from vision.single_cam_detector import SingleCamDetector
 
 
 class CameraCard(QFrame):
@@ -38,7 +51,7 @@ class CameraCard(QFrame):
     - Statusanzeige
     """
 
-    def __init__(self, title: str, parent=None):
+    def __init__(self, title: str, camera_index: int, detector: Optional[SingleCamDetector] = None, parent=None):
         super().__init__(parent)
         self.setObjectName("CameraCard")
         self.setStyleSheet("""
@@ -68,6 +81,25 @@ class CameraCard(QFrame):
 
         self.worker: Optional[CameraWorker] = None
         self._last_image: Optional[QImage] = None
+        self.camera_index = camera_index
+        self.detector = detector
+        self.vision_service = VisionService(
+            config=VisionServiceConfig(
+                auto_arm_on_reference_save=False,
+                require_board_clear_after_hit=True,
+                min_seconds_between_hits=0.80,
+                clear_board_diff_threshold=18,
+                clear_board_changed_ratio_threshold=0.0045,
+                clear_board_blur_kernel_size=5,
+                clear_board_required_consecutive_frames=2,
+                use_board_mask_for_clear_check=False,
+                keep_debug_images=True,
+            ),
+            default_detector=self.detector,
+        )
+        self._last_raw_frame = None
+        self._last_detection_result = None
+        
 
         self.title_label = QLabel(title)
         self.title_label.setStyleSheet("font-size: 18px; font-weight: bold;")
@@ -123,6 +155,25 @@ class CameraCard(QFrame):
         self.enabled_check.setChecked(True)
 
         self.status_label = QLabel("Status: nicht gestartet")
+        self.save_reference_button = QPushButton("Leeres Board speichern")
+        self.save_reference_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.save_reference_button.clicked.connect(self.save_reference_frame)
+
+        self.arm_button = QPushButton("Erkennung aktivieren")
+        self.arm_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.arm_button.clicked.connect(self.arm_detection)
+
+        self.disarm_button = QPushButton("Erkennung deaktivieren")
+        self.disarm_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.disarm_button.clicked.connect(self.disarm_detection)
+
+        self.hit_label = QLabel("Treffer: -")
+        self.hit_label.setStyleSheet("font-size: 13px; color: #7CFC98;")
+        self.hit_label.setWordWrap(True)
+
+        self.vision_status_label = QLabel("Vision: keine Referenz")
+        self.vision_status_label.setStyleSheet("font-size: 12px; color: #bbbbbb;")
+        self.vision_status_label.setWordWrap(True)
         self.status_label.setWordWrap(True)
         self.status_label.setStyleSheet("font-size: 12px; color: #bbbbbb;")
 
@@ -164,8 +215,17 @@ class CameraCard(QFrame):
         layout.addLayout(row_1)
         layout.addLayout(row_2)
         layout.addLayout(row_3)
+        buttons_row = QHBoxLayout()
+        buttons_row.setSpacing(8)
+        buttons_row.addWidget(self.save_reference_button)
+        buttons_row.addWidget(self.arm_button)
+        buttons_row.addWidget(self.disarm_button)
+
         layout.addLayout(row_4)
+        layout.addLayout(buttons_row)
         layout.addWidget(self.status_label)
+        layout.addWidget(self.vision_status_label)
+        layout.addWidget(self.hit_label)
         layout.addStretch()
 
     def set_status(self, text: str) -> None:
@@ -201,6 +261,75 @@ class CameraCard(QFrame):
         self._render_last_image()
         super().resizeEvent(event)
 
+    def set_detector(self, detector: Optional[SingleCamDetector]) -> None:
+        self.detector = detector
+        self.vision_service.set_default_detector(detector)
+
+    def save_reference_frame(self) -> None:
+        if self._last_raw_frame is None:
+            QMessageBox.warning(self, "Referenz", "Noch kein Kameraframe verfügbar.")
+            return
+
+        self.vision_service.set_reference_frame(self.camera_index, self._last_raw_frame)
+        self.vision_status_label.setText("Vision: Referenz gespeichert")
+        self.hit_label.setText("Treffer: -")
+
+    def arm_detection(self) -> None:
+        state = self.vision_service.get_state(self.camera_index)
+
+        if self.detector is None:
+            QMessageBox.warning(self, "Erkennung", "Kein SingleCamDetector gesetzt.")
+            return
+
+        if state.reference_frame is None:
+            QMessageBox.warning(self, "Erkennung", "Bitte zuerst ein leeres Board speichern.")
+            return
+
+        self.vision_service.arm(self.camera_index)
+        self.vision_status_label.setText("Vision: armed")
+
+    def disarm_detection(self) -> None:
+        self.vision_service.disarm(self.camera_index)
+        self.vision_status_label.setText("Vision: disarmed")
+
+    def handle_raw_frame(self, frame_bgr) -> None:
+        """
+        Nimmt rohe OpenCV-Frames entgegen und verarbeitet sie über VisionService.
+        """
+        self._last_raw_frame = frame_bgr
+
+        if self.detector is None:
+            self.vision_status_label.setText("Vision: kein Detector gesetzt")
+            return
+
+        result = self.vision_service.process_frame(
+            camera_id=self.camera_index,
+            frame=frame_bgr,
+        )
+        self._last_detection_result = result.detection_result
+
+        if result.status == STATUS_HIT_DETECTED and result.hit_event is not None:
+            self.vision_status_label.setText(f"Vision: Treffer erkannt ({result.hit_event.label})")
+            self.hit_label.setText(
+                f"Treffer: {result.hit_event.label} | "
+                f"Score: {result.hit_event.score} | "
+                f"Segment: {result.hit_event.segment}"
+            )
+        elif result.status == STATUS_WAITING_FOR_CLEAR:
+            self.vision_status_label.setText("Vision: warte auf freies Board")
+        elif result.status == STATUS_READY:
+            self.vision_status_label.setText("Vision: bereit")
+        elif result.status == STATUS_NO_HIT:
+            self.vision_status_label.setText("Vision: kein Treffer")
+        elif result.status == STATUS_BOARD_NOT_REFERENCED:
+            self.vision_status_label.setText("Vision: keine Referenz")
+        elif result.status == STATUS_DISARMED:
+            self.vision_status_label.setText("Vision: deaktiviert")
+        elif result.status == STATUS_COOLDOWN:
+            self.vision_status_label.setText("Vision: cooldown")
+        elif result.status == STATUS_ERROR:
+            self.vision_status_label.setText(f"Vision: Fehler – {result.message}")
+
     def stop_worker(self) -> None:
         if self.worker is not None:
             self.worker.stop()
@@ -231,6 +360,7 @@ class CameraCard(QFrame):
         )
 
         self.worker.frame_ready.connect(self.update_preview)
+        self.worker.raw_frame_ready.connect(self.handle_raw_frame)
         self.worker.status_changed.connect(self.set_status)
         self.worker.start()
 
@@ -261,19 +391,29 @@ class CamerasPage(QWidget):
     Enthält 3 Kamera-Karten und Buttons zum Starten/Speichern/Aktualisieren.
     """
 
-    def __init__(self, config_data: Dict, save_callback, refresh_cameras_callback, parent=None):
+    def __init__(
+        self,
+        config_data: Dict,
+        save_callback,
+        refresh_cameras_callback,
+        detectors: Optional[List[Optional[SingleCamDetector]]] = None,
+        parent=None
+    ):
         super().__init__(parent)
         self.config_data = deepcopy(config_data)
         self.save_callback = save_callback
         self.refresh_cameras_callback = refresh_cameras_callback
         self.available_cameras: List[Dict[str, int]] = []
+        self.detectors = detectors or [None, None, None]
+        while len(self.detectors) < 3:
+            self.detectors.append(None)
 
         self.title_label = QLabel("TripleOne – Kameras")
         self.title_label.setStyleSheet("font-size: 26px; font-weight: bold;")
 
-        self.card_1 = CameraCard("Kamera 1")
-        self.card_2 = CameraCard("Kamera 2")
-        self.card_3 = CameraCard("Kamera 3")
+        self.card_1 = CameraCard("Kamera 1", camera_index=0, detector=self.detectors[0])
+        self.card_2 = CameraCard("Kamera 2", camera_index=1, detector=self.detectors[1])
+        self.card_3 = CameraCard("Kamera 3", camera_index=2, detector=self.detectors[2])
         self.cards = [self.card_1, self.card_2, self.card_3]
 
         self.refresh_button = QPushButton("Kameras neu erkennen")

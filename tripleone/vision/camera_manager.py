@@ -13,6 +13,7 @@ import time
 from typing import Optional, List, Dict
 
 import cv2
+import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtGui import QImage
 
@@ -61,6 +62,7 @@ class CameraWorker(QThread):
     """
 
     frame_ready = pyqtSignal(QImage)
+    raw_frame_ready = pyqtSignal(object)  # sendet np.ndarray (BGR)
     status_changed = pyqtSignal(str)
 
     def __init__(
@@ -153,6 +155,10 @@ class CameraWorker(QThread):
 
                 frame = self._apply_transformations(frame)
 
+                # Wichtig:
+                # Das rohe BGR-Frame wird separat an die UI / VisionService-Logik gesendet.
+                self.raw_frame_ready.emit(frame.copy())
+
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 h, w, ch = rgb_frame.shape
                 bytes_per_line = ch * w
@@ -164,6 +170,8 @@ class CameraWorker(QThread):
                     bytes_per_line,
                     QImage.Format.Format_RGB888
                 ).copy()
+
+                self.frame_ready.emit(qt_image)
 
                 self.frame_ready.emit(qt_image)
 
