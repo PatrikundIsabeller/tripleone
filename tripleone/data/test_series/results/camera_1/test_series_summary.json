@@ -1,0 +1,68 @@
+{
+  "total_images": 6,
+  "with_scored_estimate": 6,
+  "exact_hits": 0,
+  "segment_only_hits": 0,
+  "ring_only_hits": 2,
+  "exact_accuracy": 0.0,
+  "segment_only_accuracy": 0.0,
+  "ring_only_accuracy": 0.3333333333333333,
+  "by_expected_ring": {
+    "SBULL": {
+      "total": 1,
+      "exact": 0,
+      "segment_only": 0,
+      "ring_only": 0
+    },
+    "D": {
+      "total": 1,
+      "exact": 0,
+      "segment_only": 0,
+      "ring_only": 0
+    },
+    "MISS": {
+      "total": 1,
+      "exact": 0,
+      "segment_only": 0,
+      "ring_only": 0
+    },
+    "S": {
+      "total": 2,
+      "exact": 0,
+      "segment_only": 0,
+      "ring_only": 2
+    },
+    "T": {
+      "total": 1,
+      "exact": 0,
+      "segment_only": 0,
+      "ring_only": 0
+    }
+  },
+  "top_confusions": [
+    {
+      "pair": "SBULL -> S17",
+      "count": 1
+    },
+    {
+      "pair": "D20 -> S17",
+      "count": 1
+    },
+    {
+      "pair": "MISS -> S3",
+      "count": 1
+    },
+    {
+      "pair": "S15 -> S6",
+      "count": 1
+    },
+    {
+      "pair": "S20 -> S17",
+      "count": 1
+    },
+    {
+      "pair": "T20 -> S6",
+      "count": 1
+    }
+  ]
+}
