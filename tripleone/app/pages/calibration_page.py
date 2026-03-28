@@ -1,42 +1,43 @@
 # app/pages/calibration_page.py
-# Triple One - Schritt 3:
-# Calibration Page = Orchestrierung + UI
+# Triple One - Kalibrierungsseite
 #
-# Diese Datei darf:
-# - Kamera starten/stoppen
-# - Preview versorgen
-# - Testpunkt auswerten
-# - Referenzbild speichern
-# - Detector scharf schalten
-# - Kalibrierung speichern
+# Diese Version verwendet 3 Kalibrierkarten nebeneinander – analog zur Kameraseite.
+# Jede Karte kann:
+# - eine verfügbare Kamera auswählen
+# - Livebild anzeigen
+# - 4 Kalibrierpunkte setzen
+# - Testpunkt prüfen
+# - leeres Board speichern
+# - Einzeldart-Detector scharf schalten
+# - Detektion zurücksetzen
 #
-# Diese Datei darf NICHT:
-# - eigene Homography rechnen
-# - eigene Ring-/Winkelgeometrie rechnen
-# - eigene Scorelogik erfinden
+# WICHTIG:
+# - Keine eigene Homography-Logik
+# - Keine eigene Ring-/Sektorlogik
+# - Keine eigene Scorelogik
 #
 # Alles Geometrische läuft über:
-# - vision/calibration_geometry.py
+# - vision.calibration_geometry.py
 # Alles Visuelle im Preview läuft über:
 # - app/widgets/calibration_preview.py
 
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 from PyQt6.QtGui import QImage
 from PyQt6.QtWidgets import (
     QCheckBox,
-    QComboBox,
     QDoubleSpinBox,
     QFrame,
     QHBoxLayout,
     QLabel,
     QMessageBox,
     QPushButton,
+    QComboBox,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -52,19 +53,29 @@ from vision.camera_manager import CameraWorker
 from vision.dart_detector import DartDetector
 
 
-class SingleCamCalibrationCard(QFrame):
+class CalibrationCard(QFrame):
     """
-    UI + Steuerung für genau eine aktive Kamera.
+    Eine einzelne Kalibrierkarte für genau einen Kamera-Slot.
     """
 
-    def __init__(self, title: str, parent=None):
+    def __init__(self, title: str, slot_index: int, parent=None):
         super().__init__(parent)
 
-        self.setObjectName("SingleCamCalibrationCard")
+        self.slot_index = int(slot_index)
+        self.worker: Optional[CameraWorker] = None
+        self.camera_config: Dict = {}
+        self.available_cameras: List[Dict[str, int]] = []
+        self._manual_points: List[Dict[str, int]] = []
+
+        self.detector = DartDetector()
+        self.last_frame_bgr: Optional[np.ndarray] = None
+
+        self.setObjectName("CalibrationCard")
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setMinimumWidth(360)
 
         self.setStyleSheet("""
-            QFrame#SingleCamCalibrationCard {
+            QFrame#CalibrationCard {
                 background-color: #1f1f1f;
                 border: 1px solid #333333;
                 border-radius: 12px;
@@ -72,7 +83,7 @@ class SingleCamCalibrationCard(QFrame):
             QLabel {
                 color: #f2f2f2;
             }
-            QDoubleSpinBox {
+            QComboBox, QDoubleSpinBox {
                 background-color: #2b2b2b;
                 color: #f2f2f2;
                 border: 1px solid #444444;
@@ -96,28 +107,23 @@ class SingleCamCalibrationCard(QFrame):
             }
         """)
 
-        self.worker: Optional[CameraWorker] = None
-        self.camera_config: Dict = {}
-        self._manual_points: List[Dict[str, int]] = []
-
-        self.detector = DartDetector()
-        self.last_frame_bgr: Optional[np.ndarray] = None
-
         self.title_label = QLabel(title)
         self.title_label.setStyleSheet("font-size: 20px; font-weight: bold;")
+
+        self.device_combo = QComboBox()
 
         self.device_info_label = QLabel("Gerät: keine Kamera gewählt")
         self.device_info_label.setStyleSheet("font-size: 12px; color: #bbbbbb;")
 
         self.help_label = QLabel(
-            "Kalibrierung mit 4 festen Punkten:\n"
+            "4 feste Punkte setzen:\n"
             "- P1 = 20|1\n"
             "- P2 = 6|10\n"
             "- P3 = 3|19\n"
             "- P4 = 11|14\n"
             "- Bull wird automatisch berechnet\n"
             "- Rechtsklick = Präzisions-Testpunkt\n"
-            "- Enter bestätigt den Testpunkt"
+            "- Enter bestätigt Testpunkt"
         )
         self.help_label.setWordWrap(True)
         self.help_label.setStyleSheet("font-size: 12px; color: #d8d8d8;")
@@ -141,11 +147,6 @@ class SingleCamCalibrationCard(QFrame):
         self.save_empty_board_button = QPushButton("Leeres Board speichern")
         self.arm_button = QPushButton("Einzeldart scharf")
         self.reset_detection_button = QPushButton("Detektion zurücksetzen")
-
-        self.reset_points_button.clicked.connect(self.reset_points)
-        self.save_empty_board_button.clicked.connect(self.save_empty_board)
-        self.arm_button.clicked.connect(self.arm_detector)
-        self.reset_detection_button.clicked.connect(self.reset_detection)
 
         self.point_info_label = QLabel("Punkte: -")
         self.point_info_label.setWordWrap(True)
@@ -176,10 +177,9 @@ class SingleCamCalibrationCard(QFrame):
         self._push_overlay_to_preview()
         self._update_point_info_label()
         self._update_debug_label()
-        
 
     # ------------------------------------------------------------
-    # UI-Aufbau
+    # UI
     # ------------------------------------------------------------
 
     def _build_ui(self) -> None:
@@ -187,10 +187,10 @@ class SingleCamCalibrationCard(QFrame):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(10)
 
-        layout.addWidget(self.title_label)
-        layout.addWidget(self.device_info_label)
-        layout.addWidget(self.help_label)
-        layout.addWidget(self.preview, 1)
+        device_row = QHBoxLayout()
+        device_row.setSpacing(8)
+        device_row.addWidget(QLabel("Kamera:"))
+        device_row.addWidget(self.device_combo, 1)
 
         row_overlay = QHBoxLayout()
         row_overlay.setSpacing(8)
@@ -210,8 +210,12 @@ class SingleCamCalibrationCard(QFrame):
         row_detector.addWidget(self.save_empty_board_button)
         row_detector.addWidget(self.arm_button)
         row_detector.addWidget(self.reset_detection_button)
-        row_detector.addStretch()
 
+        layout.addWidget(self.title_label)
+        layout.addLayout(device_row)
+        layout.addWidget(self.device_info_label)
+        layout.addWidget(self.help_label)
+        layout.addWidget(self.preview, 1)
         layout.addLayout(row_overlay)
         layout.addLayout(row_checks)
         layout.addLayout(row_detector)
@@ -229,19 +233,56 @@ class SingleCamCalibrationCard(QFrame):
         self.preview.points_changed.connect(self._handle_points_changed)
         self.preview.test_point_selected.connect(self._handle_test_point_selected)
 
+        self.reset_points_button.clicked.connect(self.reset_points)
+        self.save_empty_board_button.clicked.connect(self.save_empty_board)
+        self.arm_button.clicked.connect(self.arm_detector)
+        self.reset_detection_button.clicked.connect(self.reset_detection)
+
     # ------------------------------------------------------------
-    # Daten / Konfig
+    # Kameraauswahl / Runtime
+    # ------------------------------------------------------------
+
+    def set_available_cameras(self, cameras: List[Dict[str, int]]) -> None:
+        self.available_cameras = list(cameras)
+        previous_device_id = self.device_combo.currentData()
+
+        self.device_combo.blockSignals(True)
+        self.device_combo.clear()
+        self.device_combo.addItem("Keine Kamera", -1)
+
+        for cam in cameras:
+            self.device_combo.addItem(f"{cam['name']} (Index {cam['index']})", cam["index"])
+
+        found_index = self.device_combo.findData(previous_device_id)
+        if found_index >= 0:
+            self.device_combo.setCurrentIndex(found_index)
+
+        self.device_combo.blockSignals(False)
+
+    def reset_runtime_state(self) -> None:
+        self.stop_worker()
+        self.last_frame_bgr = None
+        self.preview.clear_frame()
+        self.preview.clear_test_point()
+        self.detector.reset_detection()
+        self.test_result_label.setText("Testpunkt: noch keiner gesetzt")
+        self.auto_result_label.setText("Auto-Dart: noch keiner")
+        self.detector_status_label.setText("Detector: keine Referenz")
+        self.status_label.setText("Status: gestoppt")
+        self._update_debug_label()
+
+    # ------------------------------------------------------------
+    # Daten / Overlay
     # ------------------------------------------------------------
 
     def _default_manual_points(self) -> List[Dict[str, int]]:
         frame_width = self._get_frame_width()
         frame_height = self._get_frame_height()
-
         return [
-            {"x_px": int(frame_width * 0.60), "y_px": int(frame_height * 0.28)},  # P1 = 20|1
-            {"x_px": int(frame_width * 0.70), "y_px": int(frame_height * 0.72)},  # P2 = 6|10
-            {"x_px": int(frame_width * 0.26), "y_px": int(frame_height * 0.67)},  # P3 = 3|19
-            {"x_px": int(frame_width * 0.37), "y_px": int(frame_height * 0.30)},  # P4 = 11|14
+            {"x_px": int(frame_width * 0.60), "y_px": int(frame_height * 0.28)},
+            {"x_px": int(frame_width * 0.70), "y_px": int(frame_height * 0.72)},
+            {"x_px": int(frame_width * 0.26), "y_px": int(frame_height * 0.67)},
+            {"x_px": int(frame_width * 0.37), "y_px": int(frame_height * 0.30)},
         ]
 
     def _get_frame_width(self) -> int:
@@ -319,28 +360,15 @@ class SingleCamCalibrationCard(QFrame):
             f"info={dbg.info_text}"
         )
 
-    def reset_runtime_state(self) -> None:
-        """
-        Setzt nur den flüchtigen Laufzeitzustand der Kalibrierkarte zurück,
-        ohne gespeicherte Kalibrierpunkte zu zerstören.
-        """
-        self.stop_worker()
-
-        self.last_frame_bgr = None
-        self.preview.clear_frame()
-        self.preview.clear_test_point()
-
-        self.detector.reset_detection()
-
-        self.test_result_label.setText("Testpunkt: noch keiner gesetzt")
-        self.auto_result_label.setText("Auto-Dart: noch keiner")
-        self.detector_status_label.setText("Detector: keine Referenz")
-        self.status_label.setText("Status: gestoppt")
-
-        self._update_debug_label()
-
     def set_camera_config(self, camera_config: Dict) -> None:
         self.camera_config = dict(camera_config or {})
+
+        desired_device_id = int(self.camera_config.get("device_id", -1))
+        combo_index = self.device_combo.findData(desired_device_id)
+        if combo_index >= 0:
+            self.device_combo.setCurrentIndex(combo_index)
+        else:
+            self.device_combo.setCurrentIndex(0)
 
         enabled = bool(self.camera_config.get("enabled", True))
         device_id = int(self.camera_config.get("device_id", -1))
@@ -367,10 +395,17 @@ class SingleCamCalibrationCard(QFrame):
         self._manual_points = raw_points[:4]
 
         self.preview.set_overlay_config(self.get_calibration_config())
+        self.preview.clear_test_point()
+        self.detector.reset_detection()
+        self.test_result_label.setText("Testpunkt: noch keiner gesetzt")
+        self.auto_result_label.setText("Auto-Dart: noch keiner")
+        self.detector_status_label.setText("Detector: keine Referenz")
         self._update_point_info_label()
+        self._update_debug_label()
 
     def get_calibration_config(self) -> Dict:
         return {
+            "name": f"Kamera {self.slot_index + 1}",
             "frame_width": self._get_frame_width(),
             "frame_height": self._get_frame_height(),
             "overlay_alpha": float(self.alpha_spin.value()),
@@ -485,8 +520,10 @@ class SingleCamCalibrationCard(QFrame):
     def start_worker(self) -> None:
         self.stop_worker()
 
+        device_id = int(self.device_combo.currentData())
+        self.camera_config["device_id"] = device_id
+
         enabled = bool(self.camera_config.get("enabled", True))
-        device_id = int(self.camera_config.get("device_id", -1))
 
         if not enabled:
             self.preview.clear_frame()
@@ -500,15 +537,7 @@ class SingleCamCalibrationCard(QFrame):
 
         print(
             "[CalibrationCard] start_worker -> "
-            f"device_id={device_id}, "
-            f"enabled={enabled}, "
-            f"width={self.camera_config.get('width', 1280)}, "
-            f"height={self.camera_config.get('height', 720)}, "
-            f"fps={self.camera_config.get('fps', 30)}"
-        )
-
-        print(
-            "[CalibrationCard] start_worker -> "
+            f"slot={self.slot_index}, "
             f"device_id={device_id}, "
             f"enabled={enabled}, "
             f"width={self.camera_config.get('width', 1280)}, "
@@ -532,8 +561,7 @@ class SingleCamCalibrationCard(QFrame):
 
 class CalibrationPage(QWidget):
     """
-    Seite für die Kalibrierung.
-    Verwendet aktuell bewusst nur die erste aktive Kamera.
+    Mehrkamera-Kalibrierungsseite analog zur Kameraseite.
     """
 
     def __init__(
@@ -548,45 +576,37 @@ class CalibrationPage(QWidget):
         self.camera_config = deepcopy(camera_config)
         self.calibration_config = deepcopy(calibration_config)
         self.save_callback = save_callback
+        self.available_cameras: List[Dict[str, int]] = []
 
-        self.title_label = QLabel("TripleOne – Schritt 3 / Calibration Page")
+        self.title_label = QLabel("TripleOne – Kalibrierung")
         self.title_label.setStyleSheet("font-size: 28px; font-weight: bold;")
 
         self.info_label = QLabel(
-            "Diese Seite orchestriert nur noch Kamera, Preview, Testpunkt und Detector.\n"
-            "Geometrie und Overlay kommen vollständig aus calibration_geometry.py."
+            "Jede Karte kalibriert genau einen Kamera-Slot.\n"
+            "Wähle pro Karte eine verfügbare Kamera, starte das Livebild und setze die 4 Punkte."
         )
         self.info_label.setWordWrap(True)
         self.info_label.setStyleSheet("font-size: 13px; color: #cccccc;")
 
-        self.selected_camera_index = 0
+        self.card_1 = CalibrationCard("Kalibrierung – Kamera 1", slot_index=0)
+        self.card_2 = CalibrationCard("Kalibrierung – Kamera 2", slot_index=1)
+        self.card_3 = CalibrationCard("Kalibrierung – Kamera 3", slot_index=2)
+        self.cards = [self.card_1, self.card_2, self.card_3]
 
-        self.camera_select_label = QLabel("Zu kalibrierende Kamera:")
-        self.camera_select_label.setStyleSheet("font-size: 13px; color: #dddddd; font-weight: 600;")
-
-        self.camera_select_combo = QComboBox()
-        self.camera_select_combo.addItems(["Kamera 1", "Kamera 2", "Kamera 3"])
-        self.camera_select_combo.currentIndexChanged.connect(self._on_selected_camera_changed)
-
-        self.card = SingleCamCalibrationCard("Kamera – Präzisionskalibrierung")
-
-        self.start_button = QPushButton("Livebild starten / aktualisieren")
-        self.stop_button = QPushButton("Kamera stoppen")
+        self.start_button = QPushButton("Livebilder starten / aktualisieren")
+        self.stop_button = QPushButton("Alle Kameras stoppen")
         self.save_button = QPushButton("Kalibrierung speichern")
 
         self.start_button.clicked.connect(self.apply_preview)
-        self.stop_button.clicked.connect(self.stop_camera)
+        self.stop_button.clicked.connect(self.stop_all_cameras)
         self.save_button.clicked.connect(self.save_settings)
 
-        self.global_info_label = QLabel(
-            "Hinweis: Hier wird immer genau eine ausgewählte Kamera kalibriert."
-        )
+        self.global_info_label = QLabel("Hinweis: Jede Karte arbeitet unabhängig.")
         self.global_info_label.setWordWrap(True)
         self.global_info_label.setStyleSheet("font-size: 12px; color: #8effc9; font-weight: 700;")
 
         self._build_ui()
-        self.camera_select_combo.setCurrentIndex(0)
-        self._load_single_camera_data()
+        self._load_all_data()
 
     # ------------------------------------------------------------
     # UI
@@ -614,79 +634,60 @@ class CalibrationPage(QWidget):
         top_row.addWidget(self.save_button)
         top_row.addStretch()
 
+        cards_layout = QHBoxLayout()
+        cards_layout.setSpacing(14)
+        cards_layout.addWidget(self.card_1, 1)
+        cards_layout.addWidget(self.card_2, 1)
+        cards_layout.addWidget(self.card_3, 1)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(16)
-
         layout.addWidget(self.title_label)
         layout.addWidget(self.info_label)
-        select_row = QHBoxLayout()
-        select_row.setSpacing(10)
-        select_row.addWidget(self.camera_select_label)
-        select_row.addWidget(self.camera_select_combo)
-        select_row.addStretch()
-
         layout.addLayout(top_row)
-        layout.addLayout(select_row)
         layout.addWidget(self.global_info_label)
-        layout.addWidget(self.card, 1)
+        layout.addLayout(cards_layout, 1)
+
     # ------------------------------------------------------------
-    # Kamera / Daten
+    # Daten / Config
     # ------------------------------------------------------------
 
-    def _get_selected_camera_index(self) -> int:
-        return int(self.selected_camera_index)
+    def set_available_cameras(self, cameras: List[Dict[str, int]]) -> None:
+        self.available_cameras = list(cameras)
+        for card in self.cards:
+            card.set_available_cameras(cameras)
 
-    def _load_single_camera_data(self) -> None:
+    def _load_all_data(self) -> None:
         cam_list = self.camera_config.get("cameras", [])
         cal_list = self.calibration_config.get("cameras", [])
 
-        idx = self._get_selected_camera_index()
+        for idx, card in enumerate(self.cards):
+            if idx < len(cam_list):
+                card.set_camera_config(cam_list[idx])
+            else:
+                card.set_camera_config({})
 
-        selected_camera_cfg = cam_list[idx] if idx < len(cam_list) else {}
-        selected_cal_cfg = cal_list[idx] if idx < len(cal_list) else {}
-
-        self.card.set_camera_config(selected_camera_cfg)
-        self.card.set_calibration_config(selected_cal_cfg)
-
-        self.card.preview.clear_test_point()
-        self.card.test_result_label.setText("Testpunkt: noch keiner gesetzt")
-        self.card.auto_result_label.setText("Auto-Dart: noch keiner")
-        self.card.detector_status_label.setText("Detector: keine Referenz")
-        self.card._update_point_info_label()
-        self.card._update_debug_label()
-
-    def _on_selected_camera_changed(self, index: int) -> None:
-        self.selected_camera_index = int(index)
-        print(f"[CalibrationPage] selected_camera_index = {self.selected_camera_index}")
-
-        # Alten Zustand wirklich beenden
-        self.card.reset_runtime_state()
-
-        # Neue Kamera-/Kalibrierdaten laden
-        self._load_single_camera_data()
-        print(f"[CalibrationPage] loaded camera_config = {self.card.camera_config}")
-
-        self.global_info_label.setText(
-            f"Hinweis: Aktuell ausgewählt ist Kamera {self.selected_camera_index + 1}. "
-            f"Bitte 'Livebild starten / aktualisieren' drücken."
-        )
+            if idx < len(cal_list):
+                card.set_calibration_config(cal_list[idx])
+            else:
+                card.set_calibration_config({})
 
     def update_camera_config(self, new_camera_config: Dict) -> None:
         self.camera_config = deepcopy(new_camera_config)
-        self._load_single_camera_data()
+        self._load_all_data()
 
     def collect_calibration_config(self) -> Dict:
         result = deepcopy(self.calibration_config)
         cameras = result.get("cameras", [])
 
-        idx = self._get_selected_camera_index()
-
-        while len(cameras) <= idx:
+        while len(cameras) < len(self.cards):
             cameras.append({"name": f"Kamera {len(cameras) + 1}"})
 
-        cameras[idx]["name"] = f"Kamera {idx + 1}"
-        cameras[idx].update(self.card.get_calibration_config())
+        for idx, card in enumerate(self.cards):
+            cameras[idx]["name"] = f"Kamera {idx + 1}"
+            cameras[idx].update(card.get_calibration_config())
+
         result["cameras"] = cameras
         return result
 
@@ -695,13 +696,18 @@ class CalibrationPage(QWidget):
     # ------------------------------------------------------------
 
     def apply_preview(self) -> None:
-        self.card.start_worker()
+        for idx, card in enumerate(self.cards):
+            if idx < len(self.camera_config.get("cameras", [])):
+                # Beim Start die aktuelle UI-Auswahl als device_id übernehmen
+                selected_device_id = int(card.device_combo.currentData())
+                self.camera_config["cameras"][idx]["device_id"] = selected_device_id
+                card.set_camera_config(self.camera_config["cameras"][idx])
 
-    def stop_camera(self) -> None:
-        self.card.stop_worker()
+            card.start_worker()
 
     def stop_all_cameras(self) -> None:
-        self.stop_camera()
+        for card in self.cards:
+            card.stop_worker()
 
     def save_settings(self) -> None:
         self.calibration_config = self.collect_calibration_config()
@@ -710,5 +716,5 @@ class CalibrationPage(QWidget):
         QMessageBox.information(
             self,
             "Gespeichert",
-            "Die Kalibrierung der aktiven Kamera wurde gespeichert.",
+            "Die Kalibrierung aller Kamera-Slots wurde gespeichert.",
         )

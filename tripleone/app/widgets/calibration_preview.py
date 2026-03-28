@@ -84,8 +84,8 @@ class CalibrationPreview(QWidget):
         self._confirmed_test_point: Optional[Tuple[int, int]] = None
         self._pending_test_point: Optional[Tuple[int, int]] = None
 
-        self._loupe_zoom = 12
-        self._loupe_radius_px = 16
+        self._loupe_zoom = 10
+        self._loupe_radius_px = 24
         self._marker_radius_px = 10
         self._selection_distance_px = 22
 
@@ -397,12 +397,25 @@ class CalibrationPreview(QWidget):
         left = min(left, max(0, img_w - src_size))
         top = min(top, max(0, img_h - src_size))
 
-        cropped = self._frame.copy(left, top, min(src_size, img_w - left), min(src_size, img_h - top))
+        cropped = self._frame.copy(
+            left,
+            top,
+            min(src_size, img_w - left),
+            min(src_size, img_h - top),
+        )
         if cropped.isNull():
             return
 
         loupe_w = cropped.width() * self._loupe_zoom
         loupe_h = cropped.height() * self._loupe_zoom
+
+        # Hochwertig hochskalieren, damit die Lupe weniger pixelig wirkt
+        scaled_loupe = cropped.scaled(
+            int(loupe_w),
+            int(loupe_h),
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
 
         target_x = 18
         target_y = 18
@@ -415,7 +428,7 @@ class CalibrationPreview(QWidget):
         painter.setBrush(QColor(10, 10, 10, 215))
         painter.drawRoundedRect(rect.adjusted(-6, -26, 6, 46), 10, 10)
 
-        painter.drawImage(rect, cropped)
+        painter.drawImage(rect, scaled_loupe)
 
         painter.setFont(self._small_font)
         painter.setPen(QPen(QColor(255, 240, 180), 1))

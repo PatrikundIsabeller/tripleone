@@ -220,6 +220,7 @@ class MainWindow(QMainWindow):
         """
         max_scan = self.config_data.get("app", {}).get("max_camera_scan", 10)
         self.available_cameras = probe_available_cameras(max_devices=max_scan)
+        print("[MainWindow] available_cameras =", self.available_cameras)
 
         #self.dashboard_page.update_camera_count(len(self.available_cameras))
         #self.cameras_page.set_available_cameras(self.available_cameras)
@@ -227,6 +228,7 @@ class MainWindow(QMainWindow):
 
         self.dashboard_page.update_camera_count(len(self.available_cameras))
         self.cameras_page.set_available_cameras(self.available_cameras)
+        self.calibration_page.set_available_cameras(self.available_cameras)
 
         # Wichtig: Kalibrierungsseite muss bei geänderter Kamerakonfiguration mitziehen
         self.calibration_page.update_camera_config(self.config_data)

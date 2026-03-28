@@ -5,6 +5,8 @@
 # - Frames lesen
 # - Rotation / Spiegelung anwenden
 # - Bild als QImage an die Oberfläche senden
+# - rohes BGR-Frame für Vision/Detektion senden
+# - robustes Öffnen mit Backend-Fallback
 
 from __future__ import annotations
 
@@ -18,39 +20,109 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtGui import QImage
 
 
-def get_capture_backend():
+def get_preferred_capture_backends() -> List[int]:
     """
-    Wählt ein sinnvolles OpenCV-Capture-Backend aus.
-    Auf Windows verwenden wir CAP_DSHOW, sonst Standard.
+    Liefert eine sinnvolle Reihenfolge von Capture-Backends.
+
+    Windows:
+    - zuerst DirectShow
+    - dann Media Foundation
+    - dann OpenCV Default
+
+    Andere Systeme:
+    - Standardbackend
     """
-    if platform.system().lower() == "windows":
-        return cv2.CAP_DSHOW
-    return cv2.CAP_ANY
+    system = platform.system().lower()
+
+    if system == "windows":
+        backends: List[int] = [cv2.CAP_DSHOW]
+
+        # Nicht jede OpenCV-Build hat CAP_MSMF.
+        if hasattr(cv2, "CAP_MSMF"):
+            backends.append(cv2.CAP_MSMF)
+
+        backends.append(cv2.CAP_ANY)
+        return backends
+
+    return [cv2.CAP_ANY]
+
+
+def _backend_name(backend: int) -> str:
+    if backend == cv2.CAP_DSHOW:
+        return "CAP_DSHOW"
+    if hasattr(cv2, "CAP_MSMF") and backend == cv2.CAP_MSMF:
+        return "CAP_MSMF"
+    if backend == cv2.CAP_ANY:
+        return "CAP_ANY"
+    return str(backend)
+
+
+def _try_open_camera_once(
+    device_id: int,
+    backend: int,
+    width: int,
+    height: int,
+    fps: int,
+) -> Optional[cv2.VideoCapture]:
+    """
+    Öffnet eine Kamera testweise genau einmal mit einem Backend.
+    Gibt ein geöffnetes Capture zurück oder None.
+    """
+    cap = None
+    try:
+        cap = cv2.VideoCapture(device_id, backend)
+
+        if cap is None or not cap.isOpened():
+            if cap is not None:
+                cap.release()
+            return None
+
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        cap.set(cv2.CAP_PROP_FPS, fps)
+
+        success, frame = cap.read()
+        if not success or frame is None:
+            cap.release()
+            return None
+
+        return cap
+    except Exception:
+        if cap is not None:
+            cap.release()
+        return None
 
 
 def probe_available_cameras(max_devices: int = 10) -> List[Dict[str, int]]:
     """
-    Sucht nach verfügbaren Kameras, indem die Geräte-Indizes geprüft werden.
+    Sucht nach verfügbaren Kameras, indem Geräte-Indizes geprüft werden.
+    Nutzt mehrere Backends als Fallback.
     """
     available = []
-    backend = get_capture_backend()
+    backends = get_preferred_capture_backends()
 
     for index in range(max_devices):
-        cap = None
-        try:
-            cap = cv2.VideoCapture(index, backend)
-            if not cap.isOpened():
-                continue
+        found = False
 
-            success, frame = cap.read()
-            if success and frame is not None:
-                available.append({
-                    "index": index,
-                    "name": f"Kamera {index}"
-                })
-        finally:
+        for backend in backends:
+            cap = _try_open_camera_once(
+                device_id=index,
+                backend=backend,
+                width=640,
+                height=480,
+                fps=15,
+            )
             if cap is not None:
                 cap.release()
+                available.append({
+                    "index": index,
+                    "name": f"Kamera {index}",
+                })
+                found = True
+                break
+
+        if not found:
+            continue
 
     return available
 
@@ -85,13 +157,14 @@ class CameraWorker(QThread):
 
         self._running = False
         self._cap: Optional[cv2.VideoCapture] = None
+        self._active_backend: Optional[int] = None
 
     def stop(self) -> None:
         """Beendet den Kamera-Thread sauber."""
         self._running = False
         self.wait(2000)
 
-    def _apply_transformations(self, frame):
+    def _apply_transformations(self, frame: np.ndarray) -> np.ndarray:
         """Wendet Rotation und Spiegelung auf das Kamerabild an."""
         if self.rotation == 90:
             frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
@@ -106,28 +179,41 @@ class CameraWorker(QThread):
         return frame
 
     def _open_camera(self) -> bool:
-        """Öffnet die Kamera mit den gewünschten Parametern."""
-        backend = get_capture_backend()
-        self._cap = cv2.VideoCapture(self.device_id, backend)
+        """
+        Öffnet die Kamera robust mit Backend-Fallback.
+        """
+        backends = get_preferred_capture_backends()
 
-        if not self._cap.isOpened():
-            self.status_changed.emit(
-                f"Fehler: Kamera {self.device_id} konnte nicht geöffnet werden."
+        for backend in backends:
+            cap = _try_open_camera_once(
+                device_id=self.device_id,
+                backend=backend,
+                width=self.width,
+                height=self.height,
+                fps=self.fps,
             )
-            return False
 
-        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        self._cap.set(cv2.CAP_PROP_FPS, self.fps)
+            if cap is None:
+                continue
 
-        actual_width = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        actual_height = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        actual_fps = int(self._cap.get(cv2.CAP_PROP_FPS)) or self.fps
+            self._cap = cap
+            self._active_backend = backend
+
+            actual_width = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_height = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            actual_fps = int(self._cap.get(cv2.CAP_PROP_FPS)) or self.fps
+
+            self.status_changed.emit(
+                f"Aktiv – Gerät {self.device_id} – "
+                f"{actual_width}x{actual_height} @ {actual_fps} FPS "
+                f"({_backend_name(backend)})"
+            )
+            return True
 
         self.status_changed.emit(
-            f"Aktiv – Gerät {self.device_id} – {actual_width}x{actual_height} @ {actual_fps} FPS"
+            f"Fehler: Kamera {self.device_id} konnte mit keinem Backend geöffnet werden."
         )
-        return True
+        return False
 
     def run(self) -> None:
         """Startet die Frame-Schleife der Kamera."""
@@ -155,8 +241,7 @@ class CameraWorker(QThread):
 
                 frame = self._apply_transformations(frame)
 
-                # Wichtig:
-                # Das rohe BGR-Frame wird separat an die UI / VisionService-Logik gesendet.
+                # Rohes BGR-Frame für Vision / Detektion
                 self.raw_frame_ready.emit(frame.copy())
 
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -171,8 +256,7 @@ class CameraWorker(QThread):
                     QImage.Format.Format_RGB888
                 ).copy()
 
-                self.frame_ready.emit(qt_image)
-
+                # Nur EINMAL emitten
                 self.frame_ready.emit(qt_image)
 
                 elapsed = time.time() - loop_start
@@ -183,4 +267,11 @@ class CameraWorker(QThread):
                 self._cap.release()
                 self._cap = None
 
-            self.status_changed.emit(f"Gestoppt – Gerät {self.device_id}")
+            self.status_changed.emit(
+                f"Gestoppt – Gerät {self.device_id}"
+                + (
+                    f" ({_backend_name(self._active_backend)})"
+                    if self._active_backend is not None
+                    else ""
+                )
+            )
