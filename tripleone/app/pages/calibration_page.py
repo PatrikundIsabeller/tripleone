@@ -30,6 +30,7 @@ import numpy as np
 from PyQt6.QtGui import QImage
 from PyQt6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFrame,
     QHBoxLayout,
@@ -175,6 +176,7 @@ class SingleCamCalibrationCard(QFrame):
         self._push_overlay_to_preview()
         self._update_point_info_label()
         self._update_debug_label()
+        
 
     # ------------------------------------------------------------
     # UI-Aufbau
@@ -317,11 +319,31 @@ class SingleCamCalibrationCard(QFrame):
             f"info={dbg.info_text}"
         )
 
-    def set_camera_config(self, camera_config: Dict) -> None:
-        self.camera_config = dict(camera_config)
+    def reset_runtime_state(self) -> None:
+        """
+        Setzt nur den flüchtigen Laufzeitzustand der Kalibrierkarte zurück,
+        ohne gespeicherte Kalibrierpunkte zu zerstören.
+        """
+        self.stop_worker()
 
-        enabled = bool(camera_config.get("enabled", True))
-        device_id = int(camera_config.get("device_id", -1))
+        self.last_frame_bgr = None
+        self.preview.clear_frame()
+        self.preview.clear_test_point()
+
+        self.detector.reset_detection()
+
+        self.test_result_label.setText("Testpunkt: noch keiner gesetzt")
+        self.auto_result_label.setText("Auto-Dart: noch keiner")
+        self.detector_status_label.setText("Detector: keine Referenz")
+        self.status_label.setText("Status: gestoppt")
+
+        self._update_debug_label()
+
+    def set_camera_config(self, camera_config: Dict) -> None:
+        self.camera_config = dict(camera_config or {})
+
+        enabled = bool(self.camera_config.get("enabled", True))
+        device_id = int(self.camera_config.get("device_id", -1))
 
         if not enabled:
             self.device_info_label.setText("Gerät: deaktiviert")
@@ -330,9 +352,11 @@ class SingleCamCalibrationCard(QFrame):
         else:
             self.device_info_label.setText(
                 f"Gerät: Index {device_id} – "
-                f"{camera_config.get('width', 1280)}x{camera_config.get('height', 720)} @ "
-                f"{camera_config.get('fps', 30)} FPS"
+                f"{self.camera_config.get('width', 1280)}x{self.camera_config.get('height', 720)} @ "
+                f"{self.camera_config.get('fps', 30)} FPS"
             )
+
+        self.status_label.setText("Status: Kamera-Konfiguration geladen")
 
     def set_calibration_config(self, calibration_config: Dict) -> None:
         self.alpha_spin.setValue(float(calibration_config.get("overlay_alpha", 0.35)))
@@ -362,9 +386,13 @@ class SingleCamCalibrationCard(QFrame):
     def reset_points(self) -> None:
         self._manual_points = self._default_manual_points()
         self.preview.set_overlay_config(self.get_calibration_config())
-        self._update_point_info_label()
         self.preview.clear_test_point()
+        self.detector.reset_detection()
         self.test_result_label.setText("Testpunkt: noch keiner gesetzt")
+        self.auto_result_label.setText("Auto-Dart: noch keiner")
+        self.detector_status_label.setText("Detector: keine Referenz")
+        self._update_point_info_label()
+        self._update_debug_label()
 
     def _qimage_to_bgr(self, image: QImage) -> np.ndarray:
         converted = image.convertToFormat(QImage.Format.Format_RGBA8888)
@@ -470,6 +498,24 @@ class SingleCamCalibrationCard(QFrame):
             self.set_status("keine Kamera gewählt")
             return
 
+        print(
+            "[CalibrationCard] start_worker -> "
+            f"device_id={device_id}, "
+            f"enabled={enabled}, "
+            f"width={self.camera_config.get('width', 1280)}, "
+            f"height={self.camera_config.get('height', 720)}, "
+            f"fps={self.camera_config.get('fps', 30)}"
+        )
+
+        print(
+            "[CalibrationCard] start_worker -> "
+            f"device_id={device_id}, "
+            f"enabled={enabled}, "
+            f"width={self.camera_config.get('width', 1280)}, "
+            f"height={self.camera_config.get('height', 720)}, "
+            f"fps={self.camera_config.get('fps', 30)}"
+        )
+
         self.worker = CameraWorker(
             device_id=device_id,
             width=int(self.camera_config.get("width", 1280)),
@@ -513,6 +559,15 @@ class CalibrationPage(QWidget):
         self.info_label.setWordWrap(True)
         self.info_label.setStyleSheet("font-size: 13px; color: #cccccc;")
 
+        self.selected_camera_index = 0
+
+        self.camera_select_label = QLabel("Zu kalibrierende Kamera:")
+        self.camera_select_label.setStyleSheet("font-size: 13px; color: #dddddd; font-weight: 600;")
+
+        self.camera_select_combo = QComboBox()
+        self.camera_select_combo.addItems(["Kamera 1", "Kamera 2", "Kamera 3"])
+        self.camera_select_combo.currentIndexChanged.connect(self._on_selected_camera_changed)
+
         self.card = SingleCamCalibrationCard("Kamera – Präzisionskalibrierung")
 
         self.start_button = QPushButton("Livebild starten / aktualisieren")
@@ -524,12 +579,13 @@ class CalibrationPage(QWidget):
         self.save_button.clicked.connect(self.save_settings)
 
         self.global_info_label = QLabel(
-            "Hinweis: Es wird nur die erste aktivierte Kamera verwendet."
+            "Hinweis: Hier wird immer genau eine ausgewählte Kamera kalibriert."
         )
         self.global_info_label.setWordWrap(True)
         self.global_info_label.setStyleSheet("font-size: 12px; color: #8effc9; font-weight: 700;")
 
         self._build_ui()
+        self.camera_select_combo.setCurrentIndex(0)
         self._load_single_camera_data()
 
     # ------------------------------------------------------------
@@ -564,32 +620,57 @@ class CalibrationPage(QWidget):
 
         layout.addWidget(self.title_label)
         layout.addWidget(self.info_label)
+        select_row = QHBoxLayout()
+        select_row.setSpacing(10)
+        select_row.addWidget(self.camera_select_label)
+        select_row.addWidget(self.camera_select_combo)
+        select_row.addStretch()
+
         layout.addLayout(top_row)
+        layout.addLayout(select_row)
         layout.addWidget(self.global_info_label)
         layout.addWidget(self.card, 1)
-
     # ------------------------------------------------------------
     # Kamera / Daten
     # ------------------------------------------------------------
 
-    def _find_first_enabled_camera_index(self) -> int:
-        cam_list = self.camera_config.get("cameras", [])
-        for idx, cam in enumerate(cam_list):
-            if bool(cam.get("enabled", True)) and int(cam.get("device_id", -1)) >= 0:
-                return idx
-        return 0
+    def _get_selected_camera_index(self) -> int:
+        return int(self.selected_camera_index)
 
     def _load_single_camera_data(self) -> None:
         cam_list = self.camera_config.get("cameras", [])
         cal_list = self.calibration_config.get("cameras", [])
 
-        idx = self._find_first_enabled_camera_index()
+        idx = self._get_selected_camera_index()
 
-        if idx < len(cam_list):
-            self.card.set_camera_config(cam_list[idx])
+        selected_camera_cfg = cam_list[idx] if idx < len(cam_list) else {}
+        selected_cal_cfg = cal_list[idx] if idx < len(cal_list) else {}
 
-        if idx < len(cal_list):
-            self.card.set_calibration_config(cal_list[idx])
+        self.card.set_camera_config(selected_camera_cfg)
+        self.card.set_calibration_config(selected_cal_cfg)
+
+        self.card.preview.clear_test_point()
+        self.card.test_result_label.setText("Testpunkt: noch keiner gesetzt")
+        self.card.auto_result_label.setText("Auto-Dart: noch keiner")
+        self.card.detector_status_label.setText("Detector: keine Referenz")
+        self.card._update_point_info_label()
+        self.card._update_debug_label()
+
+    def _on_selected_camera_changed(self, index: int) -> None:
+        self.selected_camera_index = int(index)
+        print(f"[CalibrationPage] selected_camera_index = {self.selected_camera_index}")
+
+        # Alten Zustand wirklich beenden
+        self.card.reset_runtime_state()
+
+        # Neue Kamera-/Kalibrierdaten laden
+        self._load_single_camera_data()
+        print(f"[CalibrationPage] loaded camera_config = {self.card.camera_config}")
+
+        self.global_info_label.setText(
+            f"Hinweis: Aktuell ausgewählt ist Kamera {self.selected_camera_index + 1}. "
+            f"Bitte 'Livebild starten / aktualisieren' drücken."
+        )
 
     def update_camera_config(self, new_camera_config: Dict) -> None:
         self.camera_config = deepcopy(new_camera_config)
@@ -599,7 +680,7 @@ class CalibrationPage(QWidget):
         result = deepcopy(self.calibration_config)
         cameras = result.get("cameras", [])
 
-        idx = self._find_first_enabled_camera_index()
+        idx = self._get_selected_camera_index()
 
         while len(cameras) <= idx:
             cameras.append({"name": f"Kamera {len(cameras) + 1}"})
