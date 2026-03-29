@@ -264,6 +264,30 @@ class ImpactEstimatorConfig:
     # Gewicht dieser Hypothese im Blend
     weight_board_near_contour_tip: float = 0.35
 
+    # --------------------------------------------------------------
+    # NEU: Live-Tuning für echte Dartspitze
+    # --------------------------------------------------------------
+    tip_preference_enabled: bool = True
+
+    # Referenzpunkt für echte Spitze
+    tip_reference_mode: str = "lowest_contour_point"   # oder "major_axis_lower_endpoint"
+
+    # Distanzgrenzen zur Referenzspitze
+    tip_reference_soft_distance_px: float = 18.0
+    tip_reference_hard_distance_px: float = 42.0
+
+    # Zusätzliche Multiplikatoren für spitzennähere Hypothesen
+    directional_tip_live_bonus: float = 1.35
+    lowest_point_live_bonus: float = 1.20
+    major_axis_lower_live_bonus: float = 1.12
+    major_axis_centerward_live_penalty: float = 0.72
+    board_near_live_penalty: float = 0.30
+    candidate_default_live_penalty: float = 0.45
+
+    # Blendpunkt stärker zur besten spitzennahen Hypothese ziehen
+    blend_tip_pull_enabled: bool = True
+    blend_tip_pull_strength: float = 0.72
+
 
 # -----------------------------------------------------------------------------
 # Kleine Helpers
@@ -595,7 +619,9 @@ class ImpactEstimator:
         if not hypotheses:
             return None
 
-        chosen_point, method, aggregate_strength, spread_px = self._choose_final_point(hypotheses)
+        hypotheses = self._reweight_hypotheses_for_live_tip(candidate, hypotheses)
+
+        chosen_point, method, aggregate_strength, spread_px = self._choose_final_point(candidate, hypotheses)
 
         if self.config.clamp_to_image_bounds:
             chosen_point = _clamp_point_to_image(chosen_point, image_shape)
@@ -612,6 +638,8 @@ class ImpactEstimator:
                 "spread_px": float(spread_px),
                 "aggregate_strength": float(aggregate_strength),
                 "strategy": self.config.strategy,
+                "tip_reference_point": self._get_tip_reference_point(candidate),
+                "live_tip_preference_enabled": bool(self.config.tip_preference_enabled),
             }
 
         return ImpactEstimate(
@@ -676,6 +704,123 @@ class ImpactEstimator:
     # -------------------------------------------------------------------------
     # interne Logik
     # -------------------------------------------------------------------------
+
+    def _coerce_point_tuple(self, point: Any) -> PointF:
+        return float(point[0]), float(point[1])
+
+    def _get_tip_reference_point(
+        self,
+        candidate: DartCandidate,
+    ) -> Optional[PointF]:
+        """
+        Liefert einen Referenzpunkt, der möglichst nah an der echten Dartspitze liegt.
+        Standard: contour_lowest_point.
+        """
+        debug = getattr(candidate, "debug", {}) or {}
+        mode = str(getattr(self.config, "tip_reference_mode", "lowest_contour_point"))
+
+        if mode == "major_axis_lower_endpoint":
+            point = _major_axis_lower_endpoint_from_candidate(candidate)
+            if point is not None:
+                return point
+
+        lowest = _safe_extract_point(debug.get("contour_lowest_point"))
+        if lowest is not None:
+            return lowest
+
+        impact = _safe_extract_point(getattr(candidate, "impact_point", None))
+        if impact is not None:
+            return impact
+
+        return None
+
+    def _live_tip_multiplier_for_hypothesis(
+        self,
+        candidate: DartCandidate,
+        hypothesis: ImpactHypothesis,
+    ) -> float:
+        """
+        Bewertet eine Hypothese danach, wie plausibel sie als echte Dartspitze ist.
+        """
+        if not getattr(self.config, "tip_preference_enabled", True):
+            return 1.0
+
+        ref = self._get_tip_reference_point(candidate)
+        if ref is None:
+            return 1.0
+
+        dist = _point_distance(ref, self._coerce_point_tuple(hypothesis.point))
+
+        soft = float(getattr(self.config, "tip_reference_soft_distance_px", 18.0))
+        hard = float(getattr(self.config, "tip_reference_hard_distance_px", 42.0))
+
+        mult = 1.0
+        name = str(getattr(hypothesis, "name", ""))
+
+        if name == "directional_contour_tip":
+            mult *= float(getattr(self.config, "directional_tip_live_bonus", 1.35))
+        elif name == "lowest_contour_point":
+            mult *= float(getattr(self.config, "lowest_point_live_bonus", 1.20))
+        elif name == "major_axis_lower_endpoint":
+            mult *= float(getattr(self.config, "major_axis_lower_live_bonus", 1.12))
+        elif name == "major_axis_centerward_endpoint":
+            mult *= float(getattr(self.config, "major_axis_centerward_live_penalty", 0.72))
+        elif name == "board_near_contour_tip":
+            mult *= float(getattr(self.config, "board_near_live_penalty", 0.30))
+        elif name == "candidate_default":
+            mult *= float(getattr(self.config, "candidate_default_live_penalty", 0.45))
+
+        if dist <= soft:
+            mult *= 1.15
+        elif dist >= hard:
+            mult *= 0.15
+        else:
+            t = (dist - soft) / max(1e-6, (hard - soft))
+            mult *= (1.15 * (1.0 - t) + 0.15 * t)
+
+        return float(mult)
+
+    def _reweight_hypotheses_for_live_tip(
+        self,
+        candidate: DartCandidate,
+        hypotheses: list[ImpactHypothesis],
+    ) -> list[ImpactHypothesis]:
+        """
+        Wendet die Live-Tip-Gewichtung direkt auf final_weight an.
+        """
+        for hyp in hypotheses:
+            mult = self._live_tip_multiplier_for_hypothesis(candidate, hyp)
+            hyp.metadata = dict(getattr(hyp, "metadata", {}) or {})
+            hyp.metadata["live_tip_multiplier"] = float(mult)
+            hyp.final_weight = float(getattr(hyp, "final_weight", 0.0)) * float(mult)
+
+        return hypotheses
+
+    def _pull_blend_towards_tip_reference(
+        self,
+        candidate: DartCandidate,
+        blended_point: PointF,
+        hypotheses: list[ImpactHypothesis],
+    ) -> PointF:
+        """
+        Zieht den Blendpunkt etwas in Richtung der besten spitzennahen Hypothese.
+        """
+        if not getattr(self.config, "blend_tip_pull_enabled", True):
+            return blended_point
+
+        if not hypotheses:
+            return blended_point
+
+        best = max(hypotheses, key=lambda h: float(getattr(h, "final_weight", 0.0)))
+        bx, by = self._coerce_point_tuple(blended_point)
+        tx, ty = self._coerce_point_tuple(best.point)
+
+        strength = float(getattr(self.config, "blend_tip_pull_strength", 0.72))
+        strength = max(0.0, min(1.0, strength))
+
+        px = bx * (1.0 - strength) + tx * strength
+        py = by * (1.0 - strength) + ty * strength
+        return float(px), float(py)
 
     def _resolve_board_center_image(
         self,
@@ -1126,6 +1271,7 @@ class ImpactEstimator:
 
     def _choose_final_point(
         self,
+        candidate: DartCandidate,
         hypotheses: list[ImpactHypothesis],
     ) -> tuple[PointF, str, float, float]:
         """
@@ -1178,8 +1324,10 @@ class ImpactEstimator:
 
         # Blend nur aus den spitzenrelevanten Hypothesen bilden.
         preferred_names = {
-            "major_axis_centerward_endpoint",
+            "lowest_contour_point",
+            "major_axis_lower_endpoint",
             "directional_contour_tip",
+            "major_axis_centerward_endpoint",
         }
 
         preferred_hypotheses = [
@@ -1200,6 +1348,12 @@ class ImpactEstimator:
 
         weighted_point = np.average(points, axis=0, weights=weights)
         chosen_point = (float(weighted_point[0]), float(weighted_point[1]))
+
+        chosen_point = self._pull_blend_towards_tip_reference(
+            candidate=candidate,
+            blended_point=chosen_point,
+            hypotheses=active_hypotheses,
+        )
 
         aggregate_strength = float(np.mean(weights))
         spread_px = _compute_weighted_spread(chosen_point, active_hypotheses)

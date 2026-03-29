@@ -9,6 +9,8 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Dict, List, Optional, Tuple
 
+import cv2
+
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPixmap, QImage
 from PyQt6.QtWidgets import (
@@ -153,6 +155,9 @@ class CameraCard(QFrame):
 
         self.enabled_check = QCheckBox("Aktiv")
         self.enabled_check.setChecked(True)
+        self.show_overlay_check = QCheckBox("Debug-Overlay anzeigen")
+        self.show_overlay_check.setChecked(True)
+        self.show_overlay_check.toggled.connect(self._refresh_preview_from_last_raw_frame)
 
         self.status_label = QLabel("Status: nicht gestartet")
         self.save_reference_button = QPushButton("Leeres Board speichern")
@@ -209,6 +214,7 @@ class CameraCard(QFrame):
         row_4 = QHBoxLayout()
         row_4.setSpacing(8)
         row_4.addWidget(self.enabled_check)
+        row_4.addWidget(self.show_overlay_check)
         row_4.addStretch()
         row_4.addWidget(self.flip_check)
 
@@ -236,9 +242,61 @@ class CameraCard(QFrame):
         self.preview_label.setPixmap(QPixmap())
         self.preview_label.setText(text)
 
-    def update_preview(self, image: QImage) -> None:
-        self._last_image = image
+    def _bgr_to_qimage(self, frame_bgr) -> QImage:
+        """
+        Wandelt ein OpenCV-BGR-Bild in QImage um.
+        """
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        bytes_per_line = ch * w
+        return QImage(
+            rgb.data,
+            w,
+            h,
+            bytes_per_line,
+            QImage.Format.Format_RGB888,
+        ).copy()
+
+    def _render_detection_overlay_to_qimage(self, frame_bgr) -> QImage:
+        """
+        Rendert – falls vorhanden – das Detection-Debug-Overlay auf das BGR-Bild
+        und gibt ein QImage für die Preview zurück.
+        """
+        display_frame = frame_bgr.copy()
+
+        if self.show_overlay_check.isChecked():
+            detection_result = self._last_detection_result
+            if detection_result is not None and hasattr(detection_result, "render_debug_overlay"):
+                try:
+                    display_frame = detection_result.render_debug_overlay(display_frame)
+                except Exception as exc:
+                    self.vision_status_label.setText(f"Vision: Overlay-Fehler – {exc}")
+
+        return self._bgr_to_qimage(display_frame)
+
+    def _refresh_preview_from_last_raw_frame(self) -> None:
+        """
+        Rendert die Vorschau aus dem letzten Raw-Frame neu.
+        Nützlich, wenn das Debug-Overlay ein-/ausgeschaltet wird.
+        """
+        if self._last_raw_frame is None:
+            return
+
+        if self.detector is None:
+            self._last_image = self._bgr_to_qimage(self._last_raw_frame)
+        else:
+            self._last_image = self._render_detection_overlay_to_qimage(self._last_raw_frame)
+
         self._render_last_image()
+
+    def update_preview(self, image: QImage) -> None:
+        """
+        Normale Vorschau vom Worker.
+        Wird nur verwendet, wenn noch kein Raw-Frame-Overlay aktiv gezeichnet wurde.
+        """
+        if self._last_raw_frame is None:
+            self._last_image = image
+            self._render_last_image()
 
     def _render_last_image(self) -> None:
         if self._last_image is None:
@@ -304,12 +362,18 @@ class CameraCard(QFrame):
 
     def handle_raw_frame(self, frame_bgr) -> None:
         """
-        Nimmt rohe OpenCV-Frames entgegen und verarbeitet sie über VisionService.
+        Nimmt rohe OpenCV-Frames entgegen, verarbeitet sie über VisionService
+        und rendert optional das Debug-Overlay direkt in die Vorschau.
         """
         self._last_raw_frame = frame_bgr
 
         if self.detector is None:
+            self._last_detection_result = None
             self.vision_status_label.setText("Vision: kein Detector gesetzt")
+
+            # Dann einfach das rohe Bild anzeigen
+            self._last_image = self._bgr_to_qimage(frame_bgr)
+            self._render_last_image()
             return
 
         result = self.vision_service.process_frame(
@@ -317,6 +381,10 @@ class CameraCard(QFrame):
             frame=frame_bgr,
         )
         self._last_detection_result = result.detection_result
+
+        # Preview-Bild mit oder ohne Overlay erzeugen
+        self._last_image = self._render_detection_overlay_to_qimage(frame_bgr)
+        self._render_last_image()
 
         if result.status == STATUS_HIT_DETECTED and result.hit_event is not None:
             self.vision_status_label.setText(f"Vision: Treffer erkannt ({result.hit_event.label})")
@@ -347,8 +415,11 @@ class CameraCard(QFrame):
 
         self._last_raw_frame = None
         self._last_detection_result = None
+        self._last_image = None
+        self.clear_preview("Keine Vorschau")
         self.set_status("gestoppt")
         self.vision_status_label.setText("Vision: gestoppt")
+        self.hit_label.setText("Treffer: -")
 
     def start_worker(self, config: Dict) -> None:
         self.stop_worker()
