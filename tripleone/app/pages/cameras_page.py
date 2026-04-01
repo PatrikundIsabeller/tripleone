@@ -41,6 +41,7 @@ from vision.vision_service import (
     VisionServiceConfig,
 )
 from vision.single_cam_detector import SingleCamDetector
+from vision.multi_cam_fusion import MultiCamFusionEngine, MultiCamFusionConfig
 
 
 class CameraCard(QFrame):
@@ -499,6 +500,22 @@ class CamerasPage(QWidget):
         self.title_label = QLabel("TripleOne – Kameras")
         self.title_label.setStyleSheet("font-size: 26px; font-weight: bold;")
 
+        self.fusion_engine = MultiCamFusionEngine(
+            MultiCamFusionConfig(
+                max_estimates_per_camera=2,
+                cluster_distance_px=28.0,
+                outlier_distance_px=22.0,
+                min_cameras_for_fusion=2,
+                allow_single_camera_fallback=True,
+            )
+        )
+
+        self.fused_result_label = QLabel("Fused Hit: -")
+        self.fused_result_label.setWordWrap(True)
+        self.fused_result_label.setStyleSheet(
+            "font-size: 15px; font-weight: 700; color: #ffd27f;"
+        )
+
         self.card_1 = CameraCard("Kamera 1", camera_index=0, detector=self.detectors[0])
         self.card_2 = CameraCard("Kamera 2", camera_index=1, detector=self.detectors[1])
         self.card_3 = CameraCard("Kamera 3", camera_index=2, detector=self.detectors[2])
@@ -556,6 +573,7 @@ class CamerasPage(QWidget):
         main_layout.setContentsMargins(20, 20, 20, 20)
         main_layout.setSpacing(16)
         main_layout.addWidget(self.title_label)
+        main_layout.addWidget(self.fused_result_label)
         main_layout.addLayout(buttons_layout)
         main_layout.addLayout(cards_layout, 1)
 
@@ -591,6 +609,50 @@ class CamerasPage(QWidget):
 
         for idx, card in enumerate(self.cards):
             card.set_detector(self.detectors[idx])
+
+    def update_fused_result(self) -> None:
+        """
+        Führt die letzten Single-Cam-Ergebnisse aller 3 Karten zusammen
+        und zeigt den gemeinsamen Fused-Hit an.
+        """
+        detectors_by_camera = {}
+        detection_results_by_camera = {}
+
+        for idx, card in enumerate(self.cards):
+            if card.detector is not None:
+                detectors_by_camera[idx] = card.detector
+
+            if getattr(card, "_last_detection_result", None) is not None:
+                detection_results_by_camera[idx] = card._last_detection_result
+
+        if not detectors_by_camera or not detection_results_by_camera:
+            self.fused_result_label.setText("Fused Hit: -")
+            return
+
+        try:
+            fused = self.fusion_engine.fuse(
+                detectors_by_camera=detectors_by_camera,
+                detection_results_by_camera=detection_results_by_camera,
+            )
+        except Exception as exc:
+            self.fused_result_label.setText(f"Fused Hit: Fehler – {exc}")
+            return
+
+        if fused is None:
+            self.fused_result_label.setText("Fused Hit: -")
+            return
+
+        cam_list = sorted({obs.camera_index + 1 for obs in fused.observations_used})
+        cam_text = ", ".join(str(cam) for cam in cam_list)
+
+        self.fused_result_label.setText(
+            f"Fused Hit: {fused.label} | "
+            f"Score: {fused.score} | "
+            f"Segment: {fused.segment} | "
+            f"Ring: {fused.ring} | "
+            f"Kameras: {cam_text} | "
+            f"Conf: {fused.confidence:.2f}"
+        )
 
     def apply_config_to_ui_device_selection(self) -> None:
         cameras_config = self.config_data.get("cameras", [])
