@@ -44,6 +44,7 @@ from vision.single_cam_detector import SingleCamDetector
 from vision.multi_cam_fusion import MultiCamFusionEngine, MultiCamFusionConfig
 
 
+
 class CameraCard(QFrame):
     """
     Ein einzelnes Kamera-Panel mit:
@@ -54,7 +55,14 @@ class CameraCard(QFrame):
     - Statusanzeige
     """
 
-    def __init__(self, title: str, camera_index: int, detector: Optional[SingleCamDetector] = None, parent=None):
+    def __init__(
+        self,
+        title: str,
+        camera_index: int,
+        detector: Optional[SingleCamDetector] = None,
+        fusion_update_callback=None,
+        parent=None
+    ):
         super().__init__(parent)
         self.setObjectName("CameraCard")
         self.setStyleSheet("""
@@ -102,6 +110,10 @@ class CameraCard(QFrame):
         )
         self._last_raw_frame = None
         self._last_detection_result = None
+        self._last_observation = None
+        self._last_result_status = None
+        self._last_image = None
+        self._fusion_update_callback = fusion_update_callback
         
 
         self.title_label = QLabel(title)
@@ -381,7 +393,40 @@ class CameraCard(QFrame):
             camera_id=self.camera_index,
             frame=frame_bgr,
         )
+        self._last_result_status = result.status
         self._last_detection_result = result.detection_result
+        self._last_observation = None
+
+        if self.detector is not None:
+            state = self.vision_service.get_state(self.camera_index)
+            reference_available = state.reference_frame is not None
+
+            if reference_available:
+                try:
+                    self._last_observation = self.detector.detect_observation(
+                        frame=frame_bgr,
+                        reference_frame=state.reference_frame,
+                        camera_index=self.camera_index,
+                        board_mask=state.board_mask,
+                        board_polygon=None,
+                        reference_available=reference_available,
+                    )
+                except Exception as exc:
+                    self._last_observation = None
+                    self.vision_status_label.setText(f"Vision: Observation-Fehler – {exc}")
+
+        if callable(self._fusion_update_callback):
+            self._fusion_update_callback()
+
+        if self._last_observation is not None:
+            print(
+                f"[CameraCard {self.camera_index}] "
+                f"observation: candidates={self._last_observation.candidate_count}, "
+                f"impacts={self._last_observation.impact_count}, "
+                f"obs={self._last_observation.scored_count}, "
+                f"best_topdown={self._last_observation.best_topdown_point}, "
+                f"best_label_debug={self._last_observation.best_label}"
+            )
 
         # Preview-Bild mit oder ohne Overlay erzeugen
         self._last_image = self._render_detection_overlay_to_qimage(frame_bgr)
@@ -394,20 +439,40 @@ class CameraCard(QFrame):
                 f"Score: {result.hit_event.score} | "
                 f"Segment: {result.hit_event.segment}"
             )
+
         elif result.status == STATUS_WAITING_FOR_CLEAR:
             self.vision_status_label.setText("Vision: warte auf freies Board")
+            self.hit_label.setText("Treffer: -")
+
         elif result.status == STATUS_READY:
             self.vision_status_label.setText("Vision: bereit")
+            self.hit_label.setText("Treffer: -")
+
         elif result.status == STATUS_NO_HIT:
             self.vision_status_label.setText("Vision: kein Treffer")
+            self.hit_label.setText("Treffer: -")
+
         elif result.status == STATUS_BOARD_NOT_REFERENCED:
             self.vision_status_label.setText("Vision: keine Referenz")
+            self.hit_label.setText("Treffer: -")
+
         elif result.status == STATUS_DISARMED:
-            self.vision_status_label.setText("Vision: deaktiviert")
+            state = self.vision_service.get_state(self.camera_index)
+
+            if getattr(state, "reference_frame", None) is not None:
+                self.vision_status_label.setText("Vision: Referenz vorhanden, Erkennung deaktiviert")
+            else:
+                self.vision_status_label.setText("Vision: deaktiviert")
+
+            self.hit_label.setText("Treffer: -")
+
         elif result.status == STATUS_COOLDOWN:
             self.vision_status_label.setText("Vision: cooldown")
+            self.hit_label.setText("Treffer: -")
+
         elif result.status == STATUS_ERROR:
             self.vision_status_label.setText(f"Vision: Fehler – {result.message}")
+            self.hit_label.setText("Treffer: -")
 
     def stop_worker(self) -> None:
         if self.worker is not None:
@@ -421,6 +486,8 @@ class CameraCard(QFrame):
         self.set_status("gestoppt")
         self.vision_status_label.setText("Vision: gestoppt")
         self.hit_label.setText("Treffer: -")
+        if callable(self._fusion_update_callback):
+            self._fusion_update_callback()
 
     def start_worker(self, config: Dict) -> None:
         self.stop_worker()
@@ -516,9 +583,27 @@ class CamerasPage(QWidget):
             "font-size: 15px; font-weight: 700; color: #ffd27f;"
         )
 
-        self.card_1 = CameraCard("Kamera 1", camera_index=0, detector=self.detectors[0])
-        self.card_2 = CameraCard("Kamera 2", camera_index=1, detector=self.detectors[1])
-        self.card_3 = CameraCard("Kamera 3", camera_index=2, detector=self.detectors[2])
+        self._fused_hit_locked = False
+        self._last_fused_result = None
+
+        self.card_1 = CameraCard(
+            "Kamera 1",
+            camera_index=0,
+            detector=self.detectors[0],
+            fusion_update_callback=self.update_fused_result,
+        )
+        self.card_2 = CameraCard(
+            "Kamera 2",
+            camera_index=1,
+            detector=self.detectors[1],
+            fusion_update_callback=self.update_fused_result,
+        )
+        self.card_3 = CameraCard(
+            "Kamera 3",
+            camera_index=2,
+            detector=self.detectors[2],
+            fusion_update_callback=self.update_fused_result,
+        )
         self.cards = [self.card_1, self.card_2, self.card_3]
 
         self.refresh_button = QPushButton("Kameras neu erkennen")
@@ -577,6 +662,33 @@ class CamerasPage(QWidget):
         main_layout.addLayout(buttons_layout)
         main_layout.addLayout(cards_layout, 1)
 
+    def _camera_status_allows_fusion_input(self, card) -> bool:
+        """
+        Nur Kameras verwenden, die gerade wirklich zum aktuellen Wurf gehören.
+        """
+        status = getattr(card, "_last_result_status", None)
+        return status in {
+            STATUS_HIT_DETECTED,
+            STATUS_WAITING_FOR_CLEAR,
+        }
+
+    def _observation_is_usable_for_fusion(self, observation) -> bool:
+        """
+        Nur Observations verwenden, die wirklich einen plausiblen Boardpunkt liefern.
+        MISS / leere Topdown-Punkte sollen die Fusion nicht vergiften.
+        """
+        if observation is None:
+            return False
+
+        if getattr(observation, "best_topdown_point", None) is None:
+            return False
+
+        best_label = getattr(observation, "best_label", None)
+        if best_label is not None and str(best_label).upper() == "MISS":
+            return False
+
+        return True
+
     def set_available_cameras(self, cameras: List[Dict[str, int]]) -> None:
         self.available_cameras = cameras
 
@@ -610,29 +722,126 @@ class CamerasPage(QWidget):
         for idx, card in enumerate(self.cards):
             card.set_detector(self.detectors[idx])
 
+    def _reset_fused_hit_state(self) -> None:
+        self._fused_hit_locked = False
+        self._last_fused_result = None
+        self.fused_result_label.setText("Fused Hit: -")
+
+    def _camera_is_active_for_fusion(self, card) -> bool:
+        return bool(card.enabled_check.isChecked())
+
+    def _all_active_cameras_are_clear(self) -> bool:
+        """
+        Globaler Unlock:
+        Wenn alle aktiven Kameras in einem 'freien' Zustand sind,
+        darf ein neuer Wurf wieder gefused werden.
+        """
+        clear_statuses = {
+            STATUS_READY,
+            STATUS_NO_HIT,
+            STATUS_DISARMED,
+            STATUS_BOARD_NOT_REFERENCED,
+        }
+
+        saw_active_camera = False
+
+        for card in self.cards:
+            if not self._camera_is_active_for_fusion(card):
+                continue
+
+            saw_active_camera = True
+            status = getattr(card, "_last_result_status", None)
+
+            # Wenn eine aktive Kamera noch keinen Status hat, noch nicht freigeben
+            if status is None:
+                return False
+
+            # waiting_for_board_clear und cooldown blockieren Unlock
+            if status not in clear_statuses:
+                return False
+
+        return saw_active_camera
+
+    def _any_camera_reported_new_hit(self) -> bool:
+        for card in self.cards:
+            if not self._camera_is_active_for_fusion(card):
+                continue
+            if getattr(card, "_last_result_status", None) == STATUS_HIT_DETECTED:
+                return True
+        return False
+
     def update_fused_result(self) -> None:
         """
-        Führt die letzten Single-Cam-Ergebnisse aller 3 Karten zusammen
-        und zeigt den gemeinsamen Fused-Hit an.
+        Führt die letzten Single-Cam-Observations nur dann zu einem neuen
+        Fused Hit zusammen, wenn ein echter neuer Hit vorliegt.
+
+        Danach wird der Fused Hit gelockt, bis alle aktiven Kameras wieder
+        einen 'freien' Zustand melden.
         """
+        # --------------------------------------------------------------
+        # 1) Falls gelockt: nur auf globales Board-Clear prüfen
+        # --------------------------------------------------------------
+        if self._fused_hit_locked:
+            if self._all_active_cameras_are_clear():
+                self._reset_fused_hit_state()
+            else:
+                # Solange gelockt, altes Ergebnis stehen lassen
+                return
+
+        # --------------------------------------------------------------
+        # 2) Nur bei neuem echten Hit überhaupt neu fusionieren
+        # --------------------------------------------------------------
+        if not self._any_camera_reported_new_hit():
+            if self._last_fused_result is None:
+                self.fused_result_label.setText("Fused Hit: -")
+            return
+
         detectors_by_camera = {}
-        detection_results_by_camera = {}
+        observations_by_camera = {}
 
         for idx, card in enumerate(self.cards):
-            if card.detector is not None:
-                detectors_by_camera[idx] = card.detector
+            observation = getattr(card, "_last_observation", None)
 
-            if getattr(card, "_last_detection_result", None) is not None:
-                detection_results_by_camera[idx] = card._last_detection_result
+            if card.detector is None or observation is None:
+                continue
 
-        if not detectors_by_camera or not detection_results_by_camera:
+            if not self._camera_status_allows_fusion_input(card):
+                continue
+
+            if not self._observation_is_usable_for_fusion(observation):
+                continue
+
+            detectors_by_camera[idx] = card.detector
+            observations_by_camera[idx] = observation
+
+        print(
+            "[FUSION INPUT] cameras=",
+            sorted(observations_by_camera.keys()),
+            "statuses=",
+            {
+                idx: getattr(self.cards[idx], "_last_result_status", None)
+                for idx in range(len(self.cards))
+            },
+            "labels=",
+            {
+                idx: getattr(getattr(self.cards[idx], "_last_observation", None), "best_label", None)
+                for idx in range(len(self.cards))
+            },
+            "topdown=",
+            {
+                idx: getattr(getattr(self.cards[idx], "_last_observation", None), "best_topdown_point", None)
+                for idx in range(len(self.cards))
+            },
+        )
+
+        if not detectors_by_camera or not observations_by_camera:
             self.fused_result_label.setText("Fused Hit: -")
             return
 
         try:
             fused = self.fusion_engine.fuse(
+                observations_by_camera=observations_by_camera,
                 detectors_by_camera=detectors_by_camera,
-                detection_results_by_camera=detection_results_by_camera,
             )
         except Exception as exc:
             self.fused_result_label.setText(f"Fused Hit: Fehler – {exc}")
@@ -643,7 +852,10 @@ class CamerasPage(QWidget):
             return
 
         cam_list = sorted({obs.camera_index + 1 for obs in fused.observations_used})
-        cam_text = ", ".join(str(cam) for cam in cam_list)
+        cam_text = ", ".join(str(cam) for cam in cam_list) if cam_list else "-"
+
+        self._last_fused_result = fused
+        self._fused_hit_locked = True
 
         self.fused_result_label.setText(
             f"Fused Hit: {fused.label} | "
@@ -707,6 +919,9 @@ class CamerasPage(QWidget):
             return
 
         self.config_data = new_config
+        self._fused_hit_locked = False
+        self._last_fused_result = None
+        self.fused_result_label.setText("Fused Hit: warte auf Kameradaten ...")
 
         for index, card in enumerate(self.cards):
             card.start_worker(self.config_data["cameras"][index])
@@ -732,3 +947,4 @@ class CamerasPage(QWidget):
     def stop_all_cameras(self) -> None:
         for card in self.cards:
             card.stop_worker()
+        self._reset_fused_hit_state()
