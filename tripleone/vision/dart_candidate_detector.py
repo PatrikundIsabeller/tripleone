@@ -46,45 +46,36 @@ BBox = tuple[int, int, int, int]
 class CandidateDetectorConfig:
     """
     Konfiguration für die Kandidaten-Detektion.
-
-    Wichtig:
-    Diese Werte sind bewusst konservative Startwerte.
-    Sie sind dafür gedacht, stabil debugbar zu sein und nicht "magisch"
-    auf jeden Fall irgendetwas zu erraten.
-    Die Feineinstellung kommt später anhand echter Testbilder/Videos.
     """
 
     # Vorverarbeitung
-    blur_kernel_size: int = 5
+    blur_kernel_size: int = 7
     apply_clahe: bool = False
     clahe_clip_limit: float = 2.0
     clahe_tile_grid_size: int = 8
 
     # Differenz-/Threshold-Logik
-    diff_threshold: int = 24
+    diff_threshold: int = 34
     use_otsu_threshold: bool = False
 
     # Morphologie
-    open_kernel_size: int = 3
-    close_kernel_size: int = 5
+    open_kernel_size: int = 5
+    close_kernel_size: int = 7
     dilate_kernel_size: int = 3
-    erode_iterations: int = 0
-    dilate_iterations: int = 1
+    erode_iterations: int = 1
+    dilate_iterations: int = 0
 
     # Kandidatenfilter
-    min_contour_area: float = 25.0
-    max_contour_area_ratio: float = 0.10
-    min_aspect_ratio: float = 1.20
-    min_solidity: float = 0.10
+    min_contour_area: float = 90.0
+    max_contour_area_ratio: float = 0.045
+    min_aspect_ratio: float = 1.45
+    min_solidity: float = 0.12
     min_extent: float = 0.03
-    max_extent: float = 0.95
-    min_confidence: float = 0.18
-    max_candidates: int = 8
+    max_extent: float = 0.72
+    min_confidence: float = 0.24
+    max_candidates: int = 5
 
     # Impact-Hypothese
-    # Erlaubte Werte:
-    # - "lowest_contour_point"
-    # - "major_axis_lower_endpoint"
     impact_point_mode: str = "major_axis_lower_endpoint"
 
     # Referenzbildbehandlung
@@ -96,7 +87,7 @@ class CandidateDetectorConfig:
     draw_confidence: bool = True
 
     # --------------------------------------------------------------
-    # NEU: erweiterter Debug
+    # erweiterter Debug
     # --------------------------------------------------------------
     keep_intermediate_debug_images: bool = True
     render_all_contours_overlay: bool = True
@@ -105,20 +96,14 @@ class CandidateDetectorConfig:
     max_rejection_reason_labels: int = 200
 
     # --------------------------------------------------------------
-    # NEU: boardnahe Impact-Heuristik
+    # boardnahe Impact-Heuristik
     # --------------------------------------------------------------
     prefer_centerward_major_axis_endpoint: bool = True
-
-    # Wenn ein board_center_image verfügbar ist, wird der Endpunkt der
-    # Hauptachse bevorzugt, der näher am Boardzentrum liegt.
     use_board_center_for_impact_point: bool = True
 
-    # Große Gesamtkonturen (z. B. kompletter Dart inkl. Flight) können
-    # leicht abgewertet werden, damit kleine boardnahe Fragmente nicht
-    # automatisch gewinnen, aber auch nicht alles dominieren.
     penalize_very_large_candidates: bool = True
-    large_candidate_area_penalty_start: float = 1200.0
-    large_candidate_area_penalty_max: float = 0.20
+    large_candidate_area_penalty_start: float = 900.0
+    large_candidate_area_penalty_max: float = 0.30
 
 
 # -----------------------------------------------------------------------------

@@ -68,8 +68,28 @@ class VisionServiceConfig:
     # Soll nach einem Treffer auf "Board wieder frei" gewartet werden?
     require_board_clear_after_hit: bool = True
 
-    # Mindestabstand zwischen zwei Treffern derselben Kamera
+    # Mindestabstand zwischen zwei bestätigten Treffern derselben Kamera
     min_seconds_between_hits: float = 0.80
+
+    # ------------------------------------------------------------------
+    # NEU: Confirming-Phase für echte Live-Treffer
+    # ------------------------------------------------------------------
+    # Ein Hit wird erst ausgelöst, wenn mehrere aufeinanderfolgende Frames
+    # einen zusammenpassenden Treffer liefern.
+    confirm_hit_required_consecutive_frames: int = 2
+
+    # Mindest-Combined-Confidence eines Kandidaten, bevor er überhaupt
+    # in die Confirming-Phase darf.
+    min_hit_confidence: float = 0.05
+
+    # Wie ähnlich müssen zwei aufeinanderfolgende Kandidaten sein,
+    # damit sie als derselbe Wurf gelten?
+    confirm_same_label_required: bool = False
+    confirm_max_topdown_distance_px: float = 24.0
+    confirm_max_image_distance_px: float = 40.0
+
+    # Nach dieser Zeit ohne passenden Folgeframe wird ein Pending-Hit verworfen.
+    pending_hit_max_age_seconds: float = 0.75
 
     # Für die Freigabe des Boards:
     # Frame wird mit Referenz verglichen, Differenzbild geschwellt, Anteil
@@ -176,6 +196,15 @@ class CameraVisionState:
     last_status: str = STATUS_BOARD_NOT_REFERENCED
     clear_board_consecutive_ok: int = 0
 
+    # --------------------------------------------------------------
+    # NEU: Pending-/Confirming-State
+    # --------------------------------------------------------------
+    pending_hit_event: Optional[VisionHitEvent] = None
+    pending_detection_result: Any = None
+    pending_started_timestamp: Optional[float] = None
+    pending_last_timestamp: Optional[float] = None
+    pending_confirmation_count: int = 0
+
 
 # -----------------------------------------------------------------------------
 # Hauptservice
@@ -233,6 +262,7 @@ class VisionService:
         state.last_detection_timestamp = None
         state.last_status = STATUS_BOARD_NOT_REFERENCED if state.reference_frame is None else STATUS_READY
         state.clear_board_consecutive_ok = 0
+        self._reset_pending_hit(state)
 
     def set_board_mask(self, camera_id: int, board_mask: Optional[np.ndarray]) -> None:
         state = self._ensure_state(camera_id)
@@ -258,6 +288,7 @@ class VisionService:
         state.last_detection_timestamp = None
         state.clear_board_consecutive_ok = 0
         state.last_status = STATUS_READY
+        self._reset_pending_hit(state)
 
         if self.config.auto_arm_on_reference_save:
             state.armed = True
@@ -271,6 +302,7 @@ class VisionService:
         state.last_detection_timestamp = None
         state.clear_board_consecutive_ok = 0
         state.last_status = STATUS_BOARD_NOT_REFERENCED
+        self._reset_pending_hit(state)
 
     def has_reference_frame(self, camera_id: int) -> bool:
         state = self._ensure_state(camera_id)
@@ -294,6 +326,7 @@ class VisionService:
         - disarmed -> disarmed
         - awaiting_clear_board -> nur Clear-Check
         - sonst Detector aufrufen
+        - neuer Treffer erst nach Confirming-Phase
         """
         camera_id = int(camera_id)
         state = self._ensure_state(camera_id)
@@ -312,6 +345,7 @@ class VisionService:
 
         if state.reference_frame is None:
             state.last_status = STATUS_BOARD_NOT_REFERENCED
+            self._reset_pending_hit(state)
             return VisionServiceResult(
                 camera_id=camera_id,
                 timestamp=ts,
@@ -321,6 +355,7 @@ class VisionService:
 
         if not state.armed:
             state.last_status = STATUS_DISARMED
+            self._reset_pending_hit(state)
             return VisionServiceResult(
                 camera_id=camera_id,
                 timestamp=ts,
@@ -330,6 +365,7 @@ class VisionService:
 
         if detector is None:
             state.last_status = STATUS_ERROR
+            self._reset_pending_hit(state)
             return VisionServiceResult(
                 camera_id=camera_id,
                 timestamp=ts,
@@ -339,6 +375,7 @@ class VisionService:
 
         # Sicherheitscheck Größe
         if frame.shape[:2] != state.reference_frame.shape[:2]:
+            self._reset_pending_hit(state)
             return VisionServiceResult(
                 camera_id=camera_id,
                 timestamp=ts,
@@ -348,6 +385,9 @@ class VisionService:
                     f"frame={frame.shape[:2]} vs reference={state.reference_frame.shape[:2]}"
                 ),
             )
+
+        # Pending verwerfen, wenn zu alt
+        self._expire_pending_hit_if_needed(state=state, timestamp=ts)
 
         # -------------------------------------------------------------
         # 1) Falls auf Board-clear gewartet wird: nur Clear-Logik
@@ -371,6 +411,7 @@ class VisionService:
                 state.awaiting_clear_board = False
                 state.clear_board_consecutive_ok = 0
                 state.last_status = STATUS_READY
+                self._reset_pending_hit(state)
                 return VisionServiceResult(
                     camera_id=camera_id,
                     timestamp=ts,
@@ -389,11 +430,14 @@ class VisionService:
                 timestamp=ts,
                 status=STATUS_WAITING_FOR_CLEAR,
                 message="Warte darauf, dass das Board wieder frei ist.",
+                hit_event=state.last_hit_event,
+                detection_result=state.last_detection_result,
                 board_is_clear=board_is_clear,
                 board_changed_ratio=board_changed_ratio,
                 debug={
                     "clear_board_consecutive_ok": state.clear_board_consecutive_ok,
                     "required_consecutive_frames": int(self.config.clear_board_required_consecutive_frames),
+                    "last_hit_label": None if state.last_hit_event is None else state.last_hit_event.label,
                 },
             )
 
@@ -409,6 +453,8 @@ class VisionService:
                     timestamp=ts,
                     status=STATUS_COOLDOWN,
                     message=f"Cooldown aktiv ({delta:.3f}s).",
+                    hit_event=state.last_hit_event,
+                    detection_result=state.last_detection_result,
                     debug={
                         "seconds_since_last_hit": delta,
                         "min_seconds_between_hits": float(self.config.min_seconds_between_hits),
@@ -427,6 +473,7 @@ class VisionService:
             )
         except Exception as exc:
             state.last_status = STATUS_ERROR
+            self._reset_pending_hit(state)
             return VisionServiceResult(
                 camera_id=camera_id,
                 timestamp=ts,
@@ -436,10 +483,17 @@ class VisionService:
 
         state.last_detection_result = detection_result
 
-        best_hit = self._extract_best_hit(detection_result)
-        best_estimate = self._extract_best_estimate(detection_result)
+        candidate_hit_event = self._build_candidate_hit_event(
+            camera_id=camera_id,
+            timestamp=ts,
+            detection_result=detection_result,
+        )
 
-        if best_hit is None or best_estimate is None:
+        # -------------------------------------------------------------
+        # 4) Kein plausibler Hit -> Pending ggf. verwerfen
+        # -------------------------------------------------------------
+        if candidate_hit_event is None:
+            self._reset_pending_hit(state)
             state.last_status = STATUS_NO_HIT
             return VisionServiceResult(
                 camera_id=camera_id,
@@ -447,50 +501,143 @@ class VisionService:
                 status=STATUS_NO_HIT,
                 message="Kein gültiger Treffer erkannt.",
                 detection_result=detection_result,
-                debug=self._build_debug_payload(detection_result),
+                debug=self._merge_debug(
+                    self._build_debug_payload(detection_result),
+                    {
+                        "pending_confirmation_count": 0,
+                        "confirm_required_frames": int(self.config.confirm_hit_required_consecutive_frames),
+                        "candidate_hit_valid": False,
+                    },
+                ),
             )
 
-        if self._is_miss(best_hit):
+        # -------------------------------------------------------------
+        # 5) Pending-Phase / Confirming
+        # -------------------------------------------------------------
+        if state.pending_hit_event is None:
+            state.pending_hit_event = candidate_hit_event
+            state.pending_detection_result = detection_result
+            state.pending_started_timestamp = ts
+            state.pending_last_timestamp = ts
+            state.pending_confirmation_count = 1
             state.last_status = STATUS_NO_HIT
+
             return VisionServiceResult(
                 camera_id=camera_id,
                 timestamp=ts,
                 status=STATUS_NO_HIT,
-                message="Es wurde nur MISS erkannt.",
+                message=(
+                    f"Treffer-Kandidat erkannt ({candidate_hit_event.label}), "
+                    "warte auf Bestätigung."
+                ),
                 detection_result=detection_result,
-                debug=self._build_debug_payload(detection_result),
+                debug=self._merge_debug(
+                    self._build_debug_payload(detection_result),
+                    {
+                        "pending_confirmation_count": state.pending_confirmation_count,
+                        "confirm_required_frames": int(self.config.confirm_hit_required_consecutive_frames),
+                        "candidate_hit_valid": True,
+                        "candidate_hit_label": candidate_hit_event.label,
+                        "candidate_hit_confidence": candidate_hit_event.confidence,
+                    },
+                ),
             )
 
-        hit_event = VisionHitEvent(
-            camera_id=camera_id,
-            timestamp=ts,
-            label=str(getattr(best_hit, "label", "")),
-            score=int(getattr(best_hit, "score", 0)),
-            ring=str(getattr(best_hit, "ring", "")),
-            segment=self._safe_int(getattr(best_hit, "segment", None)),
-            multiplier=int(getattr(best_hit, "multiplier", 0)),
-            image_point=self._coerce_point(getattr(best_estimate, "image_point", None)),
-            topdown_point=self._extract_topdown_point(best_hit),
-            confidence=self._extract_confidence(best_estimate),
-            detection_result=detection_result,
-        )
+        # Prüfen, ob neuer Kandidat zum bestehenden Pending-Hit passt
+        if self._hit_events_match(state.pending_hit_event, candidate_hit_event):
+            state.pending_hit_event = self._select_better_hit_event(
+                old_event=state.pending_hit_event,
+                new_event=candidate_hit_event,
+            )
+            state.pending_detection_result = detection_result
+            state.pending_last_timestamp = ts
+            state.pending_confirmation_count += 1
 
-        state.last_hit_event = hit_event
-        state.last_detection_timestamp = ts
-        state.last_status = STATUS_HIT_DETECTED
+            required = max(1, int(self.config.confirm_hit_required_consecutive_frames))
+            if state.pending_confirmation_count < required:
+                state.last_status = STATUS_NO_HIT
+                return VisionServiceResult(
+                    camera_id=camera_id,
+                    timestamp=ts,
+                    status=STATUS_NO_HIT,
+                    message=(
+                        f"Treffer-Kandidat bestätigt "
+                        f"({state.pending_confirmation_count}/{required})."
+                    ),
+                    detection_result=detection_result,
+                    debug=self._merge_debug(
+                        self._build_debug_payload(detection_result),
+                        {
+                            "pending_confirmation_count": state.pending_confirmation_count,
+                            "confirm_required_frames": required,
+                            "candidate_hit_valid": True,
+                            "candidate_hit_label": state.pending_hit_event.label,
+                            "candidate_hit_confidence": state.pending_hit_event.confidence,
+                        },
+                    ),
+                )
 
-        if self.config.require_board_clear_after_hit:
-            state.awaiting_clear_board = True
-            state.clear_board_consecutive_ok = 0
+            # ---------------------------------------------------------
+            # 6) Treffer jetzt final bestätigen
+            # ---------------------------------------------------------
+            confirmed_hit = state.pending_hit_event
+            state.last_hit_event = confirmed_hit
+            state.last_detection_result = state.pending_detection_result
+            state.last_detection_timestamp = ts
+            state.last_status = STATUS_HIT_DETECTED
+            self._reset_pending_hit(state)
+
+            if self.config.require_board_clear_after_hit:
+                state.awaiting_clear_board = True
+                state.clear_board_consecutive_ok = 0
+
+            return VisionServiceResult(
+                camera_id=camera_id,
+                timestamp=ts,
+                status=STATUS_HIT_DETECTED,
+                message=f"Treffer erkannt: {confirmed_hit.label}",
+                hit_event=confirmed_hit,
+                detection_result=state.last_detection_result,
+                debug=self._merge_debug(
+                    self._build_debug_payload(state.last_detection_result),
+                    {
+                        "confirmed_after_frames": required,
+                        "candidate_hit_valid": True,
+                    },
+                ),
+            )
+
+        # -------------------------------------------------------------
+        # 7) Neuer Kandidat passt NICHT zum Pending-Hit:
+        #    Pending ersetzen und Bestätigung neu starten
+        # -------------------------------------------------------------
+        state.pending_hit_event = candidate_hit_event
+        state.pending_detection_result = detection_result
+        state.pending_started_timestamp = ts
+        state.pending_last_timestamp = ts
+        state.pending_confirmation_count = 1
+        state.last_status = STATUS_NO_HIT
 
         return VisionServiceResult(
             camera_id=camera_id,
             timestamp=ts,
-            status=STATUS_HIT_DETECTED,
-            message=f"Treffer erkannt: {hit_event.label}",
-            hit_event=hit_event,
+            status=STATUS_NO_HIT,
+            message=(
+                f"Neuer Treffer-Kandidat erkannt ({candidate_hit_event.label}), "
+                "Bestätigung neu gestartet."
+            ),
             detection_result=detection_result,
-            debug=self._build_debug_payload(detection_result),
+            debug=self._merge_debug(
+                self._build_debug_payload(detection_result),
+                {
+                    "pending_confirmation_count": state.pending_confirmation_count,
+                    "confirm_required_frames": int(self.config.confirm_hit_required_consecutive_frames),
+                    "candidate_hit_valid": True,
+                    "candidate_hit_label": candidate_hit_event.label,
+                    "candidate_hit_confidence": candidate_hit_event.confidence,
+                    "pending_restarted": True,
+                },
+            ),
         )
 
     # -------------------------------------------------------------------------
@@ -517,6 +664,29 @@ class VisionService:
 
     def _copy_frame(self, frame: np.ndarray) -> np.ndarray:
         return frame.copy()
+
+    def _reset_pending_hit(self, state: CameraVisionState) -> None:
+        state.pending_hit_event = None
+        state.pending_detection_result = None
+        state.pending_started_timestamp = None
+        state.pending_last_timestamp = None
+        state.pending_confirmation_count = 0
+
+    def _expire_pending_hit_if_needed(self, *, state: CameraVisionState, timestamp: float) -> None:
+        if state.pending_hit_event is None:
+            return
+
+        reference_ts = state.pending_last_timestamp
+        if reference_ts is None:
+            reference_ts = state.pending_started_timestamp
+
+        if reference_ts is None:
+            self._reset_pending_hit(state)
+            return
+
+        age = float(timestamp) - float(reference_ts)
+        if age > float(self.config.pending_hit_max_age_seconds):
+            self._reset_pending_hit(state)
 
     def _compute_board_changed_ratio(
         self,
@@ -651,6 +821,89 @@ class VisionService:
 
         return False
 
+    def _build_candidate_hit_event(
+        self,
+        *,
+        camera_id: int,
+        timestamp: float,
+        detection_result: Any,
+    ) -> Optional[VisionHitEvent]:
+        best_hit = self._extract_best_hit(detection_result)
+        best_estimate = self._extract_best_estimate(detection_result)
+
+        if best_hit is None or best_estimate is None:
+            return None
+
+        if self._is_miss(best_hit):
+            return None
+
+        confidence = self._extract_confidence(best_estimate)
+        if confidence is None:
+            confidence = 0.0
+
+        if float(confidence) < float(self.config.min_hit_confidence):
+            return None
+
+        return VisionHitEvent(
+            camera_id=int(camera_id),
+            timestamp=float(timestamp),
+            label=str(getattr(best_hit, "label", "")),
+            score=int(getattr(best_hit, "score", 0)),
+            ring=str(getattr(best_hit, "ring", "")),
+            segment=self._safe_int(getattr(best_hit, "segment", None)),
+            multiplier=int(getattr(best_hit, "multiplier", 0)),
+            image_point=self._coerce_point(getattr(best_estimate, "image_point", None)),
+            topdown_point=self._extract_topdown_point(best_hit),
+            confidence=float(confidence),
+            detection_result=detection_result,
+        )
+
+    def _hit_events_match(
+        self,
+        old_event: VisionHitEvent,
+        new_event: VisionHitEvent,
+    ) -> bool:
+        if self.config.confirm_same_label_required:
+            if str(old_event.label).upper() != str(new_event.label).upper():
+                return False
+
+        topdown_dist = self._point_distance(old_event.topdown_point, new_event.topdown_point)
+        image_dist = self._point_distance(old_event.image_point, new_event.image_point)
+
+        if topdown_dist is not None:
+            return topdown_dist <= float(self.config.confirm_max_topdown_distance_px)
+
+        if image_dist is not None:
+            return image_dist <= float(self.config.confirm_max_image_distance_px)
+
+        # Wenn gar keine Geometrie vergleichbar ist, lieber nicht matchen.
+        return False
+
+    def _select_better_hit_event(
+        self,
+        *,
+        old_event: VisionHitEvent,
+        new_event: VisionHitEvent,
+    ) -> VisionHitEvent:
+        old_conf = 0.0 if old_event.confidence is None else float(old_event.confidence)
+        new_conf = 0.0 if new_event.confidence is None else float(new_event.confidence)
+
+        if new_conf >= old_conf:
+            return new_event
+        return old_event
+
+    def _point_distance(
+        self,
+        a: Optional[PointF],
+        b: Optional[PointF],
+    ) -> Optional[float]:
+        if a is None or b is None:
+            return None
+
+        dx = float(a[0]) - float(b[0])
+        dy = float(a[1]) - float(b[1])
+        return float((dx * dx + dy * dy) ** 0.5)
+
     def _build_debug_payload(self, detection_result: Any) -> dict[str, Any]:
         if detection_result is None:
             return {}
@@ -669,6 +922,7 @@ class VisionService:
         if best_estimate is not None:
             payload["best_candidate_id"] = getattr(best_estimate, "candidate_id", None)
             payload["best_image_point"] = self._coerce_point(getattr(best_estimate, "image_point", None))
+            payload["best_combined_confidence"] = self._extract_confidence(best_estimate)
 
         best_hit = self._extract_best_hit(detection_result)
         if best_hit is not None:
@@ -676,8 +930,14 @@ class VisionService:
             payload["best_score"] = getattr(best_hit, "score", None)
             payload["best_ring"] = getattr(best_hit, "ring", None)
             payload["best_segment"] = getattr(best_hit, "segment", None)
+            payload["best_topdown_point"] = self._extract_topdown_point(best_hit)
 
         return payload
+
+    def _merge_debug(self, base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(base or {})
+        merged.update(extra or {})
+        return merged
 
     # -------------------------------------------------------------------------
     # Kleine Utils

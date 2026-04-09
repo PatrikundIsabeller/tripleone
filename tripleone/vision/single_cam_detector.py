@@ -566,8 +566,11 @@ class SingleCamDetector:
             image_shape=image_shape,
         )
 
-        return self._build_observation_from_impact_result(
+        scored_estimates = self._score_impacts(impact_result)
+
+        return self._build_observation_from_scored_estimates(
             camera_index=int(camera_index),
+            scored_estimates=scored_estimates,
             impact_result=impact_result,
             candidate_result=candidate_result,
             reference_available=reference_available,
@@ -694,6 +697,112 @@ class SingleCamDetector:
         except Exception as exc:
             logger.debug("Could not project image point to topdown: %s", exc)
             return None
+
+    def _build_observation_from_scored_estimates(
+        self,
+        *,
+        camera_index: int,
+        scored_estimates: list[SingleCamScoredEstimate],
+        impact_result: Optional[ImpactEstimationResult] = None,
+        candidate_result: Optional[CandidateDetectionResult] = None,
+        reference_available: bool = True,
+        frame_ok: bool = True,
+    ) -> SingleCamObservation:
+        """
+        Baut eine SingleCamObservation aus bereits final gescorten Estimates.
+
+        WICHTIG:
+        Damit verwendet die Observation exakt dieselbe Auswahl- und
+        Pruning-Logik wie detect().
+        """
+        estimate_observations: list[SingleCamEstimateObservation] = []
+
+        for idx, scored in enumerate(scored_estimates):
+            image_point = _coerce_point(scored.image_point)
+
+            topdown_point = None
+            scored_hit = getattr(scored, "scored_hit", None)
+            if scored_hit is not None:
+                topdown_point = _coerce_point(getattr(scored_hit, "topdown_point", None))
+
+            if topdown_point is None:
+                topdown_point = self._project_image_point_to_topdown_safe(image_point)
+
+            estimate_observations.append(
+                SingleCamEstimateObservation(
+                    estimate_rank=int(idx + 1),
+                    image_point=image_point,
+                    topdown_point=topdown_point,
+                    label=None if scored.label is None else str(scored.label),
+                    score=None if scored.score is None else int(scored.score),
+                    ring=None if scored.ring is None else str(scored.ring),
+                    segment=None if scored.segment is None else int(scored.segment),
+                    multiplier=None if scored.multiplier is None else int(scored.multiplier),
+                    combined_confidence=float(scored.combined_confidence),
+                    impact_confidence=float(scored.impact_confidence),
+                    candidate_confidence=float(scored.candidate_confidence),
+                    debug={
+                        "candidate_id": int(scored.candidate_id),
+                        "bbox": _coerce_bbox(scored.bbox),
+                        "centroid": _coerce_point(scored.centroid),
+                        "scored_estimate_debug": dict(getattr(scored, "debug", {}) or {}),
+                        "source": "scored_estimate",
+                    },
+                )
+            )
+
+        estimate_observations.sort(
+            key=lambda item: float(item.combined_confidence),
+            reverse=True,
+        )
+
+        for rank, obs in enumerate(estimate_observations, start=1):
+            obs.estimate_rank = int(rank)
+
+        best = estimate_observations[0] if estimate_observations else None
+
+        candidate_count = 0
+        if candidate_result is not None:
+            candidate_count = len(getattr(candidate_result, "candidates", []) or [])
+
+        impact_count = 0
+        metadata: dict[str, Any] = {}
+        if impact_result is not None:
+            estimates = list(getattr(impact_result, "estimates", []) or [])
+            impact_count = len(estimates)
+            metadata = dict(getattr(impact_result, "metadata", {}) or {})
+
+        metadata["candidate_count"] = int(candidate_count)
+        metadata["impact_count"] = int(impact_count)
+        metadata["observation_count"] = int(len(estimate_observations))
+        metadata["observation_built_from"] = "scored_estimates"
+
+        return SingleCamObservation(
+            camera_index=int(camera_index),
+            frame_ok=bool(frame_ok),
+            detector_ready=self._score_mapper is not None,
+            reference_available=bool(reference_available),
+            candidate_count=int(candidate_count),
+            impact_count=int(impact_count),
+            scored_count=int(len(estimate_observations)),
+            best_image_point=None if best is None else best.image_point,
+            best_topdown_point=None if best is None else best.topdown_point,
+            best_label=None if best is None else best.label,
+            best_score=None if best is None else best.score,
+            best_ring=None if best is None else best.ring,
+            best_segment=None if best is None else best.segment,
+            best_multiplier=None if best is None else best.multiplier,
+            best_combined_confidence=0.0 if best is None else float(best.combined_confidence),
+            best_impact_confidence=0.0 if best is None else float(best.impact_confidence),
+            best_candidate_confidence=0.0 if best is None else float(best.candidate_confidence),
+            estimates=estimate_observations,
+            metadata=metadata,
+            debug={
+                "observation_mode": "scored_first",
+                "has_score_mapper": self._score_mapper is not None,
+            },
+            raw_result=impact_result,
+        )
 
     def _build_observation_from_impact_result(
         self,

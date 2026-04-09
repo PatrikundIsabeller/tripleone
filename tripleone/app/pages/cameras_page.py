@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
@@ -42,7 +43,6 @@ from vision.vision_service import (
 )
 from vision.single_cam_detector import SingleCamDetector
 from vision.multi_cam_fusion import MultiCamFusionEngine, MultiCamFusionConfig
-
 
 
 class CameraCard(QFrame):
@@ -99,6 +99,12 @@ class CameraCard(QFrame):
                 auto_arm_on_reference_save=False,
                 require_board_clear_after_hit=True,
                 min_seconds_between_hits=0.80,
+                confirm_hit_required_consecutive_frames=2,
+                min_hit_confidence=0.08,
+                confirm_same_label_required=False,
+                confirm_max_topdown_distance_px=24.0,
+                confirm_max_image_distance_px=40.0,
+                pending_hit_max_age_seconds=0.75,
                 clear_board_diff_threshold=18,
                 clear_board_changed_ratio_threshold=0.0045,
                 clear_board_blur_kernel_size=5,
@@ -108,13 +114,20 @@ class CameraCard(QFrame):
             ),
             default_detector=self.detector,
         )
+
         self._last_raw_frame = None
         self._last_detection_result = None
         self._last_observation = None
         self._last_result_status = None
         self._last_image = None
         self._fusion_update_callback = fusion_update_callback
-        
+
+        # Bestätigter Treffer für UI
+        self._last_confirmed_hit_event = None
+
+        # Harte, gelatchte Fusion-Observation:
+        # bleibt erhalten, bis das Board wirklich wieder frei ist.
+        self._latched_fusion_observation = None
 
         self.title_label = QLabel(title)
         self.title_label.setStyleSheet("font-size: 18px; font-weight: bold;")
@@ -256,9 +269,6 @@ class CameraCard(QFrame):
         self.preview_label.setText(text)
 
     def _bgr_to_qimage(self, frame_bgr) -> QImage:
-        """
-        Wandelt ein OpenCV-BGR-Bild in QImage um.
-        """
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         bytes_per_line = ch * w
@@ -271,10 +281,6 @@ class CameraCard(QFrame):
         ).copy()
 
     def _render_detection_overlay_to_qimage(self, frame_bgr) -> QImage:
-        """
-        Rendert – falls vorhanden – das Detection-Debug-Overlay auf das BGR-Bild
-        und gibt ein QImage für die Preview zurück.
-        """
         display_frame = frame_bgr.copy()
 
         if self.show_overlay_check.isChecked():
@@ -288,10 +294,6 @@ class CameraCard(QFrame):
         return self._bgr_to_qimage(display_frame)
 
     def _refresh_preview_from_last_raw_frame(self) -> None:
-        """
-        Rendert die Vorschau aus dem letzten Raw-Frame neu.
-        Nützlich, wenn das Debug-Overlay ein-/ausgeschaltet wird.
-        """
         if self._last_raw_frame is None:
             return
 
@@ -303,10 +305,6 @@ class CameraCard(QFrame):
         self._render_last_image()
 
     def update_preview(self, image: QImage) -> None:
-        """
-        Normale Vorschau vom Worker.
-        Wird nur verwendet, wenn noch kein Raw-Frame-Overlay aktiv gezeichnet wurde.
-        """
         if self._last_raw_frame is None:
             self._last_image = image
             self._render_last_image()
@@ -341,6 +339,86 @@ class CameraCard(QFrame):
         else:
             self.vision_status_label.setText("Vision: Detector gesetzt")
 
+    def _format_hit_text(self, hit_event) -> str:
+        if hit_event is None:
+            return "Treffer: -"
+
+        return (
+            f"Treffer: {hit_event.label} | "
+            f"Score: {hit_event.score} | "
+            f"Segment: {hit_event.segment}"
+        )
+
+    def _build_fusion_observation_from_hit_event(self, hit_event):
+        """
+        Baut eine einfache Observation direkt aus dem bestätigten HitEvent.
+        """
+        if hit_event is None:
+            return None
+
+        image_point = getattr(hit_event, "image_point", None)
+        topdown_point = getattr(hit_event, "topdown_point", None)
+
+        if image_point is None or topdown_point is None:
+            return None
+
+        confidence = getattr(hit_event, "confidence", None)
+        confidence = 0.0 if confidence is None else float(confidence)
+
+        estimate = SimpleNamespace(
+            estimate_rank=1,
+            image_point=image_point,
+            topdown_point=topdown_point,
+            label=str(getattr(hit_event, "label", "")),
+            score=int(getattr(hit_event, "score", 0)),
+            ring=str(getattr(hit_event, "ring", "")),
+            segment=getattr(hit_event, "segment", None),
+            multiplier=int(getattr(hit_event, "multiplier", 0)),
+            combined_confidence=confidence,
+            impact_confidence=confidence,
+            candidate_confidence=confidence,
+            debug={
+                "source": "vision_service_hit_event",
+                "camera_id": int(getattr(hit_event, "camera_id", self.camera_index)),
+            },
+        )
+
+        observation = SimpleNamespace(
+            camera_index=int(self.camera_index),
+            frame_ok=True,
+            detector_ready=self.detector is not None,
+            reference_available=True,
+            candidate_count=1,
+            impact_count=1,
+            scored_count=1,
+            best_image_point=image_point,
+            best_topdown_point=topdown_point,
+            best_label=str(getattr(hit_event, "label", "")),
+            best_score=int(getattr(hit_event, "score", 0)),
+            best_ring=str(getattr(hit_event, "ring", "")),
+            best_segment=getattr(hit_event, "segment", None),
+            best_multiplier=int(getattr(hit_event, "multiplier", 0)),
+            best_combined_confidence=confidence,
+            best_impact_confidence=confidence,
+            best_candidate_confidence=confidence,
+            estimates=[estimate],
+            metadata={
+                "source": "vision_service_hit_event",
+            },
+            debug={
+                "observation_mode": "confirmed_hit_event",
+            },
+            raw_result=None,
+        )
+        return observation
+
+    def _clear_runtime_detection_cache(self) -> None:
+        self._last_detection_result = None
+        self._last_observation = None
+        self._last_result_status = None
+        self._last_confirmed_hit_event = None
+        self._latched_fusion_observation = None
+
     def save_reference_frame(self) -> None:
         if self._last_raw_frame is None:
             QMessageBox.warning(self, "Referenz", "Noch kein Kameraframe verfügbar.")
@@ -353,6 +431,10 @@ class CameraCard(QFrame):
         else:
             self.vision_status_label.setText("Vision: Referenz gespeichert")
 
+        self._last_observation = None
+        self._last_detection_result = None
+        self._last_confirmed_hit_event = None
+        self._latched_fusion_observation = None
         self.hit_label.setText("Treffer: -")
 
     def arm_detection(self) -> None:
@@ -371,20 +453,17 @@ class CameraCard(QFrame):
 
     def disarm_detection(self) -> None:
         self.vision_service.disarm(self.camera_index)
-        self.vision_status_label.setText("Vision: disarmed")
 
     def handle_raw_frame(self, frame_bgr) -> None:
-        """
-        Nimmt rohe OpenCV-Frames entgegen, verarbeitet sie über VisionService
-        und rendert optional das Debug-Overlay direkt in die Vorschau.
-        """
         self._last_raw_frame = frame_bgr
 
         if self.detector is None:
             self._last_detection_result = None
+            self._last_observation = None
+            self._last_confirmed_hit_event = None
+            self._latched_fusion_observation = None
             self.vision_status_label.setText("Vision: kein Detector gesetzt")
 
-            # Dann einfach das rohe Bild anzeigen
             self._last_image = self._bgr_to_qimage(frame_bgr)
             self._render_last_image()
             return
@@ -395,84 +474,95 @@ class CameraCard(QFrame):
         )
         self._last_result_status = result.status
         self._last_detection_result = result.detection_result
-        self._last_observation = None
 
-        if self.detector is not None:
-            state = self.vision_service.get_state(self.camera_index)
-            reference_available = state.reference_frame is not None
+        if result.hit_event is not None:
+            self._last_confirmed_hit_event = result.hit_event
 
-            if reference_available:
-                try:
-                    self._last_observation = self.detector.detect_observation(
-                        frame=frame_bgr,
-                        reference_frame=state.reference_frame,
-                        camera_index=self.camera_index,
-                        board_mask=state.board_mask,
-                        board_polygon=None,
-                        reference_available=reference_available,
-                    )
-                except Exception as exc:
-                    self._last_observation = None
-                    self.vision_status_label.setText(f"Vision: Observation-Fehler – {exc}")
+        state = self.vision_service.get_state(self.camera_index)
+
+        # --------------------------------------------------------------
+        # Harte Latch-Logik für Fusion:
+        # - neuer bestätigter Hit -> latched observation setzen
+        # - waiting/cooldown/no_hit -> latched observation behalten
+        # - ready / board_clear -> erst dann löschen
+        # --------------------------------------------------------------
+        if result.status == STATUS_HIT_DETECTED and result.hit_event is not None:
+            latched = self._build_fusion_observation_from_hit_event(result.hit_event)
+            self._latched_fusion_observation = latched
+            self._last_observation = latched
+
+        elif result.status in {STATUS_WAITING_FOR_CLEAR, STATUS_COOLDOWN, STATUS_NO_HIT}:
+            self._last_observation = self._latched_fusion_observation
+
+        elif result.status in {STATUS_READY, STATUS_BOARD_NOT_REFERENCED, STATUS_DISARMED}:
+            self._latched_fusion_observation = None
+            self._last_observation = None
+
+            if result.status != STATUS_READY:
+                self._last_confirmed_hit_event = None
+
+        elif result.status == STATUS_ERROR:
+            # Bei Fehlern nichts aktiv neu setzen, aber auch nicht aggressiv löschen.
+            self._last_observation = self._latched_fusion_observation
+
+        else:
+            self._last_observation = self._latched_fusion_observation
 
         if callable(self._fusion_update_callback):
             self._fusion_update_callback()
 
-        if self._last_observation is not None:
+        if self._latched_fusion_observation is not None:
             print(
                 f"[CameraCard {self.camera_index}] "
-                f"observation: candidates={self._last_observation.candidate_count}, "
-                f"impacts={self._last_observation.impact_count}, "
-                f"obs={self._last_observation.scored_count}, "
-                f"best_topdown={self._last_observation.best_topdown_point}, "
-                f"best_label_debug={self._last_observation.best_label}"
+                f"latched_hit_obs: "
+                f"best_topdown={self._latched_fusion_observation.best_topdown_point}, "
+                f"best_label={self._latched_fusion_observation.best_label}, "
+                f"best_score={self._latched_fusion_observation.best_score}, "
+                f"conf={self._latched_fusion_observation.best_combined_confidence:.3f}, "
+                f"status={result.status}"
             )
 
-        # Preview-Bild mit oder ohne Overlay erzeugen
         self._last_image = self._render_detection_overlay_to_qimage(frame_bgr)
         self._render_last_image()
 
         if result.status == STATUS_HIT_DETECTED and result.hit_event is not None:
             self.vision_status_label.setText(f"Vision: Treffer erkannt ({result.hit_event.label})")
-            self.hit_label.setText(
-                f"Treffer: {result.hit_event.label} | "
-                f"Score: {result.hit_event.score} | "
-                f"Segment: {result.hit_event.segment}"
-            )
+            self.hit_label.setText(self._format_hit_text(result.hit_event))
 
         elif result.status == STATUS_WAITING_FOR_CLEAR:
             self.vision_status_label.setText("Vision: warte auf freies Board")
-            self.hit_label.setText("Treffer: -")
+            self.hit_label.setText(self._format_hit_text(self._last_confirmed_hit_event))
 
         elif result.status == STATUS_READY:
             self.vision_status_label.setText("Vision: bereit")
+            self._last_confirmed_hit_event = None
             self.hit_label.setText("Treffer: -")
 
         elif result.status == STATUS_NO_HIT:
-            self.vision_status_label.setText("Vision: kein Treffer")
-            self.hit_label.setText("Treffer: -")
+            self.vision_status_label.setText("Vision: kein bestätigter Treffer")
+            self.hit_label.setText(self._format_hit_text(self._last_confirmed_hit_event))
 
         elif result.status == STATUS_BOARD_NOT_REFERENCED:
             self.vision_status_label.setText("Vision: keine Referenz")
+            self._last_confirmed_hit_event = None
             self.hit_label.setText("Treffer: -")
 
         elif result.status == STATUS_DISARMED:
-            state = self.vision_service.get_state(self.camera_index)
-
             if getattr(state, "reference_frame", None) is not None:
                 self.vision_status_label.setText("Vision: Referenz vorhanden, Erkennung deaktiviert")
             else:
                 self.vision_status_label.setText("Vision: deaktiviert")
 
+            self._last_confirmed_hit_event = None
             self.hit_label.setText("Treffer: -")
 
         elif result.status == STATUS_COOLDOWN:
             self.vision_status_label.setText("Vision: cooldown")
-            self.hit_label.setText("Treffer: -")
+            self.hit_label.setText(self._format_hit_text(self._last_confirmed_hit_event))
 
         elif result.status == STATUS_ERROR:
             self.vision_status_label.setText(f"Vision: Fehler – {result.message}")
-            self.hit_label.setText("Treffer: -")
+            self.hit_label.setText(self._format_hit_text(self._last_confirmed_hit_event))
 
     def stop_worker(self) -> None:
         if self.worker is not None:
@@ -481,6 +571,9 @@ class CameraCard(QFrame):
 
         self._last_raw_frame = None
         self._last_detection_result = None
+        self._last_observation = None
+        self._last_confirmed_hit_event = None
+        self._latched_fusion_observation = None
         self._last_image = None
         self.clear_preview("Keine Vorschau")
         self.set_status("gestoppt")
@@ -494,6 +587,10 @@ class CameraCard(QFrame):
 
         self.hit_label.setText("Treffer: -")
         self.vision_status_label.setText("Vision: starte Kamera ...")
+        self._last_confirmed_hit_event = None
+        self._latched_fusion_observation = None
+        self._last_observation = None
+        self._last_detection_result = None
 
         if not config.get("enabled", True):
             self.clear_preview("Deaktiviert")
@@ -569,7 +666,7 @@ class CamerasPage(QWidget):
 
         self.fusion_engine = MultiCamFusionEngine(
             MultiCamFusionConfig(
-                max_estimates_per_camera=2,
+                max_estimates_per_camera=1,
                 cluster_distance_px=28.0,
                 outlier_distance_px=22.0,
                 min_cameras_for_fusion=2,
@@ -663,20 +760,15 @@ class CamerasPage(QWidget):
         main_layout.addLayout(cards_layout, 1)
 
     def _camera_status_allows_fusion_input(self, card) -> bool:
-        """
-        Nur Kameras verwenden, die gerade wirklich zum aktuellen Wurf gehören.
-        """
         status = getattr(card, "_last_result_status", None)
         return status in {
             STATUS_HIT_DETECTED,
             STATUS_WAITING_FOR_CLEAR,
+            STATUS_COOLDOWN,
+            STATUS_NO_HIT,
         }
 
     def _observation_is_usable_for_fusion(self, observation) -> bool:
-        """
-        Nur Observations verwenden, die wirklich einen plausiblen Boardpunkt liefern.
-        MISS / leere Topdown-Punkte sollen die Fusion nicht vergiften.
-        """
         if observation is None:
             return False
 
@@ -731,16 +823,10 @@ class CamerasPage(QWidget):
         return bool(card.enabled_check.isChecked())
 
     def _all_active_cameras_are_clear(self) -> bool:
-        """
-        Globaler Unlock:
-        Wenn alle aktiven Kameras in einem 'freien' Zustand sind,
-        darf ein neuer Wurf wieder gefused werden.
-        """
         clear_statuses = {
             STATUS_READY,
-            STATUS_NO_HIT,
-            STATUS_DISARMED,
             STATUS_BOARD_NOT_REFERENCED,
+            STATUS_DISARMED,
         }
 
         saw_active_camera = False
@@ -752,46 +838,30 @@ class CamerasPage(QWidget):
             saw_active_camera = True
             status = getattr(card, "_last_result_status", None)
 
-            # Wenn eine aktive Kamera noch keinen Status hat, noch nicht freigeben
             if status is None:
                 return False
 
-            # waiting_for_board_clear und cooldown blockieren Unlock
             if status not in clear_statuses:
                 return False
 
         return saw_active_camera
 
-    def _any_camera_reported_new_hit(self) -> bool:
+    def _any_camera_has_latched_hit(self) -> bool:
         for card in self.cards:
             if not self._camera_is_active_for_fusion(card):
                 continue
-            if getattr(card, "_last_result_status", None) == STATUS_HIT_DETECTED:
+            if getattr(card, "_latched_fusion_observation", None) is not None:
                 return True
         return False
 
     def update_fused_result(self) -> None:
-        """
-        Führt die letzten Single-Cam-Observations nur dann zu einem neuen
-        Fused Hit zusammen, wenn ein echter neuer Hit vorliegt.
-
-        Danach wird der Fused Hit gelockt, bis alle aktiven Kameras wieder
-        einen 'freien' Zustand melden.
-        """
-        # --------------------------------------------------------------
-        # 1) Falls gelockt: nur auf globales Board-Clear prüfen
-        # --------------------------------------------------------------
         if self._fused_hit_locked:
             if self._all_active_cameras_are_clear():
                 self._reset_fused_hit_state()
             else:
-                # Solange gelockt, altes Ergebnis stehen lassen
                 return
 
-        # --------------------------------------------------------------
-        # 2) Nur bei neuem echten Hit überhaupt neu fusionieren
-        # --------------------------------------------------------------
-        if not self._any_camera_reported_new_hit():
+        if not self._any_camera_has_latched_hit():
             if self._last_fused_result is None:
                 self.fused_result_label.setText("Fused Hit: -")
             return
@@ -800,7 +870,7 @@ class CamerasPage(QWidget):
         observations_by_camera = {}
 
         for idx, card in enumerate(self.cards):
-            observation = getattr(card, "_last_observation", None)
+            observation = getattr(card, "_latched_fusion_observation", None)
 
             if card.detector is None or observation is None:
                 continue
@@ -824,12 +894,12 @@ class CamerasPage(QWidget):
             },
             "labels=",
             {
-                idx: getattr(getattr(self.cards[idx], "_last_observation", None), "best_label", None)
+                idx: getattr(getattr(self.cards[idx], "_latched_fusion_observation", None), "best_label", None)
                 for idx in range(len(self.cards))
             },
             "topdown=",
             {
-                idx: getattr(getattr(self.cards[idx], "_last_observation", None), "best_topdown_point", None)
+                idx: getattr(getattr(self.cards[idx], "_latched_fusion_observation", None), "best_topdown_point", None)
                 for idx in range(len(self.cards))
             },
         )

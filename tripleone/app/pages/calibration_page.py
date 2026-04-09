@@ -48,6 +48,7 @@ from vision.calibration_geometry import (
     build_pipeline_points,
     calculate_hit_from_image_point,
     compute_bull_from_manual_points,
+    generate_ring_polylines_image,
 )
 from vision.camera_manager import CameraWorker
 from vision.dart_detector import DartDetector
@@ -123,7 +124,9 @@ class CalibrationCard(QFrame):
             "- P4 = 11|14\n"
             "- Bull wird automatisch berechnet\n"
             "- Rechtsklick = Präzisions-Testpunkt\n"
-            "- Enter bestätigt Testpunkt"
+            "- Enter bestätigt Testpunkt\n"
+            "- Tasten 1/2/3/4 wählen P1/P2/P3/P4\n"
+            "- Pfeiltasten = 1 px | Shift = 5 px"
         )
         self.help_label.setWordWrap(True)
         self.help_label.setStyleSheet("font-size: 12px; color: #d8d8d8;")
@@ -440,6 +443,98 @@ class CalibrationCard(QFrame):
         arr = np.frombuffer(ptr, dtype=np.uint8).reshape((height, width, 4))
         return cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
 
+    def _build_board_mask(self, frame_shape) -> Optional[np.ndarray]:
+        """
+        Baut eine Maske für den eigentlichen Dartboard-Bereich.
+        Grundlage ist der äußerste Ring des Kalibrierungs-Overlays.
+        """
+        calibration = self.get_calibration_config()
+        polylines = generate_ring_polylines_image(calibration, degree_step=3)
+
+        if not polylines:
+            return None
+
+        outer_ring = polylines[0]
+        if outer_ring is None or len(outer_ring) < 8:
+            return None
+
+        if len(frame_shape) == 3:
+            height, width = frame_shape[:2]
+        else:
+            height, width = frame_shape
+
+        mask = np.zeros((height, width), dtype=np.uint8)
+
+        pts = np.round(np.asarray(outer_ring, dtype=np.float32)).astype(np.int32)
+        pts = pts.reshape(-1, 1, 2)
+
+        cv2.fillPoly(mask, [pts], 255)
+
+        # Kleine Reserve, damit Draht / Spitze am Rand nicht abgeschnitten werden
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
+        mask = cv2.dilate(mask, kernel, iterations=1)
+
+        return mask
+
+    def _apply_board_mask_to_frame(self, frame_bgr: np.ndarray) -> np.ndarray:
+        """
+        Blendet alles außerhalb des Boards aus.
+        """
+        mask = self._build_board_mask(frame_bgr.shape)
+        if mask is None:
+            return frame_bgr.copy()
+
+        return cv2.bitwise_and(frame_bgr, frame_bgr, mask=mask)
+
+    def _build_board_mask(self, frame_shape: tuple[int, int, int] | tuple[int, int]) -> Optional[np.ndarray]:
+        """
+        Baut eine Binärmaske für den eigentlichen Dartboard-Bereich.
+
+        Grundlage:
+        - äußerster Ring aus generate_ring_polylines_image(...)
+        - daraus gefülltes Polygon
+        - leicht dilatiert, damit Draht / Barrel / Spitze am Rand nicht abgeschnitten werden
+        """
+        calibration = self.get_calibration_config()
+        polylines = generate_ring_polylines_image(calibration, degree_step=3)
+
+        if not polylines:
+            return None
+
+        outer_ring = polylines[0]
+        if outer_ring is None or len(outer_ring) < 8:
+            return None
+
+        if len(frame_shape) == 3:
+            height, width = frame_shape[:2]
+        else:
+            height, width = frame_shape
+
+        mask = np.zeros((height, width), dtype=np.uint8)
+
+        pts = np.round(np.asarray(outer_ring, dtype=np.float32)).astype(np.int32)
+        pts = pts.reshape(-1, 1, 2)
+
+        cv2.fillPoly(mask, [pts], 255)
+
+        # Leichte Sicherheitsreserve rund um das Board
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
+        mask = cv2.dilate(mask, kernel, iterations=1)
+
+        return mask
+
+    def _apply_board_mask_to_frame(self, frame_bgr: np.ndarray) -> np.ndarray:
+        """
+        Blendet alles außerhalb des Dartboards aus, damit der Detector
+        nur auf dem Board arbeitet.
+        """
+        mask = self._build_board_mask(frame_bgr.shape)
+        if mask is None:
+            return frame_bgr.copy()
+
+        masked = cv2.bitwise_and(frame_bgr, frame_bgr, mask=mask)
+        return masked
+
     def update_preview(self, image: QImage) -> None:
         self.preview.set_frame(image)
 
@@ -452,7 +547,12 @@ class CalibrationCard(QFrame):
         if self.last_frame_bgr is None:
             return
 
-        detection = self.detector.process_frame(self.last_frame_bgr, self.get_calibration_config())
+        detector_frame = self._apply_board_mask_to_frame(self.last_frame_bgr)
+
+        detection = self.detector.process_frame(
+            detector_frame,
+            self.get_calibration_config(),
+        )
         self._update_debug_label()
 
         if detection is not None:
@@ -474,7 +574,12 @@ class CalibrationCard(QFrame):
             self.detector_status_label.setText("Detector: kein Livebild für Referenz vorhanden")
             return
 
-        ok = self.detector.set_reference_frame(self.last_frame_bgr, self.get_calibration_config())
+        detector_frame = self._apply_board_mask_to_frame(self.last_frame_bgr)
+
+        ok = self.detector.set_reference_frame(
+            detector_frame,
+            self.get_calibration_config(),
+        )
         if ok:
             self.auto_result_label.setText("Auto-Dart: noch keiner")
             self.detector_status_label.setText("Detector: leeres Board gespeichert")

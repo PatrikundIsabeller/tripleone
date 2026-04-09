@@ -124,6 +124,11 @@ class CalibrationPreview(QWidget):
         points = deepcopy(config.get("points", []))
         self._manual_points = points[:4]
 
+        if self._active_point_index is None and len(self._manual_points) >= 1:
+            self._active_point_index = 0
+        elif self._active_point_index is not None and self._active_point_index >= len(self._manual_points):
+            self._active_point_index = max(0, len(self._manual_points) - 1) if self._manual_points else None
+
         self.update()
 
     # ------------------------------------------------------------
@@ -575,6 +580,31 @@ class CalibrationPreview(QWidget):
         self.update()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
+        # Direkte Auswahl des aktiven Kalibrierpunkts per Tastatur:
+        # 1 = P1, 2 = P2, 3 = P3, 4 = P4
+        if event.key() == Qt.Key.Key_1:
+            if len(self._manual_points) >= 1:
+                self._active_point_index = 0
+                self.update()
+            return
+
+        if event.key() == Qt.Key.Key_2:
+            if len(self._manual_points) >= 2:
+                self._active_point_index = 1
+                self.update()
+            return
+
+        if event.key() == Qt.Key.Key_3:
+            if len(self._manual_points) >= 3:
+                self._active_point_index = 2
+                self.update()
+            return
+
+        if event.key() == Qt.Key.Key_4:
+            if len(self._manual_points) >= 4:
+                self._active_point_index = 3
+                self.update()
+            return
         # Pending-Testpunkt hat Vorrang
         if self._pending_test_point is not None:
             x_px, y_px = self._pending_test_point

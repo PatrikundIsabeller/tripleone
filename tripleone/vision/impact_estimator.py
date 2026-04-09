@@ -205,35 +205,39 @@ class ImpactEstimationResult:
 class ImpactEstimatorConfig:
     """
     Konfiguration der Impact-Schätzung.
-    """
-    strategy: str = "blend"
 
-    use_candidate_default: bool = True
-    use_lowest_contour_point: bool = True
-    use_major_axis_lower_endpoint: bool = True
+    LIVE-DEFAULTS:
+    Für echte Mehrkamera-Setups wird die Spitze relativ zum Boardzentrum gesucht,
+    nicht relativ zur Bildrichtung nach unten.
+    """
+    strategy: str = "centerward_tip_consensus"
+
+    use_candidate_default: bool = False
+    use_lowest_contour_point: bool = False
+    use_major_axis_lower_endpoint: bool = False
     use_major_axis_centerward_endpoint: bool = True
     use_centerward_contour_tip: bool = True
-    use_directional_contour_tip: bool = True
+    use_directional_contour_tip: bool = False
 
-    weight_candidate_default: float = 0.15
-    weight_lowest_contour_point: float = 0.10
-    weight_major_axis_lower_endpoint: float = 0.10
-    weight_major_axis_centerward_endpoint: float = 0.35
-    weight_centerward_contour_tip: float = 0.35
-    weight_directional_contour_tip: float = 2.10
+    weight_candidate_default: float = 0.00
+    weight_lowest_contour_point: float = 0.00
+    weight_major_axis_lower_endpoint: float = 0.00
+    weight_major_axis_centerward_endpoint: float = 1.00
+    weight_centerward_contour_tip: float = 0.90
+    weight_directional_contour_tip: float = 0.00
 
     min_major_axis_length_for_axis_based_methods: float = 10.0
     min_aspect_ratio_for_axis_based_methods: float = 1.15
     min_candidate_confidence: float = 0.01
 
-    directional_tip_band_fraction: float = 0.15
-    directional_tip_top_k_points: int = 8
+    directional_tip_band_fraction: float = 0.12
+    directional_tip_top_k_points: int = 4
 
-    centerward_tip_top_k_points: int = 12
-    centerward_tip_distance_weight: float = 0.70
-    centerward_tip_forward_weight: float = 0.30
+    centerward_tip_top_k_points: int = 6
+    centerward_tip_distance_weight: float = 0.85
+    centerward_tip_forward_weight: float = 0.15
     centerward_tip_requires_axis_agreement: bool = True
-    centerward_tip_max_distance_from_centerward_axis_px: float = 35.0
+    centerward_tip_max_distance_from_centerward_axis_px: float = 20.0
 
     consistency_distance_scale_px: float = 12.0
     weight_source_candidate_confidence: float = 0.60
@@ -243,40 +247,26 @@ class ImpactEstimatorConfig:
     keep_debug_metadata: bool = True
 
     # --------------------------------------------------------------
-    # NEU: boardnahe Konturspitze für große Dartkonturen
+    # Boardnahe Konturspitze für große Dartkonturen
+    # LIVE-DEFAULT: AN
     # --------------------------------------------------------------
-    use_board_near_contour_tip: bool = True
+    use_board_near_contour_tip: bool = False
 
-    # Nur die konturpunkte betrachten, die grob in Richtung Boardzentrum liegen
-    board_near_tip_top_k_points: int = 3
-
-    # Wie stark Punkte bevorzugt werden, die näher am Boardzentrum liegen
-    board_near_tip_distance_weight: float = 1.40
-
-    # Wie stark Punkte bevorzugt werden, die entlang der Dart-Richtung "nach vorne"
-    # in Richtung Boardzentrum zeigen
-    board_near_tip_forward_weight: float = 2.20
-
-    # Maximal erlaubter Abstand zur Hauptachsen-Referenz, damit wir nicht auf
-    # völlig irrelevante Konturäste springen
-    board_near_tip_max_distance_from_axis_px: float = 18.0
-
-    # Gewicht dieser Hypothese im Blend
-    weight_board_near_contour_tip: float = 0.35
-
+    board_near_tip_top_k_points: int = 2
+    board_near_tip_distance_weight: float = 1.50
+    board_near_tip_forward_weight: float = 2.40
+    board_near_tip_max_distance_from_axis_px: float = 14.0
+    weight_board_near_contour_tip: float = 0.00
     # --------------------------------------------------------------
-    # NEU: Live-Tuning für echte Dartspitze
+    # Live-Tuning
     # --------------------------------------------------------------
-    tip_preference_enabled: bool = True
+    tip_preference_enabled: bool = False
 
-    # Referenzpunkt für echte Spitze
-    tip_reference_mode: str = "lowest_contour_point"   # oder "major_axis_lower_endpoint"
+    tip_reference_mode: str = "lowest_contour_point"
 
-    # Distanzgrenzen zur Referenzspitze
     tip_reference_soft_distance_px: float = 18.0
     tip_reference_hard_distance_px: float = 42.0
 
-    # Zusätzliche Multiplikatoren für spitzennähere Hypothesen
     directional_tip_live_bonus: float = 1.35
     lowest_point_live_bonus: float = 1.20
     major_axis_lower_live_bonus: float = 1.12
@@ -284,8 +274,7 @@ class ImpactEstimatorConfig:
     board_near_live_penalty: float = 0.30
     candidate_default_live_penalty: float = 0.45
 
-    # Blendpunkt stärker zur besten spitzennahen Hypothese ziehen
-    blend_tip_pull_enabled: bool = True
+    blend_tip_pull_enabled: bool = False
     blend_tip_pull_strength: float = 0.72
 
 
@@ -478,12 +467,6 @@ def _centerward_contour_tip_from_candidate(
 ) -> Optional[PointF]:
     """
     Wählt eine Spitzen-Schätzung direkt aus den Konturpunkten.
-
-    Idee:
-    - Betrachte alle Konturpunkte des Kandidaten
-    - bevorzuge Punkte, die näher am Boardzentrum liegen
-    - bevorzuge zusätzlich Punkte, die entlang der Dart-Hauptachse "vorne"
-      liegen, also in Richtung Zentrum zeigen
     """
     contour = getattr(candidate, "contour", None)
     if contour is None or len(contour) < 3:
@@ -619,7 +602,9 @@ class ImpactEstimator:
         if not hypotheses:
             return None
 
-        hypotheses = self._reweight_hypotheses_for_live_tip(candidate, hypotheses)
+        # Live-Reweighting nur wenn explizit aktiviert
+        if self.config.tip_preference_enabled:
+            hypotheses = self._reweight_hypotheses_for_live_tip(candidate, hypotheses)
 
         chosen_point, method, aggregate_strength, spread_px = self._choose_final_point(candidate, hypotheses)
 
@@ -640,6 +625,9 @@ class ImpactEstimator:
                 "strategy": self.config.strategy,
                 "tip_reference_point": self._get_tip_reference_point(candidate),
                 "live_tip_preference_enabled": bool(self.config.tip_preference_enabled),
+                "chosen_method": str(method),
+                "chosen_point": (float(chosen_point[0]), float(chosen_point[1])),
+                "available_hypotheses": [hyp.name for hyp in hypotheses],
             }
 
         return ImpactEstimate(
@@ -907,14 +895,6 @@ class ImpactEstimator:
     ) -> Optional[tuple[PointF, dict[str, Any]]]:
         """
         Sucht auf der Kontur gezielt die boardnahe Spitze.
-
-        Idee:
-        - Konturpunkte nehmen
-        - Boardzentrum aus candidate.debug lesen
-        - Punkte bevorzugen, die:
-          1) näher zum Boardzentrum liegen
-          2) entlang der Hauptachse plausibel liegen
-          3) nicht weit seitlich von der Dartachse abweichen
         """
         if not self.config.use_board_near_contour_tip:
             return None
@@ -966,15 +946,12 @@ class ImpactEstimator:
                 if axis_distance > float(self.config.board_near_tip_max_distance_from_axis_px):
                     continue
 
-                # Nur Punkte auf der boardnahen Achsenhälfte zulassen.
-                # Damit fliegen obere/flight-nahe Punkte raus.
                 rel = (point[0] - axis_a[0], point[1] - axis_a[1])
                 t = (rel[0] * axis_vec[0] + rel[1] * axis_vec[1]) / axis_len_sq
 
                 da = math.hypot(axis_a[0] - board_center[0], axis_a[1] - board_center[1])
                 db = math.hypot(axis_b[0] - board_center[0], axis_b[1] - board_center[1])
 
-                # Wenn axis_b boardnaher ist, wollen wir nur den unteren/boardnahen Teil.
                 if db <= da:
                     if t < 0.55:
                         continue
@@ -1007,9 +984,6 @@ class ImpactEstimator:
         top_k = max(1, int(self.config.board_near_tip_top_k_points))
         selected = scored_points[:top_k]
 
-        # Für die boardnahe Spitze darf nicht zu stark über die ganze Kontur gemittelt werden.
-        # Deshalb nehmen wir den besten Punkt direkt, oder nur ein sehr lokales Mittel
-        # der wenigen besten Punkte.
         if top_k <= 1 or len(selected) == 1:
             best_point = selected[0][1]
         else:
@@ -1269,6 +1243,107 @@ class ImpactEstimator:
 
         return hypotheses
 
+    def _choose_tip_consensus_point(
+        self,
+        hypotheses: list[ImpactHypothesis],
+    ) -> tuple[PointF, str, float, float]:
+        """
+        Robuste Spitzenwahl aus den wirklich spitzenrelevanten Hypothesen.
+
+        Idee:
+        - Nur lowest_contour_point, major_axis_lower_endpoint und
+          directional_contour_tip berücksichtigen
+        - Daraus den geometrischen Medianbereich bestimmen
+        - Dann den Hypothesenpunkt wählen, der diesem Konsens am nächsten liegt
+
+        Warum:
+        - stabiler als blend mit zu vielen Nebenhypothesen
+        - besser debugbar
+        - weniger anfällig für "kluge", aber falsche centerward-/board-near-Ausreißer
+        """
+        preferred_names = {
+            "lowest_contour_point",
+            "major_axis_lower_endpoint",
+            "directional_contour_tip",
+        }
+
+        active = [h for h in hypotheses if h.name in preferred_names]
+        if not active:
+            active = list(hypotheses)
+
+        if len(active) == 1:
+            chosen = active[0]
+            spread_px = _compute_point_spread(chosen.point, [h.point for h in active])
+            return chosen.point, f"tip_consensus:{chosen.name}", float(chosen.final_weight), float(spread_px)
+
+        pts = np.asarray([h.point for h in active], dtype=np.float64)
+
+        # Median ist robuster gegen einzelne Ausreißer als ein gewichteter Mittelwert.
+        median_x = float(np.median(pts[:, 0]))
+        median_y = float(np.median(pts[:, 1]))
+        median_point = (median_x, median_y)
+
+        def sort_key(h: ImpactHypothesis) -> tuple[float, float]:
+            dist = _point_distance(h.point, median_point)
+            # Erst Nähe zum Median, dann bei Gleichstand höheres Gewicht bevorzugen.
+            return (dist, -float(h.final_weight))
+
+        chosen = sorted(active, key=sort_key)[0]
+
+        aggregate_strength = float(np.mean([max(h.final_weight, 1e-9) for h in active]))
+        spread_px = _compute_point_spread(chosen.point, [h.point for h in active])
+
+        return chosen.point, f"tip_consensus:{chosen.name}", aggregate_strength, spread_px
+
+    def _choose_centerward_tip_consensus_point(
+        self,
+        hypotheses: list[ImpactHypothesis],
+    ) -> tuple[PointF, str, float, float]:
+        """
+        Robuste Spitzenwahl für Mehrkamera-Setups.
+
+        Verwendet nur board-zentrumsbezogene Hypothesen:
+        - major_axis_centerward_endpoint
+        - centerward_contour_tip
+        - board_near_contour_tip
+
+        Idee:
+        - Medianpunkt dieser centerward-Hypothesen bestimmen
+        - dann die Hypothese wählen, die diesem Konsens am nächsten liegt
+        - bei Gleichstand die mit höherem Gewicht bevorzugen
+        """
+        preferred_names = {
+            "major_axis_centerward_endpoint",
+            "centerward_contour_tip",
+            "board_near_contour_tip",
+        }
+
+        active = [h for h in hypotheses if h.name in preferred_names]
+        if not active:
+            active = list(hypotheses)
+
+        if len(active) == 1:
+            chosen = active[0]
+            spread_px = _compute_point_spread(chosen.point, [h.point for h in active])
+            return chosen.point, f"centerward_tip_consensus:{chosen.name}", float(chosen.final_weight), float(spread_px)
+
+        pts = np.asarray([h.point for h in active], dtype=np.float64)
+
+        median_x = float(np.median(pts[:, 0]))
+        median_y = float(np.median(pts[:, 1]))
+        median_point = (median_x, median_y)
+
+        def sort_key(h: ImpactHypothesis) -> tuple[float, float]:
+            dist = _point_distance(h.point, median_point)
+            return (dist, -float(h.final_weight))
+
+        chosen = sorted(active, key=sort_key)[0]
+
+        aggregate_strength = float(np.mean([max(h.final_weight, 1e-9) for h in active]))
+        spread_px = _compute_point_spread(chosen.point, [h.point for h in active])
+
+        return chosen.point, f"centerward_tip_consensus:{chosen.name}", aggregate_strength, spread_px
+
     def _choose_final_point(
         self,
         candidate: DartCandidate,
@@ -1295,6 +1370,9 @@ class ImpactEstimator:
             "board_near_contour_tip",
         }
 
+        if strategy == "centerward_tip_consensus":
+            return self._choose_centerward_tip_consensus_point(hypotheses)
+
         if strategy in supported_direct_strategies:
             if strategy not in available_by_name:
                 raise ValueError(
@@ -1314,20 +1392,17 @@ class ImpactEstimator:
         if strategy != "blend":
             raise ValueError(
                 "Unsupported impact estimator strategy. Expected one of: "
-                "'blend', 'best_hypothesis', 'candidate_default', "
-                "'lowest_contour_point', 'major_axis_lower_endpoint', "
-                "'major_axis_centerward_endpoint', "
-                "'centerward_contour_tip', "
-                "'directional_contour_tip'."
+                "'centerward_tip_consensus', 'blend', 'best_hypothesis', "
+                "'candidate_default', 'lowest_contour_point', "
+                "'major_axis_lower_endpoint', 'major_axis_centerward_endpoint', "
+                "'centerward_contour_tip', 'directional_contour_tip', "
                 "'board_near_contour_tip'."
             )
 
-        # Blend nur aus den spitzenrelevanten Hypothesen bilden.
         preferred_names = {
-            "lowest_contour_point",
-            "major_axis_lower_endpoint",
-            "directional_contour_tip",
             "major_axis_centerward_endpoint",
+            "centerward_contour_tip",
+            "board_near_contour_tip",
         }
 
         preferred_hypotheses = [
@@ -1336,8 +1411,6 @@ class ImpactEstimator:
             if hypothesis.name in preferred_names
         ]
 
-        # Fallback:
-        # Wenn davon zu wenig vorhanden sind, nehme wieder alle Hypothesen.
         active_hypotheses = preferred_hypotheses if len(preferred_hypotheses) >= 2 else hypotheses
 
         weights = np.asarray(
@@ -1349,17 +1422,10 @@ class ImpactEstimator:
         weighted_point = np.average(points, axis=0, weights=weights)
         chosen_point = (float(weighted_point[0]), float(weighted_point[1]))
 
-        chosen_point = self._pull_blend_towards_tip_reference(
-            candidate=candidate,
-            blended_point=chosen_point,
-            hypotheses=active_hypotheses,
-        )
-
         aggregate_strength = float(np.mean(weights))
         spread_px = _compute_weighted_spread(chosen_point, active_hypotheses)
 
         return chosen_point, "blend", aggregate_strength, spread_px
-
 
     def _combine_confidence(
         self,
