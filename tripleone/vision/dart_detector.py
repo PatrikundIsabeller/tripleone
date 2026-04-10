@@ -21,6 +21,11 @@ import cv2
 import numpy as np
 
 from vision.board_model import calculate_board_hit_from_image_point
+from vision.calibration_geometry import (
+    compute_homography_image_to_topdown,
+    image_to_topdown_point,
+    topdown_to_image_point,
+)
 
 
 @dataclass
@@ -89,11 +94,28 @@ class DartDetector:
         self.last_detection: Optional[DartDetectionResult] = None
 
         self.topdown_size: int = 900
+
+        # WICHTIG:
+        # Die eigentliche Bild->Topdown-Geometrie kommt jetzt aus
+        # calibration_geometry.py, damit Kalibrierungs-Overlay,
+        # manueller Testpunkt und Auto-Dart dieselbe Welt benutzen.
         self.board_center_topdown: Tuple[float, float] = (
             self.topdown_size / 2.0,
             self.topdown_size / 2.0,
         )
         self.outer_double_radius_topdown: float = self.topdown_size * 0.36
+
+        # Robuste Spitzenwahl:
+        # Nicht einfach den äußersten Konturpunkt nehmen,
+        # sondern die centerward-Spitze entlang der Hauptachse.
+        self.tip_endpoint_band_fraction: float = 0.10
+        self.tip_endpoint_top_k_points: int = 1
+        self.tip_centerward_axis_max_distance_px: float = 10.0
+
+        # Debug-Offset für den zurückprojizierten Kamera-Tippunkt.
+        # Nur zum Testen, ob der Auto-Punkt systematisch zu hoch liegt.
+        self.debug_camera_tip_offset_x: int = 0
+        self.debug_camera_tip_offset_y: int = 0
 
         self._last_debug = DartDebugSnapshot(
             is_armed=False,
@@ -178,57 +200,25 @@ class DartDetector:
         self._set_debug(info_text="Detector scharf")
         return True
 
-    def _extract_src_points(self, calibration: Dict) -> Optional[np.ndarray]:
-        points = calibration.get("points", [])
-        if len(points) < 5:
-            return None
+    
 
-        src = []
-        for item in points[:4]:
-            if not isinstance(item, dict):
-                return None
-            src.append([float(item.get("x_px", 0)), float(item.get("y_px", 0))])
+    
 
-        if len(src) != 4:
-            return None
-
-        return np.array(src, dtype=np.float32)
-
-    def _dest_point_on_outer_double(self, boundary_angle_deg: float) -> Tuple[float, float]:
-        cx, cy = self.board_center_topdown
-        r = self.outer_double_radius_topdown
-        a = math.radians(boundary_angle_deg)
-        x = cx + math.cos(a) * r
-        y = cy - math.sin(a) * r
-        return x, y
-
-    def _topdown_destination_points(self) -> np.ndarray:
-        """
-        Feste Zielpunkte auf dem Outer-Double-Draht.
-
-        Grenzen:
-        P1 = 20|1   -> 81°
-        P2 = 6|10   -> 351°
-        P3 = 3|19   -> 261°
-        P4 = 11|14  -> 171°
-        """
-        p1 = self._dest_point_on_outer_double(81.0)
-        p2 = self._dest_point_on_outer_double(351.0)
-        p3 = self._dest_point_on_outer_double(261.0)
-        p4 = self._dest_point_on_outer_double(171.0)
-        return np.array([p1, p2, p3, p4], dtype=np.float32)
-
+    
     def _compute_homography(self, calibration: Dict) -> Optional[np.ndarray]:
-        src = self._extract_src_points(calibration)
-        if src is None:
+        """
+        Verwendet jetzt dieselbe Homography wie das Kalibrierungs-Overlay.
+        """
+        try:
+            return compute_homography_image_to_topdown(calibration)
+        except Exception:
             return None
-        dst = self._topdown_destination_points()
-        return cv2.getPerspectiveTransform(src, dst)
 
     def _warp_to_topdown(self, frame_bgr: np.ndarray, calibration: Dict) -> Optional[np.ndarray]:
         matrix = self._compute_homography(calibration)
         if matrix is None:
             return None
+
         return cv2.warpPerspective(
             frame_bgr,
             matrix,
@@ -256,12 +246,19 @@ class DartDetector:
         return True
 
     def _build_circular_board_mask(self) -> np.ndarray:
+        """
+        Debug-Test:
+        Vorübergehend KEINE alte Kreis-Maske mehr verwenden.
+
+        Hintergrund:
+        Nach Umstellung auf die zentrale Homography aus calibration_geometry.py
+        kann die frühere feste Kreis-Maske mit Radius topdown_size * 0.36
+        das Board am Rand falsch abschneiden.
+
+        Deshalb hier testweise volle Top-Down-Fläche freigeben.
+        """
         s = self.topdown_size
-        mask = np.zeros((s, s), dtype=np.uint8)
-        center = (int(self.board_center_topdown[0]), int(self.board_center_topdown[1]))
-        radius = int(self.outer_double_radius_topdown * 1.02)
-        cv2.circle(mask, center, radius, 255, thickness=-1, lineType=cv2.LINE_AA)
-        return mask
+        return np.full((s, s), 255, dtype=np.uint8)
 
     def _build_diff_mask(self, frame_bgr: np.ndarray, calibration: Dict) -> Optional[np.ndarray]:
         if self.reference_topdown_gray is None:
@@ -326,25 +323,13 @@ class DartDetector:
         self,
         contour: np.ndarray,
     ) -> Tuple[Optional[Tuple[int, int]], Optional[float], str]:
-        pts = contour.reshape(-1, 2)
-        if len(pts) == 0:
-            return None, None, "Leere Kontur"
+        """
+        Öffentlicher Spitzenfinder für den Detector.
 
-        cx, cy = self.board_center_topdown
-        dx = pts[:, 0] - cx
-        dy = pts[:, 1] - cy
-        dists = np.sqrt(dx * dx + dy * dy)
-
-        tip_index = int(np.argmax(dists))
-        tip = pts[tip_index]
-        tip_x = int(tip[0])
-        tip_y = int(tip[1])
-
-        tip_radius = float(dists[tip_index] / self.outer_double_radius_topdown)
-        if tip_radius > 1.12:
-            return None, None, f"Tip zu weit außen ({tip_radius:.3f})"
-
-        return (tip_x, tip_y), tip_radius, "OK"
+        Nutzt jetzt die robuste centerward-Achsenlogik
+        statt einfach den äußersten Konturpunkt.
+        """
+        return self._topdown_tip_from_contour_centerward(contour)
 
     def _pca_direction(self, contour: np.ndarray) -> Optional[np.ndarray]:
         pts = contour.reshape(-1, 2).astype(np.float32)
@@ -361,6 +346,117 @@ class DartDetector:
             return None
 
         return direction / norm
+
+    def _topdown_tip_from_contour_centerward(
+        self,
+        contour: np.ndarray,
+    ) -> Tuple[Optional[Tuple[int, int]], Optional[float], str]:
+        """
+        Robuste Spitzenwahl im Top-Down.
+
+        Idee:
+        - Hauptachse der Kontur bestimmen
+        - das Ende wählen, das NÄHER am Boardzentrum liegt
+        - nur Konturpunkte in der Nähe dieses Endes betrachten
+        - daraus einen stabilen Spitzenpunkt mitteln
+
+        Warum:
+        Der bisherige Ansatz "äußerster Konturpunkt" trifft in deinem Setup
+        häufig Barrel/Körper statt die echte Spitze.
+        """
+        pts = contour.reshape(-1, 2).astype(np.float32)
+        if len(pts) < 5:
+            return None, None, "Zu wenige Konturpunkte"
+
+        cx, cy = self.board_center_topdown
+        center = np.array([cx, cy], dtype=np.float32)
+
+        # PCA-Hauptachse
+        mean, eigenvectors = cv2.PCACompute(pts, mean=None)
+        if mean is None or eigenvectors is None or len(eigenvectors) == 0:
+            return None, None, "PCA fehlgeschlagen"
+
+        axis = eigenvectors[0].astype(np.float32)
+        axis_norm = float(np.linalg.norm(axis))
+        if axis_norm < 1e-6:
+            return None, None, "Achse ungültig"
+        axis /= axis_norm
+
+        mean_pt = mean[0].astype(np.float32)
+
+        # Projektion aller Punkte auf die Hauptachse
+        centered = pts - mean_pt[None, :]
+        proj = centered @ axis
+
+        min_idx = int(np.argmin(proj))
+        max_idx = int(np.argmax(proj))
+
+        endpoint_a = pts[min_idx]
+        endpoint_b = pts[max_idx]
+
+        # CENTERWARD-Ende wählen = näher am Boardzentrum
+        dist_a = float(np.linalg.norm(endpoint_a - center))
+        dist_b = float(np.linalg.norm(endpoint_b - center))
+
+        if dist_a <= dist_b:
+            centerward_endpoint = endpoint_a
+            outward_endpoint = endpoint_b
+        else:
+            centerward_endpoint = endpoint_b
+            outward_endpoint = endpoint_a
+
+        axis_vec = centerward_endpoint - outward_endpoint
+        axis_len = float(np.linalg.norm(axis_vec))
+        if axis_len < 1e-6:
+            tip_x = int(round(float(centerward_endpoint[0])))
+            tip_y = int(round(float(centerward_endpoint[1])))
+            tip_radius = float(np.linalg.norm(centerward_endpoint - center) / self.outer_double_radius_topdown)
+            return (tip_x, tip_y), tip_radius, "OK"
+
+        axis_unit = axis_vec / axis_len
+
+        # Punkte nahe am centerward-Ende auswählen
+        forward = (pts - outward_endpoint[None, :]) @ axis_unit
+        max_forward = float(np.max(forward))
+        min_keep = max_forward - (self.tip_endpoint_band_fraction * axis_len)
+
+        candidates = []
+        for i, point in enumerate(pts):
+            if float(forward[i]) < min_keep:
+                continue
+
+            # Seitlichen Abstand zur Achse begrenzen
+            rel = point - outward_endpoint
+            proj_len = float(rel @ axis_unit)
+            proj_point = outward_endpoint + (proj_len * axis_unit)
+            axis_dist = float(np.linalg.norm(point - proj_point))
+
+            if axis_dist > self.tip_centerward_axis_max_distance_px:
+                continue
+
+            candidates.append((float(forward[i]), point))
+
+        if not candidates:
+            # Fallback auf centerward endpoint
+            tip_x = int(round(float(centerward_endpoint[0])))
+            tip_y = int(round(float(centerward_endpoint[1])))
+            tip_radius = float(np.linalg.norm(centerward_endpoint - center) / self.outer_double_radius_topdown)
+            if tip_radius > 1.12:
+                return None, None, f"Tip zu weit außen ({tip_radius:.3f})"
+            return (tip_x, tip_y), tip_radius, "OK"
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        selected = candidates[: max(1, int(self.tip_endpoint_top_k_points))]
+        chosen = selected[0][1]
+
+        tip_x = int(round(float(chosen[0])))
+        tip_y = int(round(float(chosen[1])))
+        tip_radius = float(np.linalg.norm(chosen - center) / self.outer_double_radius_topdown)
+
+        if tip_radius > 1.12:
+            return None, None, f"Tip zu weit außen ({tip_radius:.3f})"
+
+        return (tip_x, tip_y), tip_radius, "OK"
 
     def _score_candidate(
         self,
@@ -468,21 +564,23 @@ class DartDetector:
         tip_topdown: Tuple[int, int],
         calibration: Dict,
     ) -> Optional[Tuple[int, int]]:
-        src = self._extract_src_points(calibration)
-        if src is None:
+        """
+        Rückprojektion über dieselbe zentrale Geometrie wie das Overlay.
+        """
+        try:
+            mapped = topdown_to_image_point(
+                calibration,
+                float(tip_topdown[0]),
+                float(tip_topdown[1]),
+            )
+        except Exception:
             return None
 
-        dst = self._topdown_destination_points()
-        inverse_matrix = cv2.getPerspectiveTransform(dst, src)
+        if mapped is None:
+            return None
 
-        point = np.array(
-            [[[float(tip_topdown[0]), float(tip_topdown[1])]]],
-            dtype=np.float32,
-        )
-        mapped = cv2.perspectiveTransform(point, inverse_matrix)
-
-        x_px = int(round(float(mapped[0, 0, 0])))
-        y_px = int(round(float(mapped[0, 0, 1])))
+        x_px = int(round(float(mapped[0])))
+        y_px = int(round(float(mapped[1])))
         return x_px, y_px
 
     def process_frame(
@@ -611,6 +709,17 @@ class DartDetector:
             return None
 
         cam_x, cam_y = camera_tip
+        # Debug: Konsistenzcheck Kamera -> Topdown
+        try:
+            td = image_to_topdown_point(float(cam_x), float(cam_y), calibration)
+        except Exception:
+            td = None
+        # Debug-Test:
+        # Auto-Punkt im Kamerabild bewusst verschieben, um zu prüfen,
+        # ob der aktuell gewählte Punkt systematisch zu hoch liegt.
+        cam_x += int(self.debug_camera_tip_offset_x)
+        cam_y += int(self.debug_camera_tip_offset_y)
+
         hit = calculate_board_hit_from_image_point(cam_x, cam_y, calibration)
 
         if hit is None:

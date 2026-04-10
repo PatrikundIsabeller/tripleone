@@ -246,22 +246,25 @@ class CalibrationPreview(QWidget):
         show_sector_lines = bool(self._overlay_config.get("show_sector_lines", True))
         show_numbers = bool(self._overlay_config.get("show_numbers", True))
 
+        show_filled_segments = bool(self._overlay_config.get("show_filled_segments", True))
+
         # 20er-Segment rot
-        poly20 = generate_twenty_segment_polygon_image(pipeline_points)
-        if poly20 is not None and len(poly20) >= 3:
-            path = QPainterPath()
-            first = self._image_to_widget(poly20[0, 0], poly20[0, 1])
-            path.moveTo(first)
+        if show_filled_segments:
+            poly20 = generate_twenty_segment_polygon_image(pipeline_points)
+            if poly20 is not None and len(poly20) >= 3:
+                path = QPainterPath()
+                first = self._image_to_widget(poly20[0, 0], poly20[0, 1])
+                path.moveTo(first)
 
-            for pt in poly20[1:]:
-                wpt = self._image_to_widget(pt[0], pt[1])
-                path.lineTo(wpt)
+                for pt in poly20[1:]:
+                    wpt = self._image_to_widget(pt[0], pt[1])
+                    path.lineTo(wpt)
 
-            path.closeSubpath()
+                path.closeSubpath()
 
-            painter.setPen(QPen(QColor(255, 140, 170, int(255 * max(0.30, alpha))), 1.2))
-            painter.setBrush(QColor(255, 0, 80, int(255 * max(0.18, alpha * 0.90))))
-            painter.drawPath(path)
+                painter.setPen(QPen(QColor(255, 140, 170, int(255 * max(0.30, alpha))), 1.2))
+                painter.setBrush(QColor(255, 0, 80, int(255 * max(0.18, alpha * 0.90))))
+                painter.drawPath(path)
 
         ring_pen = QPen(QColor(120, 220, 255, int(255 * alpha)), 1.5)
         sector_pen = QPen(QColor(180, 240, 255, int(255 * alpha)), 1.2)

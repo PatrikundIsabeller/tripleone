@@ -146,6 +146,9 @@ class CalibrationCard(QFrame):
         self.show_sector_lines_check = QCheckBox("Sektorlinien anzeigen")
         self.show_sector_lines_check.setChecked(True)
 
+        self.show_filled_segments_check = QCheckBox("Feldfarben anzeigen")
+        self.show_filled_segments_check.setChecked(True)
+
         self.reset_points_button = QPushButton("4 Punkte zurücksetzen")
         self.save_empty_board_button = QPushButton("Leeres Board speichern")
         self.arm_button = QPushButton("Einzeldart scharf")
@@ -205,6 +208,7 @@ class CalibrationCard(QFrame):
         row_checks = QHBoxLayout()
         row_checks.setSpacing(8)
         row_checks.addWidget(self.show_numbers_check)
+        row_checks.addWidget(self.show_filled_segments_check)
         row_checks.addStretch()
         row_checks.addWidget(self.show_sector_lines_check)
 
@@ -233,6 +237,7 @@ class CalibrationCard(QFrame):
         self.alpha_spin.valueChanged.connect(self._push_overlay_to_preview)
         self.show_numbers_check.toggled.connect(self._push_overlay_to_preview)
         self.show_sector_lines_check.toggled.connect(self._push_overlay_to_preview)
+        self.show_filled_segments_check.toggled.connect(self._push_overlay_to_preview)
         self.preview.points_changed.connect(self._handle_points_changed)
         self.preview.test_point_selected.connect(self._handle_test_point_selected)
 
@@ -393,6 +398,7 @@ class CalibrationCard(QFrame):
         self.alpha_spin.setValue(float(calibration_config.get("overlay_alpha", 0.35)))
         self.show_numbers_check.setChecked(bool(calibration_config.get("show_numbers", True)))
         self.show_sector_lines_check.setChecked(bool(calibration_config.get("show_sector_lines", True)))
+        self.show_filled_segments_check.setChecked(bool(calibration_config.get("show_filled_segments", True)))
 
         raw_points = deepcopy(calibration_config.get("points", self._default_manual_points()))
         self._manual_points = raw_points[:4]
@@ -414,6 +420,7 @@ class CalibrationCard(QFrame):
             "overlay_alpha": float(self.alpha_spin.value()),
             "show_numbers": bool(self.show_numbers_check.isChecked()),
             "show_sector_lines": bool(self.show_sector_lines_check.isChecked()),
+            "show_filled_segments": bool(self.show_filled_segments_check.isChecked()),
             "points": self._pipeline_points(),
         }
 
@@ -556,6 +563,11 @@ class CalibrationCard(QFrame):
         self._update_debug_label()
 
         if detection is not None:
+            # Auto-Dart direkt im Bild markieren:
+            # Wir nutzen denselben sichtbaren Punkt wie beim manuellen Testpunkt,
+            # damit sofort erkennbar ist, wo der Detector wirklich misst.
+            self.preview.set_test_point(int(detection.x_px), int(detection.y_px))
+
             self.auto_result_label.setText(
                 f"Auto-Dart: {detection.score_label} = {detection.score_value} | "
                 f"Ring: {detection.ring_name} | "
@@ -581,6 +593,7 @@ class CalibrationCard(QFrame):
             self.get_calibration_config(),
         )
         if ok:
+            self.preview.clear_test_point()
             self.auto_result_label.setText("Auto-Dart: noch keiner")
             self.detector_status_label.setText("Detector: leeres Board gespeichert")
         else:
@@ -591,6 +604,7 @@ class CalibrationCard(QFrame):
     def arm_detector(self) -> None:
         ok = self.detector.arm()
         if ok:
+            self.preview.clear_test_point()
             self.auto_result_label.setText("Auto-Dart: warte auf Einzeldart")
             self.detector_status_label.setText("Detector: scharf für genau einen Dart")
         else:
@@ -600,6 +614,7 @@ class CalibrationCard(QFrame):
 
     def reset_detection(self) -> None:
         self.detector.reset_detection()
+        self.preview.clear_test_point()
         self.auto_result_label.setText("Auto-Dart: noch keiner")
 
         if self.detector.reference_topdown_gray is not None:
