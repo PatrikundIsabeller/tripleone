@@ -1,25 +1,3 @@
-# vision/single_cam_detector.py
-# Zweck:
-# Diese Datei orchestriert die komplette Single-Camera-Pipeline:
-#
-# 1) Kandidaten finden
-#    -> vision/dart_candidate_detector.py
-#
-# 2) finalen Impact-Punkt im Bild schätzen
-#    -> vision/impact_estimator.py
-#
-# 3) finalen Bildpunkt auf ein Dartfeld mappen
-#    -> vision/score_mapper.py
-#
-# WICHTIG:
-# Diese Datei enthält bewusst KEINE eigene:
-# - Board-Geometrie
-# - Ring-/Sektorlogik
-# - Homography-Berechnung
-# - Score-Berechnung
-#
-# Sie ist nur der Orchestrator zwischen den sauberen Schichten.
-
 from __future__ import annotations
 
 import logging
@@ -30,140 +8,91 @@ from typing import Any, Optional
 import cv2
 import numpy as np
 
-# Robuste Imports:
-# - normaler Paketbetrieb
-# - Fallback für direkte Ausführung / Tests
 try:
-    from .dart_candidate_detector import (
-        CandidateDetectionResult,
-        CandidateDetectorConfig,
-        DartCandidateDetector,
-        detect_dart_candidates,
+    from .calibration_geometry import OUTER_DOUBLE_RADIUS_PX, TOPDOWN_CENTER_X, TOPDOWN_CENTER_Y
+    from .dart_candidate_detector import CandidateDetectionResult, CandidateDetectorConfig, DartCandidateDetector
+    from .dart_keypoint_detector import (
+        DartKeypointDetection,
+        DartKeypointDetectionResult,
+        DartKeypointDetector,
+        DartKeypointDetectorConfig,
     )
-    from .impact_estimator import (
-        ImpactEstimate,
-        ImpactEstimationResult,
-        ImpactEstimator,
-        ImpactEstimatorConfig,
-        estimate_impacts_from_detection_result,
-    )
-    from .score_mapper import (
-        ScoreMapper,
-        ScoredHit,
-        build_score_mapper,
-    )
-    from .single_cam_observation import (
-        SingleCamEstimateObservation,
-        SingleCamObservation,
-    )
-    from .calibration_geometry import (
-        TOPDOWN_CENTER_X,
-        TOPDOWN_CENTER_Y,
-        OUTER_DOUBLE_RADIUS_PX,
-    )
+    from .score_mapper import ScoreMapper, ScoredHit, build_score_mapper
+    from .single_cam_observation import SingleCamEstimateObservation, SingleCamObservation
 except ImportError:  # pragma: no cover
-    from vision.dart_candidate_detector import (  # type: ignore
-        CandidateDetectionResult,
-        CandidateDetectorConfig,
-        DartCandidateDetector,
-        detect_dart_candidates,
+    from vision.calibration_geometry import OUTER_DOUBLE_RADIUS_PX, TOPDOWN_CENTER_X, TOPDOWN_CENTER_Y  # type: ignore
+    from vision.dart_candidate_detector import CandidateDetectionResult, CandidateDetectorConfig, DartCandidateDetector  # type: ignore
+    from vision.dart_keypoint_detector import (  # type: ignore
+        DartKeypointDetection,
+        DartKeypointDetectionResult,
+        DartKeypointDetector,
+        DartKeypointDetectorConfig,
     )
-    from vision.impact_estimator import (  # type: ignore
-        ImpactEstimate,
-        ImpactEstimationResult,
-        ImpactEstimator,
-        ImpactEstimatorConfig,
-        estimate_impacts_from_detection_result,
-    )
-    from vision.score_mapper import (  # type: ignore
-        ScoreMapper,
-        ScoredHit,
-        build_score_mapper,
-    )
-    from vision.single_cam_observation import (  # type: ignore
-        SingleCamEstimateObservation,
-        SingleCamObservation,
-    )
-    from vision.calibration_geometry import (  # type: ignore
-        TOPDOWN_CENTER_X,
-        TOPDOWN_CENTER_Y,
-        OUTER_DOUBLE_RADIUS_PX,
-    )
+    from vision.score_mapper import ScoreMapper, ScoredHit, build_score_mapper  # type: ignore
+    from vision.single_cam_observation import SingleCamEstimateObservation, SingleCamObservation  # type: ignore
 
 logger = logging.getLogger(__name__)
-
 PointF = tuple[float, float]
 BBox = tuple[int, int, int, int]
 
 
-# -----------------------------------------------------------------------------
-# Konfiguration
-# -----------------------------------------------------------------------------
 @dataclass(slots=True)
 class SingleCamDetectorConfig:
-    """
-    Konfiguration für die Orchestrierung der Single-Camera-Pipeline.
-
-    Wichtig:
-    Diese Datei trifft keine geometrischen oder scoring-spezifischen
-    Fachentscheidungen. Sie entscheidet nur:
-    - wie viele Impact-Schätzungen weitergescort werden
-    - welche Mindestkonfidenzen gelten
-    - wie die finale Ranking-Konfidenz gemischt wird
-    - ob geometrisch unplausible Off-Board-Kandidaten vor dem Scoring
-      verworfen werden
-    """
-
-    # Wie viele Impact-Schätzungen sollen maximal an den ScoreMapper gehen?
+    detection_backend: str = "keypoint"
+    use_change_trigger: bool = False
+    require_change_trigger_for_detection: bool = False
+    gate_keypoints_with_trigger_boxes: bool = True
+    trigger_bbox_margin_px: int = 50
     max_estimates_to_score: int = 3
-
-    # Wenn False, wird nur die beste Impact-Schätzung gescort.
     score_all_estimates: bool = True
-
-    # Mindestkonfidenzen
     min_impact_confidence: float = 0.01
     min_combined_confidence: float = 0.01
-
-    # Gewichtung für finale Ranking-Konfidenz
-    weight_candidate_confidence: float = 0.40
-    weight_impact_confidence: float = 0.60
-
-    # --------------------------------------------------------------
-    # NEU: Geometrisches Candidate-Pruning
-    # --------------------------------------------------------------
+    weight_candidate_confidence: float = 0.0
+    weight_impact_confidence: float = 1.0
     prune_offboard_estimates_before_scoring: bool = True
-
-    # Toleranz relativ zum Outer-Double-Radius.
-    # 1.00 = exakt Outer Double
-    # 1.03 = kleiner Sicherheitspuffer
     max_board_radius_rel_for_scoring: float = 1.03
-
-    # Optionaler Fallback:
-    # Wenn alle Estimates weggefiltert werden, kann man die Originalmenge
-    # trotzdem weiterreichen. Standardmäßig AUS.
     fallback_to_unpruned_estimates_if_all_filtered: bool = False
-
-    # Debug/Ergebnisverhalten
     keep_debug_images: bool = True
     keep_stage_results: bool = True
     render_stage_overlays: bool = True
 
 
-# -----------------------------------------------------------------------------
-# Ergebnisdatenmodelle
-# -----------------------------------------------------------------------------
+@dataclass(slots=True)
+class KeypointImpactEstimate:
+    candidate_id: int
+    impact_point: PointF
+    method: str
+    confidence: float
+    source_candidate_confidence: float
+    bbox: BBox
+    centroid: PointF
+    debug: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def hypothesis_count(self) -> int:
+        return 1
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "candidate_id": self.candidate_id,
+            "impact_point": self.impact_point,
+            "method": self.method,
+            "confidence": self.confidence,
+            "source_candidate_confidence": self.source_candidate_confidence,
+            "bbox": self.bbox,
+            "centroid": self.centroid,
+            "hypothesis_count": 1,
+            "debug": self.debug,
+        }
+
+
 @dataclass(slots=True)
 class SingleCamScoredEstimate:
-    """
-    Ein einzelnes vollständiges Single-Cam-Ergebnis:
-    Kandidat -> ImpactEstimate -> ScoredHit -> finales Ranking
-    """
-
     rank: int
     candidate_id: int
     image_point: PointF
     scored_hit: ScoredHit
-    impact_estimate: ImpactEstimate
+    impact_estimate: KeypointImpactEstimate
     candidate_confidence: float
     impact_confidence: float
     combined_confidence: float
@@ -214,119 +143,73 @@ class SingleCamScoredEstimate:
 
 @dataclass(slots=True)
 class SingleCamDetectionResult:
-    """
-    Gesamtergebnis der Single-Cam-Pipeline.
-    """
-
     scored_estimates: list[SingleCamScoredEstimate]
     metadata: dict[str, Any] = field(default_factory=dict)
     debug_images: dict[str, np.ndarray] = field(default_factory=dict)
     candidate_result: Optional[CandidateDetectionResult] = None
-    impact_result: Optional[ImpactEstimationResult] = None
+    impact_result: Any = None
+    keypoint_result: Optional[DartKeypointDetectionResult] = None
 
     @property
     def best_estimate(self) -> Optional[SingleCamScoredEstimate]:
-        if not self.scored_estimates:
-            return None
-        return self.scored_estimates[0]
+        return self.scored_estimates[0] if self.scored_estimates else None
 
     @property
     def best_hit(self) -> Optional[ScoredHit]:
-        if self.best_estimate is None:
-            return None
-        return self.best_estimate.scored_hit
+        return None if self.best_estimate is None else self.best_estimate.scored_hit
 
     @property
     def best_label(self) -> Optional[str]:
-        if self.best_estimate is None:
-            return None
-        return self.best_estimate.label
+        return None if self.best_estimate is None else self.best_estimate.label
 
     @property
     def best_score(self) -> Optional[int]:
-        if self.best_estimate is None:
-            return None
-        return self.best_estimate.score
+        return None if self.best_estimate is None else self.best_estimate.score
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "metadata": self.metadata,
             "best_label": self.best_label,
             "best_score": self.best_score,
-            "scored_estimates": [estimate.to_dict() for estimate in self.scored_estimates],
+            "scored_estimates": [x.to_dict() for x in self.scored_estimates],
             "candidate_result": None if self.candidate_result is None else self.candidate_result.to_dict(),
-            "impact_result": None if self.impact_result is None else self.impact_result.to_dict(),
+            "keypoint_result": None if self.keypoint_result is None else self.keypoint_result.to_dict(),
         }
 
-    def render_debug_overlay(
-        self,
-        frame: np.ndarray,
-        *,
-        max_estimates: Optional[int] = None,
-    ) -> np.ndarray:
+    def render_debug_overlay(self, frame: np.ndarray, *, max_estimates: Optional[int] = None) -> np.ndarray:
         canvas = _ensure_bgr(frame)
-
-        if self.candidate_result is not None:
-            canvas = self.candidate_result.render_debug_overlay(canvas)
-
-        if self.impact_result is not None:
-            canvas = self.impact_result.render_debug_overlay(canvas, max_estimates=max_estimates)
-
-        count = len(self.scored_estimates) if max_estimates is None else min(len(self.scored_estimates), max_estimates)
-
-        for estimate in self.scored_estimates[:count]:
-            x, y, w, h = estimate.bbox
-            px, py = _round_point(estimate.image_point)
-            cx, cy = _round_point(estimate.centroid)
-
-            cv2.rectangle(canvas, (x, y), (x + w, y + h), (255, 255, 255), 1)
-            cv2.circle(canvas, (px, py), 6, (0, 0, 255), 2)
-            cv2.circle(canvas, (cx, cy), 3, (255, 255, 0), -1)
-            cv2.line(canvas, (cx, cy), (px, py), (0, 165, 255), 1, cv2.LINE_AA)
-
-            text = (
-                f"#{estimate.rank} | {estimate.label} | score={estimate.score} | "
-                f"comb={estimate.combined_confidence:.2f}"
-            )
+        if self.keypoint_result is not None:
+            canvas = self.keypoint_result.render_debug_overlay(canvas)
+        count = len(self.scored_estimates)
+        if max_estimates is not None:
+            count = min(count, max(0, int(max_estimates)))
+        for item in self.scored_estimates[:count]:
+            x, y = _round_point(item.image_point)
             cv2.putText(
                 canvas,
-                text,
-                (x, max(18, y - 8)),
+                f"{item.label} score={item.score} KI={item.combined_confidence:.2f}",
+                (x + 10, max(18, y + 18)),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.48,
+                0.5,
                 (255, 255, 255),
                 1,
                 cv2.LINE_AA,
             )
-
         return canvas
 
 
-# -----------------------------------------------------------------------------
-# Hauptklasse
-# -----------------------------------------------------------------------------
 class SingleCamDetector:
-    """
-    Orchestrator für die Single-Camera-Erkennung.
-
-    Pipeline:
-    frame/reference -> candidate detector -> impact estimator -> score mapper
-
-    Diese Klasse darf NICHT:
-    - eigene Board-Geometrie erzeugen
-    - eigene Ring-/Sektorlogik rechnen
-    - eigene Homography rechnen
-    """
-
     def __init__(
         self,
         *,
         config: Optional[SingleCamDetectorConfig] = None,
+        keypoint_detector: Optional[DartKeypointDetector] = None,
+        keypoint_detector_config: Optional[DartKeypointDetectorConfig] = None,
         candidate_detector: Optional[DartCandidateDetector] = None,
-        impact_estimator: Optional[ImpactEstimator] = None,
-        score_mapper: Optional[ScoreMapper] = None,
         candidate_detector_config: Optional[CandidateDetectorConfig] = None,
-        impact_estimator_config: Optional[ImpactEstimatorConfig] = None,
+        impact_estimator: Any = None,
+        impact_estimator_config: Any = None,
+        score_mapper: Optional[ScoreMapper] = None,
         manual_points: Optional[list[Any]] = None,
         calibration_record: Optional[Any] = None,
         pipeline: Optional[Any] = None,
@@ -334,15 +217,12 @@ class SingleCamDetector:
         pipeline_kwargs: Optional[dict[str, Any]] = None,
     ) -> None:
         self.config = config or SingleCamDetectorConfig()
-        self.candidate_detector = candidate_detector or DartCandidateDetector(
-            config=candidate_detector_config
-        )
-        self.impact_estimator = impact_estimator or ImpactEstimator(
-            config=impact_estimator_config
-        )
-
-        self._score_mapper: Optional[ScoreMapper] = None
+        self.keypoint_detector = keypoint_detector or DartKeypointDetector(config=keypoint_detector_config)
+        self.candidate_detector = candidate_detector or DartCandidateDetector(config=candidate_detector_config)
+        self.impact_estimator = impact_estimator
+        self.impact_estimator_config = impact_estimator_config
         self._pipeline_kwargs = pipeline_kwargs or {}
+        self._score_mapper: Optional[ScoreMapper] = None
 
         if score_mapper is not None:
             self._score_mapper = score_mapper
@@ -359,20 +239,26 @@ class SingleCamDetector:
     def score_mapper(self) -> Optional[ScoreMapper]:
         return self._score_mapper
 
-    # -------------------------------------------------------------------------
-    # ScoreMapper-Verwaltung
-    # -------------------------------------------------------------------------
+    def reset_tracking(self) -> None:
+        """
+        Setzt den aktuellen KI-Dart-Track zurück.
+
+        SingleCamDetector bleibt damit die öffentliche Schnittstelle.
+        VisionService muss DartKeypointDetector nicht direkt kennen.
+        """
+        reset_method = getattr(
+            self.keypoint_detector,
+            "reset_tracking",
+            None,
+        )
+
+        if callable(reset_method):
+            reset_method()
+
     def set_score_mapper(self, score_mapper: ScoreMapper) -> None:
-        if score_mapper is None:
-            raise ValueError("score_mapper must not be None.")
         self._score_mapper = score_mapper
 
-    def rebuild_score_mapper_from_manual_points(
-        self,
-        manual_points: list[Any],
-        *,
-        image_size: Optional[tuple[int, int]] = None,
-    ) -> None:
+    def rebuild_score_mapper_from_manual_points(self, manual_points: list[Any], *, image_size: Optional[tuple[int, int]] = None) -> None:
         self._score_mapper = build_score_mapper(
             manual_points=manual_points,
             image_size=image_size,
@@ -391,9 +277,6 @@ class SingleCamDetector:
             pipeline_kwargs=self._pipeline_kwargs,
         )
 
-    # -------------------------------------------------------------------------
-    # Öffentliche Haupt-API
-    # -------------------------------------------------------------------------
     def detect(
         self,
         frame: np.ndarray,
@@ -402,111 +285,73 @@ class SingleCamDetector:
         board_mask: Optional[np.ndarray] = None,
         board_polygon: Optional[np.ndarray | list[tuple[int, int]] | list[tuple[float, float]]] = None,
     ) -> SingleCamDetectionResult:
-        """
-        Führt die komplette Single-Camera-Pipeline aus.
-
-        Schritte:
-        1) Kandidaten finden
-        2) Impact-Punkte schätzen
-        3) finale Bildpunkte scoren
-        4) Ergebnisse sortieren und debugbar zurückgeben
-        """
         self._ensure_score_mapper_ready()
-        _validate_frame(frame, name="frame")
-        _validate_frame(reference_frame, name="reference_frame")
+        _validate_frame(frame, "frame")
+        _validate_frame(reference_frame, "reference_frame")
+        if frame.shape[:2] != reference_frame.shape[:2]:
+            raise ValueError("frame und reference_frame müssen dieselbe Größe haben.")
 
-        image_shape = frame.shape[:2]
+        effective_board_mask = board_mask
+        effective_board_polygon = board_polygon
+        if effective_board_mask is None and effective_board_polygon is None:
+            effective_board_polygon = self._build_auto_board_polygon()
 
-        candidate_result = self._run_candidate_detection(
-            frame=frame,
+        trigger_result = None
+        if self.config.use_change_trigger:
+            trigger_result = self._run_change_trigger(
+                frame=frame,
+                reference_frame=reference_frame,
+                board_mask=effective_board_mask,
+                board_polygon=effective_board_polygon,
+            )
+            if self.config.require_change_trigger_for_detection and not trigger_result.candidates:
+                return SingleCamDetectionResult(
+                    scored_estimates=[],
+                    metadata={"backend": "keypoint", "reason": "change_trigger_no_candidate"},
+                    candidate_result=trigger_result,
+                )
+
+        kp_result = self.keypoint_detector.detect(
+            frame,
             reference_frame=reference_frame,
-            board_mask=board_mask,
-            board_polygon=board_polygon,
+            board_mask=effective_board_mask,
+            board_polygon=effective_board_polygon,
         )
+        detections = list(kp_result.detections)
 
-        # Kandidaten mit Geometrie-/Pipeline-Infos anreichern,
-        # damit der ImpactEstimator centerward arbeiten kann.
-        if self._score_mapper is not None:
-            mapper_pipeline = getattr(self._score_mapper, "pipeline", None)
-            has_topdown_to_image = hasattr(self._score_mapper, "topdown_point_to_image")
+        if trigger_result is not None and trigger_result.candidates and self.config.gate_keypoints_with_trigger_boxes:
+            gated = self._gate_keypoints_by_trigger_boxes(detections, trigger_result)
+            if gated or self.config.require_change_trigger_for_detection:
+                detections = gated
 
-            for candidate in candidate_result.candidates:
-                candidate.debug = dict(getattr(candidate, "debug", {}) or {})
-
-                if mapper_pipeline is not None:
-                    candidate.debug["pipeline"] = mapper_pipeline
-                    candidate.debug["points_like"] = mapper_pipeline
-
-                board_center_image = candidate_result.metadata.get("board_center_image")
-                candidate.debug["board_center_image"] = board_center_image
-
-                if has_topdown_to_image and board_center_image is None:
-                    try:
-                        computed_center = self._score_mapper.topdown_point_to_image((450.0, 450.0))
-                        candidate.debug["board_center_image"] = computed_center
-                    except Exception as exc:
-                        candidate.debug["board_center_image_error"] = str(exc)
-
-        impact_result = self.impact_estimator.estimate_from_detection_result(
-            detection_result=candidate_result,
-            image_shape=image_shape,
-        )
-
-        # --------------------------------------------------------------
-        # Schritt 3: Impact-Punkte scoren
-        # --------------------------------------------------------------
-        scored_estimates = self._score_impacts(impact_result)
-
+        scored = self._score_keypoints(detections)
         metadata = {
-            "input_shape": tuple(int(v) for v in frame.shape),
-            "candidate_count": len(candidate_result.candidates),
-            "impact_count": len(impact_result.estimates),
-            "scored_count": len(scored_estimates),
-            "best_label": scored_estimates[0].label if scored_estimates else None,
-            "best_score": scored_estimates[0].score if scored_estimates else None,
-            "config": _dataclass_to_dict(self.config),
+            "backend": "keypoint",
+            "candidate_count": 0 if trigger_result is None else len(trigger_result.candidates),
+            "keypoint_count": len(kp_result.detections),
+            "keypoint_count_after_gate": len(detections),
+            "impact_count": len(detections),
+            "scored_count": len(scored),
+            "best_label": None if not scored else scored[0].label,
+            "best_score": None if not scored else scored[0].score,
         }
 
-        debug_images: dict[str, np.ndarray] = {}
-        if self.config.keep_debug_images:
-            debug_images.update(candidate_result.debug_images)
-
-            if self.config.render_stage_overlays:
-                debug_images["candidate_overlay"] = candidate_result.render_debug_overlay(frame)
-                debug_images["impact_overlay"] = impact_result.render_debug_overlay(frame)
-
-                final_result_preview = SingleCamDetectionResult(
-                    scored_estimates=scored_estimates,
-                    metadata=metadata,
-                    debug_images={},
-                    candidate_result=candidate_result if self.config.keep_stage_results else None,
-                    impact_result=impact_result if self.config.keep_stage_results else None,
-                )
-                debug_images["single_cam_overlay"] = final_result_preview.render_debug_overlay(frame)
-
-        return SingleCamDetectionResult(
-            scored_estimates=scored_estimates,
+        result = SingleCamDetectionResult(
+            scored_estimates=scored,
             metadata=metadata,
-            debug_images=debug_images,
-            candidate_result=candidate_result if self.config.keep_stage_results else None,
-            impact_result=impact_result if self.config.keep_stage_results else None,
+            candidate_result=trigger_result if self.config.keep_stage_results else None,
+            keypoint_result=kp_result if self.config.keep_stage_results else None,
         )
+        if self.config.keep_debug_images:
+            if trigger_result is not None:
+                result.debug_images.update(trigger_result.debug_images)
+            result.debug_images.update(kp_result.debug_images)
+            if self.config.render_stage_overlays:
+                result.debug_images["single_cam_overlay"] = result.render_debug_overlay(frame)
+        return result
 
-    def detect_best_hit(
-        self,
-        frame: np.ndarray,
-        reference_frame: np.ndarray,
-        *,
-        board_mask: Optional[np.ndarray] = None,
-        board_polygon: Optional[np.ndarray | list[tuple[int, int]] | list[tuple[float, float]]] = None,
-    ) -> Optional[ScoredHit]:
-        result = self.detect(
-            frame=frame,
-            reference_frame=reference_frame,
-            board_mask=board_mask,
-            board_polygon=board_polygon,
-        )
-        return result.best_hit
+    def detect_best_hit(self, frame: np.ndarray, reference_frame: np.ndarray, **kwargs: Any) -> Optional[ScoredHit]:
+        return self.detect(frame=frame, reference_frame=reference_frame, **kwargs).best_hit
 
     def detect_observation(
         self,
@@ -518,701 +363,206 @@ class SingleCamDetector:
         board_polygon: Optional[np.ndarray | list[tuple[int, int]] | list[tuple[float, float]]] = None,
         reference_available: bool = True,
     ) -> SingleCamObservation:
-        """
-        Führt die Single-Cam-Pipeline bis zur Observation-Schicht aus.
-
-        WICHTIG:
-        - Kandidaten finden
-        - Impact schätzen
-        - Bildpunkt -> Topdown projizieren
-        - KEIN lokaler finaler Score als Hauptprodukt
-        """
-        self._ensure_score_mapper_ready()
-        _validate_frame(frame, name="frame")
-        _validate_frame(reference_frame, name="reference_frame")
-
-        image_shape = frame.shape[:2]
-
-        candidate_result = self._run_candidate_detection(
+        result = self.detect(
             frame=frame,
             reference_frame=reference_frame,
             board_mask=board_mask,
             board_polygon=board_polygon,
         )
 
-        if self._score_mapper is not None:
-            mapper_pipeline = getattr(self._score_mapper, "pipeline", None)
-            has_topdown_to_image = hasattr(self._score_mapper, "topdown_point_to_image")
-
-            for candidate in candidate_result.candidates:
-                candidate.debug = dict(getattr(candidate, "debug", {}) or {})
-
-                if mapper_pipeline is not None:
-                    candidate.debug["pipeline"] = mapper_pipeline
-                    candidate.debug["points_like"] = mapper_pipeline
-
-                board_center_image = candidate_result.metadata.get("board_center_image")
-                candidate.debug["board_center_image"] = board_center_image
-
-                if has_topdown_to_image and board_center_image is None:
-                    try:
-                        computed_center = self._score_mapper.topdown_point_to_image((450.0, 450.0))
-                        candidate.debug["board_center_image"] = computed_center
-                    except Exception as exc:
-                        candidate.debug["board_center_image_error"] = str(exc)
-
-        impact_result = self.impact_estimator.estimate_from_detection_result(
-            detection_result=candidate_result,
-            image_shape=image_shape,
-        )
-
-        scored_estimates = self._score_impacts(impact_result)
-
-        return self._build_observation_from_scored_estimates(
-            camera_index=int(camera_index),
-            scored_estimates=scored_estimates,
-            impact_result=impact_result,
-            candidate_result=candidate_result,
-            reference_available=reference_available,
-            frame_ok=True,
-        )
-
-    # -------------------------------------------------------------------------
-    # Interne Hilfslogik
-    # -------------------------------------------------------------------------
-    def _ensure_score_mapper_ready(self) -> None:
-        if self._score_mapper is None:
-            raise RuntimeError(
-                "SingleCamDetector has no ScoreMapper configured. "
-                "Provide one via constructor or rebuild_score_mapper_*()."
+        estimates: list[SingleCamEstimateObservation] = []
+        for item in result.scored_estimates:
+            topdown = _coerce_point(getattr(item.scored_hit, "topdown_point", None))
+            if topdown is None:
+                topdown = self._project_image_point_to_topdown_safe(item.image_point)
+            estimates.append(
+                SingleCamEstimateObservation(
+                    estimate_rank=int(item.rank),
+                    image_point=item.image_point,
+                    topdown_point=topdown,
+                    label=item.label,
+                    score=int(item.score),
+                    ring=item.ring,
+                    segment=item.segment,
+                    multiplier=int(item.multiplier),
+                    combined_confidence=float(item.combined_confidence),
+                    impact_confidence=float(item.impact_confidence),
+                    candidate_confidence=float(item.candidate_confidence),
+                    debug=dict(item.debug),
+                )
             )
 
-    def _try_get_board_center_image(self) -> Optional[PointF]:
-        """
-        Versucht das Board-Zentrum im Bildraum robust zu bestimmen.
+        best = estimates[0] if estimates else None
+        return SingleCamObservation(
+            camera_index=int(camera_index),
+            frame_ok=True,
+            detector_ready=self._score_mapper is not None,
+            reference_available=bool(reference_available),
+            candidate_count=int(result.metadata.get("candidate_count", 0)),
+            impact_count=int(result.metadata.get("impact_count", len(estimates))),
+            scored_count=len(estimates),
+            best_image_point=None if best is None else best.image_point,
+            best_topdown_point=None if best is None else best.topdown_point,
+            best_label=None if best is None else best.label,
+            best_score=None if best is None else best.score,
+            best_ring=None if best is None else best.ring,
+            best_segment=None if best is None else best.segment,
+            best_multiplier=None if best is None else best.multiplier,
+            best_combined_confidence=0.0 if best is None else float(best.combined_confidence),
+            best_impact_confidence=0.0 if best is None else float(best.impact_confidence),
+            best_candidate_confidence=0.0 if best is None else float(best.candidate_confidence),
+            estimates=estimates,
+            metadata=dict(result.metadata),
+            debug={"observation_mode": "keypoint_first"},
+            raw_result=result,
+        )
 
-        Strategie:
-        1. Falls der ScoreMapper eine direkte Projektion von Topdown -> Image kann,
-           verwende das Zentrum des standardisierten Topdown-Boards.
-        2. Falls das nicht geht, None zurückgeben.
+    def _score_keypoints(self, detections: list[DartKeypointDetection]) -> list[SingleCamScoredEstimate]:
+        assert self._score_mapper is not None
+        source = detections[:1] if not self.config.score_all_estimates else detections[:max(1, int(self.config.max_estimates_to_score))]
+        scored: list[SingleCamScoredEstimate] = []
 
-        WICHTIG:
-        - Kein Fehler darf die Pipeline killen
-        - Das ist nur ein optionaler Hint für den CandidateDetector
-        """
-        if self._score_mapper is None:
-            return None
+        for det in source:
+            if det.confidence < float(self.config.min_impact_confidence):
+                continue
+            topdown = self._project_image_point_to_topdown_safe(det.tip_point)
+            if self.config.prune_offboard_estimates_before_scoring and topdown is not None:
+                if self._compute_topdown_radius_rel(topdown) > float(self.config.max_board_radius_rel_for_scoring):
+                    continue
 
-        topdown_center = (450.0, 450.0)
+            scored_hit = self._score_mapper.score_image_point(det.tip_point)
+            combined = self._compute_combined_confidence(det.confidence, det.confidence)
+            if combined < float(self.config.min_combined_confidence):
+                continue
 
-        for method_name in (
-            "topdown_point_to_image",
-            "project_topdown_point_to_image",
-            "topdown_to_image",
-        ):
-            method = getattr(self._score_mapper, method_name, None)
-            if callable(method):
-                try:
-                    point = method(topdown_center)
-                    coerced = _coerce_point(point)
-                    if coerced is not None:
-                        return coerced
-                except Exception as exc:
-                    logger.debug(
-                        "Could not get board_center_image via %s: %s",
-                        method_name,
-                        exc,
-                    )
+            bbox = _coerce_bbox(det.bbox)
+            centroid = _bbox_center_or_point(bbox, det.tip_point)
+            adapter = KeypointImpactEstimate(
+                candidate_id=int(det.detection_index),
+                impact_point=det.tip_point,
+                method="yolo_pose_keypoint",
+                confidence=float(det.confidence),
+                source_candidate_confidence=float(det.confidence),
+                bbox=bbox,
+                centroid=centroid,
+                debug={"keypoint_detection": det.to_dict()},
+            )
+            scored.append(
+                SingleCamScoredEstimate(
+                    rank=0,
+                    candidate_id=int(det.detection_index),
+                    image_point=det.tip_point,
+                    scored_hit=scored_hit,
+                    impact_estimate=adapter,
+                    candidate_confidence=float(det.confidence),
+                    impact_confidence=float(det.confidence),
+                    combined_confidence=float(combined),
+                    bbox=bbox,
+                    centroid=centroid,
+                    debug={"backend": "keypoint", "method": "yolo_pose_keypoint"},
+                )
+            )
 
-        return None
+        scored.sort(key=lambda x: x.combined_confidence, reverse=True)
+        for rank, item in enumerate(scored, start=1):
+            item.rank = rank
+        return scored
 
-    def _run_candidate_detection(
-        self,
-        *,
-        frame: np.ndarray,
-        reference_frame: np.ndarray,
-        board_mask: Optional[np.ndarray] = None,
-        board_polygon: Optional[np.ndarray | list[tuple[int, int]] | list[tuple[float, float]]] = None,
-    ) -> CandidateDetectionResult:
-        """
-        Führt die Candidate Detection rückwärtskompatibel aus.
-
-        Wichtig:
-        Manche Test-Doubles/Fakes unterstützen das neue Argument
-        'board_center_image' noch nicht. Deshalb wird der Aufruf
-        robust auf beide Signaturen angepasst.
-        """
-        if self.candidate_detector is None:
-            raise RuntimeError("Candidate detector is not configured.")
-
-        board_center_image = self._try_get_board_center_image()
-
-        base_kwargs = {
+    def _run_change_trigger(self, *, frame: np.ndarray, reference_frame: np.ndarray, board_mask: Optional[np.ndarray], board_polygon: Any) -> CandidateDetectionResult:
+        center = self._try_get_board_center_image()
+        kwargs = {
             "frame": frame,
             "reference_frame": reference_frame,
             "board_mask": board_mask,
             "board_polygon": board_polygon,
         }
-
-        # Neuer Pfad: echter Detector mit board_center_image
         try:
-            candidate_result = self.candidate_detector.detect_candidates(
-                **base_kwargs,
-                board_center_image=board_center_image,
-            )
+            return self.candidate_detector.detect_candidates(**kwargs, board_center_image=center)
         except TypeError as exc:
-            # Nur auf alte Signatur zurückfallen, wenn wirklich das neue
-            # Argument das Problem ist.
             if "board_center_image" not in str(exc):
                 raise
+            return self.candidate_detector.detect_candidates(**kwargs)
 
-            candidate_result = self.candidate_detector.detect_candidates(
-                **base_kwargs,
-            )
+    def _gate_keypoints_by_trigger_boxes(self, detections: list[DartKeypointDetection], trigger_result: CandidateDetectionResult) -> list[DartKeypointDetection]:
+        margin = max(0, int(self.config.trigger_bbox_margin_px))
+        boxes = [_expand_bbox(_coerce_bbox(c.bbox), margin) for c in trigger_result.candidates]
+        return [d for d in detections if any(_point_in_bbox(d.tip_point, b) for b in boxes)]
 
-        candidate_result.metadata = dict(getattr(candidate_result, "metadata", {}) or {})
-        candidate_result.metadata["board_center_image"] = board_center_image
+    def _ensure_score_mapper_ready(self) -> None:
+        if self._score_mapper is None:
+            raise RuntimeError("SingleCamDetector hat keinen ScoreMapper.")
 
-        for candidate in candidate_result.candidates:
-            candidate.debug = dict(getattr(candidate, "debug", {}) or {})
-            candidate.debug["board_center_image"] = board_center_image
+    def _try_get_board_center_image(self) -> Optional[PointF]:
+        return self._project_topdown_point_to_image_safe((float(TOPDOWN_CENTER_X), float(TOPDOWN_CENTER_Y)))
 
-        return candidate_result
-
-
-    def _project_image_point_to_topdown_safe(
-        self,
-        point: Any,
-    ) -> Optional[PointF]:
-        """
-        Projiziert einen Bildpunkt robust nach Topdown.
-        Gibt None zurück, wenn keine Projektion möglich ist.
-        """
+    def _project_topdown_point_to_image_safe(self, point: PointF) -> Optional[PointF]:
         if self._score_mapper is None:
             return None
-
-        try:
-            projected = self._score_mapper.image_point_to_topdown(point)
-            return _coerce_point(projected)
-        except Exception as exc:
-            logger.debug("Could not project image point to topdown: %s", exc)
-            return None
-
-    def _build_observation_from_scored_estimates(
-        self,
-        *,
-        camera_index: int,
-        scored_estimates: list[SingleCamScoredEstimate],
-        impact_result: Optional[ImpactEstimationResult] = None,
-        candidate_result: Optional[CandidateDetectionResult] = None,
-        reference_available: bool = True,
-        frame_ok: bool = True,
-    ) -> SingleCamObservation:
-        """
-        Baut eine SingleCamObservation aus bereits final gescorten Estimates.
-
-        WICHTIG:
-        Damit verwendet die Observation exakt dieselbe Auswahl- und
-        Pruning-Logik wie detect().
-        """
-        estimate_observations: list[SingleCamEstimateObservation] = []
-
-        for idx, scored in enumerate(scored_estimates):
-            image_point = _coerce_point(scored.image_point)
-
-            topdown_point = None
-            scored_hit = getattr(scored, "scored_hit", None)
-            if scored_hit is not None:
-                topdown_point = _coerce_point(getattr(scored_hit, "topdown_point", None))
-
-            if topdown_point is None:
-                topdown_point = self._project_image_point_to_topdown_safe(image_point)
-
-            estimate_observations.append(
-                SingleCamEstimateObservation(
-                    estimate_rank=int(idx + 1),
-                    image_point=image_point,
-                    topdown_point=topdown_point,
-                    label=None if scored.label is None else str(scored.label),
-                    score=None if scored.score is None else int(scored.score),
-                    ring=None if scored.ring is None else str(scored.ring),
-                    segment=None if scored.segment is None else int(scored.segment),
-                    multiplier=None if scored.multiplier is None else int(scored.multiplier),
-                    combined_confidence=float(scored.combined_confidence),
-                    impact_confidence=float(scored.impact_confidence),
-                    candidate_confidence=float(scored.candidate_confidence),
-                    debug={
-                        "candidate_id": int(scored.candidate_id),
-                        "bbox": _coerce_bbox(scored.bbox),
-                        "centroid": _coerce_point(scored.centroid),
-                        "scored_estimate_debug": dict(getattr(scored, "debug", {}) or {}),
-                        "source": "scored_estimate",
-                    },
-                )
-            )
-
-        estimate_observations.sort(
-            key=lambda item: float(item.combined_confidence),
-            reverse=True,
-        )
-
-        for rank, obs in enumerate(estimate_observations, start=1):
-            obs.estimate_rank = int(rank)
-
-        best = estimate_observations[0] if estimate_observations else None
-
-        candidate_count = 0
-        if candidate_result is not None:
-            candidate_count = len(getattr(candidate_result, "candidates", []) or [])
-
-        impact_count = 0
-        metadata: dict[str, Any] = {}
-        if impact_result is not None:
-            estimates = list(getattr(impact_result, "estimates", []) or [])
-            impact_count = len(estimates)
-            metadata = dict(getattr(impact_result, "metadata", {}) or {})
-
-        metadata["candidate_count"] = int(candidate_count)
-        metadata["impact_count"] = int(impact_count)
-        metadata["observation_count"] = int(len(estimate_observations))
-        metadata["observation_built_from"] = "scored_estimates"
-
-        return SingleCamObservation(
-            camera_index=int(camera_index),
-            frame_ok=bool(frame_ok),
-            detector_ready=self._score_mapper is not None,
-            reference_available=bool(reference_available),
-            candidate_count=int(candidate_count),
-            impact_count=int(impact_count),
-            scored_count=int(len(estimate_observations)),
-            best_image_point=None if best is None else best.image_point,
-            best_topdown_point=None if best is None else best.topdown_point,
-            best_label=None if best is None else best.label,
-            best_score=None if best is None else best.score,
-            best_ring=None if best is None else best.ring,
-            best_segment=None if best is None else best.segment,
-            best_multiplier=None if best is None else best.multiplier,
-            best_combined_confidence=0.0 if best is None else float(best.combined_confidence),
-            best_impact_confidence=0.0 if best is None else float(best.impact_confidence),
-            best_candidate_confidence=0.0 if best is None else float(best.candidate_confidence),
-            estimates=estimate_observations,
-            metadata=metadata,
-            debug={
-                "observation_mode": "scored_first",
-                "has_score_mapper": self._score_mapper is not None,
-            },
-            raw_result=impact_result,
-        )
-
-    def _build_observation_from_impact_result(
-        self,
-        *,
-        camera_index: int,
-        impact_result: ImpactEstimationResult,
-        candidate_result: Optional[CandidateDetectionResult] = None,
-        reference_available: bool = True,
-        frame_ok: bool = True,
-    ) -> SingleCamObservation:
-        """
-        Baut eine SingleCamObservation direkt aus dem ImpactResult.
-
-        WICHTIG:
-        - kein finales lokales Score-Mapping als Hauptpfad
-        - stattdessen rohe Impact-Beobachtungen + Topdown-Projektion
-        """
-        estimates = list(getattr(impact_result, "estimates", []) or [])
-        estimate_observations: list[SingleCamEstimateObservation] = []
-
-        for idx, estimate in enumerate(estimates):
-            image_point = _coerce_point(getattr(estimate, "impact_point", None))
-            topdown_point = self._project_image_point_to_topdown_safe(image_point)
-
-            # Optionaler Debug-Score nur zu Diagnosezwecken, nicht als Hauptprodukt
-            label = None
-            score = None
-            ring = None
-            segment = None
-            multiplier = None
-
-            if image_point is not None and self._score_mapper is not None:
+        for name in ("topdown_point_to_image", "project_topdown_point_to_image", "topdown_to_image"):
+            method = getattr(self._score_mapper, name, None)
+            if callable(method):
                 try:
-                    debug_hit = self._score_mapper.score_image_point(image_point)
-                    label = getattr(debug_hit, "label", None)
-                    score = getattr(debug_hit, "score", None)
-                    ring = getattr(debug_hit, "ring", None)
-                    segment = getattr(debug_hit, "segment", None)
-                    multiplier = getattr(debug_hit, "multiplier", None)
+                    return _coerce_point(method(point))
                 except Exception:
                     pass
+        return None
 
-            candidate_confidence = float(getattr(estimate, "source_candidate_confidence", 0.0))
-            impact_confidence = float(getattr(estimate, "confidence", 0.0))
-            combined_confidence = self._compute_combined_confidence(
-                candidate_confidence=candidate_confidence,
-                impact_confidence=impact_confidence,
+    def _project_image_point_to_topdown_safe(self, point: PointF) -> Optional[PointF]:
+        if self._score_mapper is None:
+            return None
+        method = getattr(self._score_mapper, "image_point_to_topdown", None)
+        if not callable(method):
+            return None
+        try:
+            return _coerce_point(method(point))
+        except Exception:
+            return None
+
+    def _build_auto_board_polygon(self, *, point_count: int = 72, radius_scale: float = 1.05) -> Optional[list[PointF]]:
+        radius = float(OUTER_DOUBLE_RADIUS_PX) * float(radius_scale)
+        polygon: list[PointF] = []
+        count = max(24, int(point_count))
+        for i in range(count):
+            angle = 2.0 * math.pi * i / count
+            topdown = (
+                float(TOPDOWN_CENTER_X + radius * math.cos(angle)),
+                float(TOPDOWN_CENTER_Y + radius * math.sin(angle)),
             )
+            image_point = self._project_topdown_point_to_image_safe(topdown)
+            if image_point is not None:
+                polygon.append(image_point)
+        return polygon if len(polygon) >= 12 else None
 
-            estimate_observations.append(
-                SingleCamEstimateObservation(
-                    estimate_rank=int(idx + 1),
-                    image_point=image_point,
-                    topdown_point=topdown_point,
-                    label=None if label is None else str(label),
-                    score=None if score is None else int(score),
-                    ring=None if ring is None else str(ring),
-                    segment=None if segment is None else int(segment),
-                    multiplier=None if multiplier is None else int(multiplier),
-                    combined_confidence=float(combined_confidence),
-                    impact_confidence=float(impact_confidence),
-                    candidate_confidence=float(candidate_confidence),
-                    debug={
-                        "impact_method": getattr(estimate, "method", None),
-                        "candidate_id": getattr(estimate, "candidate_id", None),
-                        "bbox": _coerce_bbox(getattr(estimate, "bbox", None)),
-                        "centroid": _coerce_point(getattr(estimate, "centroid", None)),
-                        "estimate_debug": dict(getattr(estimate, "debug", {}) or {}),
-                    },
-                )
-            )
+    def _compute_topdown_radius_rel(self, point: PointF) -> float:
+        return float(math.hypot(point[0] - TOPDOWN_CENTER_X, point[1] - TOPDOWN_CENTER_Y) / OUTER_DOUBLE_RADIUS_PX)
 
-        estimate_observations.sort(
-            key=lambda item: float(item.combined_confidence),
-            reverse=True,
-        )
-
-        for rank, obs in enumerate(estimate_observations, start=1):
-            obs.estimate_rank = int(rank)
-
-        best = estimate_observations[0] if estimate_observations else None
-
-        candidate_count = 0
-        if candidate_result is not None:
-            candidate_count = len(getattr(candidate_result, "candidates", []) or [])
-
-        metadata = dict(getattr(impact_result, "metadata", {}) or {})
-        metadata["candidate_count"] = int(candidate_count)
-        metadata["impact_count"] = int(len(estimates))
-        metadata["observation_count"] = int(len(estimate_observations))
-
-        return SingleCamObservation(
-            camera_index=int(camera_index),
-            frame_ok=bool(frame_ok),
-            detector_ready=self._score_mapper is not None,
-            reference_available=bool(reference_available),
-            candidate_count=int(candidate_count),
-            impact_count=int(len(estimates)),
-            scored_count=int(len(estimate_observations)),
-            best_image_point=None if best is None else best.image_point,
-            best_topdown_point=None if best is None else best.topdown_point,
-            best_label=None if best is None else best.label,
-            best_score=None if best is None else best.score,
-            best_ring=None if best is None else best.ring,
-            best_segment=None if best is None else best.segment,
-            best_multiplier=None if best is None else best.multiplier,
-            best_combined_confidence=0.0 if best is None else float(best.combined_confidence),
-            best_impact_confidence=0.0 if best is None else float(best.impact_confidence),
-            best_candidate_confidence=0.0 if best is None else float(best.candidate_confidence),
-            estimates=estimate_observations,
-            metadata=metadata,
-            debug={
-                "observation_mode": "impact_first",
-                "has_score_mapper": self._score_mapper is not None,
-            },
-            raw_result=impact_result,
-        )
-    
-    def _compute_topdown_radius_rel(
-        self,
-        topdown_point: PointF,
-    ) -> float:
-        """
-        Berechnet den normierten Board-Radius relativ zum Outer-Double-Radius.
-        1.0 = exakt äußerer Double-Rand
-        """
-        dx = float(topdown_point[0]) - float(TOPDOWN_CENTER_X)
-        dy = float(topdown_point[1]) - float(TOPDOWN_CENTER_Y)
-        radius_px = math.hypot(dx, dy)
-        return float(radius_px / float(OUTER_DOUBLE_RADIUS_PX))
-
-    def _is_estimate_geometrically_plausible(
-        self,
-        estimate: ImpactEstimate,
-    ) -> tuple[bool, dict[str, Any]]:
-        """
-        Prüft, ob eine Impact-Schätzung geometrisch plausibel auf dem Board liegt.
-
-        Logik:
-        - impact_point nach Topdown projizieren
-        - normierten Radius berechnen
-        - außerhalb max_board_radius_rel_for_scoring => verwerfen
-
-        WICHTIG:
-        Wenn die Projektion nicht möglich ist (z. B. in Unit-Tests mit FakeScoreMapper),
-        wird der Estimate NICHT verworfen, sondern als 'nicht prüfbar' durchgelassen.
-        """
-        debug: dict[str, Any] = {
-            "checked": False,
-            "reason": None,
-            "topdown_point": None,
-            "radius_rel": None,
-            "max_radius_rel": float(self.config.max_board_radius_rel_for_scoring),
-        }
-
-        if not self.config.prune_offboard_estimates_before_scoring:
-            debug["checked"] = False
-            debug["reason"] = "pruning_disabled"
-            return True, debug
-
-        topdown_point = self._project_image_point_to_topdown_safe(estimate.impact_point)
-        if topdown_point is None:
-            debug["checked"] = True
-            debug["reason"] = "projection_unavailable_keep"
-            return True, debug
-
-        radius_rel = self._compute_topdown_radius_rel(topdown_point)
-
-        debug["checked"] = True
-        debug["topdown_point"] = topdown_point
-        debug["radius_rel"] = float(radius_rel)
-
-        if radius_rel > float(self.config.max_board_radius_rel_for_scoring):
-            debug["reason"] = "offboard_radius"
-            return False, debug
-
-        debug["reason"] = "ok"
-        return True, debug
-
-    def _prune_estimates_geometrically(
-        self,
-        estimates: list[ImpactEstimate],
-    ) -> tuple[list[ImpactEstimate], list[dict[str, Any]]]:
-        """
-        Filtert Off-Board-Estimates vor dem Scoring heraus.
-        """
-        kept: list[ImpactEstimate] = []
-        debug_rows: list[dict[str, Any]] = []
-
-        for estimate in estimates:
-            keep, prune_debug = self._is_estimate_geometrically_plausible(estimate)
-            row = {
-                "candidate_id": int(getattr(estimate, "candidate_id", -1)),
-                "impact_point": _coerce_point(getattr(estimate, "impact_point")),
-                "confidence": float(getattr(estimate, "confidence", 0.0)),
-                "keep": bool(keep),
-                "prune_debug": prune_debug,
-            }
-            debug_rows.append(row)
-
-            estimate.debug = dict(getattr(estimate, "debug", {}) or {})
-            estimate.debug["geometric_pruning"] = prune_debug
-
-            if keep:
-                kept.append(estimate)
-
-        if not kept and estimates and self.config.fallback_to_unpruned_estimates_if_all_filtered:
-            logger.warning(
-                "All estimates were geometrically pruned. Falling back to unpruned estimates "
-                "because fallback_to_unpruned_estimates_if_all_filtered=True."
-            )
-            return list(estimates), debug_rows
-
-        return kept, debug_rows
-
-    def _score_impacts(
-        self,
-        impact_result: ImpactEstimationResult,
-    ) -> list[SingleCamScoredEstimate]:
-        """
-        Bewertet die Impact-Schätzungen über den ScoreMapper und erzeugt finale
-        SingleCamScoredEstimate-Objekte.
-
-        WICHTIG:
-        Geometrisches Pruning passiert jetzt VOR der finalen Begrenzung auf
-        max_estimates_to_score, damit nicht zufällig nur die ersten 3 Off-Board-
-        Estimates geprüft und alle restlichen ignoriert werden.
-        """
-        assert self._score_mapper is not None, "ScoreMapper must be configured before scoring."
-
-        all_estimates = list(impact_result.estimates)
-
-        # --------------------------------------------------------------
-        # 1) Erst geometrisch plausibel filtern
-        # --------------------------------------------------------------
-        pruned_estimates, pruning_debug_rows = self._prune_estimates_geometrically(all_estimates)
-
-        # Optionaler Fallback, falls aktiviert
-        estimates_after_pruning = pruned_estimates
-        if (
-            not estimates_after_pruning
-            and all_estimates
-            and self.config.fallback_to_unpruned_estimates_if_all_filtered
-        ):
-            estimates_after_pruning = list(all_estimates)
-
-        # --------------------------------------------------------------
-        # 2) Erst danach auf max_estimates_to_score begrenzen
-        # --------------------------------------------------------------
-        if not self.config.score_all_estimates:
-            estimates_to_score = estimates_after_pruning[:1]
-        else:
-            max_count = max(1, int(self.config.max_estimates_to_score))
-            estimates_to_score = estimates_after_pruning[:max_count]
-
-        scored_estimates: list[SingleCamScoredEstimate] = []
-
-        for estimate in estimates_to_score:
-            if estimate.confidence < self.config.min_impact_confidence:
-                continue
-
-            scored_hit = self._score_mapper.score_image_point(estimate.impact_point)
-
-            combined_confidence = self._compute_combined_confidence(
-                candidate_confidence=estimate.source_candidate_confidence,
-                impact_confidence=estimate.confidence,
-            )
-
-            if combined_confidence < self.config.min_combined_confidence:
-                continue
-
-            candidate_bbox = _coerce_bbox(estimate.bbox)
-            candidate_centroid = _coerce_point(estimate.centroid)
-
-            pruning_debug = None
-            if isinstance(getattr(estimate, "debug", None), dict):
-                pruning_debug = estimate.debug.get("geometric_pruning")
-
-            scored_estimates.append(
-                SingleCamScoredEstimate(
-                    rank=0,
-                    candidate_id=int(estimate.candidate_id),
-                    image_point=_coerce_point(estimate.impact_point),
-                    scored_hit=scored_hit,
-                    impact_estimate=estimate,
-                    candidate_confidence=float(estimate.source_candidate_confidence),
-                    impact_confidence=float(estimate.confidence),
-                    combined_confidence=float(combined_confidence),
-                    bbox=candidate_bbox,
-                    centroid=candidate_centroid,
-                    debug={
-                        "impact_method": estimate.method,
-                        "hypothesis_count": getattr(
-                            estimate,
-                            "hypothesis_count",
-                            len(getattr(estimate, "hypotheses", []) or []),
-                        ),
-                        "geometric_pruning": pruning_debug,
-                    },
-                )
-            )
-
-        scored_estimates.sort(
-            key=lambda item: item.combined_confidence,
-            reverse=True,
-        )
-
-        for rank, estimate in enumerate(scored_estimates, start=1):
-            estimate.rank = rank
-
-        return scored_estimates
-
-    def _compute_combined_confidence(
-        self,
-        *,
-        candidate_confidence: float,
-        impact_confidence: float,
-    ) -> float:
-        """
-        Mischt Kandidaten- und Impact-Konfidenz für das finale Ranking.
-        """
-        weight_candidate = float(self.config.weight_candidate_confidence)
-        weight_impact = float(self.config.weight_impact_confidence)
-
-        total_weight = weight_candidate + weight_impact
-        if total_weight <= 0.0:
-            return 0.0
-
-        score = (
-            weight_candidate * float(candidate_confidence)
-            + weight_impact * float(impact_confidence)
-        ) / total_weight
-
-        return float(max(0.0, min(1.0, score)))
+    def _compute_combined_confidence(self, candidate_confidence: float, impact_confidence: float) -> float:
+        wc = float(self.config.weight_candidate_confidence)
+        wi = float(self.config.weight_impact_confidence)
+        total = wc + wi
+        if total <= 0.0:
+            return float(max(0.0, min(1.0, impact_confidence)))
+        return float(max(0.0, min(1.0, (wc*candidate_confidence + wi*impact_confidence) / total)))
 
 
-# -----------------------------------------------------------------------------
-# Convenience-Funktionen
-# -----------------------------------------------------------------------------
-def build_single_cam_detector(
-    *,
-    config: Optional[SingleCamDetectorConfig] = None,
-    candidate_detector_config: Optional[CandidateDetectorConfig] = None,
-    impact_estimator_config: Optional[ImpactEstimatorConfig] = None,
-    manual_points: Optional[list[Any]] = None,
-    calibration_record: Optional[Any] = None,
-    pipeline: Optional[Any] = None,
-    image_size: Optional[tuple[int, int]] = None,
-    pipeline_kwargs: Optional[dict[str, Any]] = None,
-) -> SingleCamDetector:
-    return SingleCamDetector(
-        config=config,
-        candidate_detector_config=candidate_detector_config,
-        impact_estimator_config=impact_estimator_config,
-        manual_points=manual_points,
-        calibration_record=calibration_record,
-        pipeline=pipeline,
-        image_size=image_size,
-        pipeline_kwargs=pipeline_kwargs,
-    )
+def build_single_cam_detector(**kwargs: Any) -> SingleCamDetector:
+    return SingleCamDetector(**kwargs)
 
 
-def detect_single_cam(
-    frame: np.ndarray,
-    reference_frame: np.ndarray,
-    *,
-    board_mask: Optional[np.ndarray] = None,
-    board_polygon: Optional[np.ndarray | list[tuple[int, int]] | list[tuple[float, float]]] = None,
-    detector: Optional[SingleCamDetector] = None,
-    config: Optional[SingleCamDetectorConfig] = None,
-    candidate_detector_config: Optional[CandidateDetectorConfig] = None,
-    impact_estimator_config: Optional[ImpactEstimatorConfig] = None,
-    manual_points: Optional[list[Any]] = None,
-    calibration_record: Optional[Any] = None,
-    pipeline: Optional[Any] = None,
-    image_size: Optional[tuple[int, int]] = None,
-    pipeline_kwargs: Optional[dict[str, Any]] = None,
-) -> SingleCamDetectionResult:
+def detect_single_cam(frame: np.ndarray, reference_frame: np.ndarray, *, detector: Optional[SingleCamDetector] = None, **kwargs: Any) -> SingleCamDetectionResult:
     if detector is None:
-        detector = build_single_cam_detector(
-            config=config,
-            candidate_detector_config=candidate_detector_config,
-            impact_estimator_config=impact_estimator_config,
-            manual_points=manual_points,
-            calibration_record=calibration_record,
-            pipeline=pipeline,
-            image_size=image_size,
-            pipeline_kwargs=pipeline_kwargs,
-        )
-
+        detector = SingleCamDetector(**{k: v for k, v in kwargs.items() if k not in {"board_mask", "board_polygon"}})
     return detector.detect(
         frame=frame,
         reference_frame=reference_frame,
-        board_mask=board_mask,
-        board_polygon=board_polygon,
+        board_mask=kwargs.get("board_mask"),
+        board_polygon=kwargs.get("board_polygon"),
     )
 
 
-# -----------------------------------------------------------------------------
-# Hilfsfunktionen
-# -----------------------------------------------------------------------------
-def _validate_frame(frame: np.ndarray, *, name: str) -> None:
-    if frame is None:
-        raise ValueError(f"{name} must not be None.")
-    if not isinstance(frame, np.ndarray):
-        raise TypeError(f"{name} must be a numpy.ndarray, got {type(frame)!r}.")
-    if frame.ndim not in (2, 3):
-        raise ValueError(f"{name} must have ndim 2 or 3, got {frame.ndim}.")
-    if frame.size == 0:
-        raise ValueError(f"{name} must not be empty.")
+def _validate_frame(frame: np.ndarray, name: str) -> None:
+    if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
+        raise ValueError(f"{name} ist ungültig.")
 
 
 def _ensure_bgr(frame: np.ndarray) -> np.ndarray:
@@ -1222,97 +572,54 @@ def _ensure_bgr(frame: np.ndarray) -> np.ndarray:
         return frame.copy()
     if frame.ndim == 3 and frame.shape[2] == 4:
         return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-    raise ValueError(f"Unsupported frame shape for BGR conversion: {frame.shape}")
+    raise ValueError(f"Nicht unterstützte Bildform: {frame.shape}")
 
 
 def _coerce_point(value: Any) -> Optional[PointF]:
     if value is None:
         return None
-
+    if isinstance(value, dict):
+        if "x" in value and "y" in value:
+            return float(value["x"]), float(value["y"])
+        if "x_px" in value and "y_px" in value:
+            return float(value["x_px"]), float(value["y_px"])
     if isinstance(value, np.ndarray):
         arr = value.astype(float).reshape(-1)
         if arr.size >= 2:
             return float(arr[0]), float(arr[1])
-
-    if isinstance(value, (list, tuple)) and len(value) >= 2:
-        try:
-            return float(value[0]), float(value[1])
-        except Exception:
-            return None
-
-    if isinstance(value, dict):
-        if "x" in value and "y" in value:
-            try:
-                return float(value["x"]), float(value["y"])
-            except Exception:
-                return None
-        if "x_px" in value and "y_px" in value:
-            try:
-                return float(value["x_px"]), float(value["y_px"])
-            except Exception:
-                return None
-
-    if hasattr(value, "x") and hasattr(value, "y"):
-        try:
-            return float(value.x), float(value.y)
-        except Exception:
-            return None
-
-    if hasattr(value, "x_px") and hasattr(value, "y_px"):
-        try:
-            return float(value.x_px), float(value.y_px)
-        except Exception:
-            return None
-
+    if isinstance(value, (tuple, list)) and len(value) >= 2:
+        return float(value[0]), float(value[1])
     return None
 
 
 def _coerce_bbox(value: Any) -> BBox:
-    if isinstance(value, np.ndarray):
-        arr = value.astype(float).reshape(-1)
-        if arr.size >= 4:
-            return int(round(arr[0])), int(round(arr[1])), int(round(arr[2])), int(round(arr[3]))
-
-    if isinstance(value, (list, tuple)) and len(value) >= 4:
-        return (
-            int(round(float(value[0]))),
-            int(round(float(value[1]))),
-            int(round(float(value[2]))),
-            int(round(float(value[3]))),
-        )
-
-    if isinstance(value, dict):
-        if all(k in value for k in ("x", "y", "w", "h")):
-            return (
-                int(round(float(value["x"]))),
-                int(round(float(value["y"]))),
-                int(round(float(value["w"]))),
-                int(round(float(value["h"]))),
-            )
-
+    if isinstance(value, (tuple, list, np.ndarray)) and len(value) >= 4:
+        return tuple(int(round(float(v))) for v in value[:4])  # type: ignore[return-value]
     return (0, 0, 0, 0)
+
+
+def _bbox_center_or_point(bbox: BBox, point: PointF) -> PointF:
+    x, y, w, h = bbox
+    return (float(x + w/2.0), float(y + h/2.0)) if w > 0 and h > 0 else point
+
+
+def _expand_bbox(bbox: BBox, margin: int) -> BBox:
+    x, y, w, h = bbox
+    return x-margin, y-margin, w+2*margin, h+2*margin
+
+
+def _point_in_bbox(point: PointF, bbox: BBox) -> bool:
+    x, y = point
+    bx, by, bw, bh = bbox
+    return bx <= x <= bx+bw and by <= y <= by+bh
 
 
 def _round_point(point: PointF) -> tuple[int, int]:
     return int(round(point[0])), int(round(point[1]))
 
 
-def _dataclass_to_dict(value: Any) -> dict[str, Any]:
-    if hasattr(value, "__dataclass_fields__"):
-        result = {}
-        for field_name in value.__dataclass_fields__:
-            result[field_name] = getattr(value, field_name)
-        return result
-    raise TypeError(f"Expected dataclass instance, got {type(value)!r}.")
-
-
 __all__ = [
-    "PointF",
-    "BBox",
-    "SingleCamDetectorConfig",
-    "SingleCamScoredEstimate",
-    "SingleCamDetectionResult",
-    "SingleCamDetector",
-    "build_single_cam_detector",
-    "detect_single_cam",
+    "PointF", "BBox", "SingleCamDetectorConfig", "KeypointImpactEstimate",
+    "SingleCamScoredEstimate", "SingleCamDetectionResult", "SingleCamDetector",
+    "build_single_cam_detector", "detect_single_cam",
 ]

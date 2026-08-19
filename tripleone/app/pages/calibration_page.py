@@ -53,6 +53,10 @@ from vision.calibration_geometry import (
 from vision.camera_manager import CameraWorker
 from vision.dart_detector import DartDetector
 
+SINGLE_CAMERA_TEST_MODE = False
+
+from vision.calibration_storage import CalibrationStorage
+
 
 class CalibrationCard(QFrame):
     """
@@ -450,39 +454,6 @@ class CalibrationCard(QFrame):
         arr = np.frombuffer(ptr, dtype=np.uint8).reshape((height, width, 4))
         return cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
 
-    def _build_board_mask(self, frame_shape) -> Optional[np.ndarray]:
-        """
-        Baut eine Maske für den eigentlichen Dartboard-Bereich.
-        Grundlage ist der äußerste Ring des Kalibrierungs-Overlays.
-        """
-        calibration = self.get_calibration_config()
-        polylines = generate_ring_polylines_image(calibration, degree_step=3)
-
-        if not polylines:
-            return None
-
-        outer_ring = polylines[0]
-        if outer_ring is None or len(outer_ring) < 8:
-            return None
-
-        if len(frame_shape) == 3:
-            height, width = frame_shape[:2]
-        else:
-            height, width = frame_shape
-
-        mask = np.zeros((height, width), dtype=np.uint8)
-
-        pts = np.round(np.asarray(outer_ring, dtype=np.float32)).astype(np.int32)
-        pts = pts.reshape(-1, 1, 2)
-
-        cv2.fillPoly(mask, [pts], 255)
-
-        # Kleine Reserve, damit Draht / Spitze am Rand nicht abgeschnitten werden
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
-        mask = cv2.dilate(mask, kernel, iterations=1)
-
-        return mask
-
     def _apply_board_mask_to_frame(self, frame_bgr: np.ndarray) -> np.ndarray:
         """
         Blendet alles außerhalb des Boards aus.
@@ -529,18 +500,6 @@ class CalibrationCard(QFrame):
         mask = cv2.dilate(mask, kernel, iterations=1)
 
         return mask
-
-    def _apply_board_mask_to_frame(self, frame_bgr: np.ndarray) -> np.ndarray:
-        """
-        Blendet alles außerhalb des Dartboards aus, damit der Detector
-        nur auf dem Board arbeitet.
-        """
-        mask = self._build_board_mask(frame_bgr.shape)
-        if mask is None:
-            return frame_bgr.copy()
-
-        masked = cv2.bitwise_and(frame_bgr, frame_bgr, mask=mask)
-        return masked
 
     def update_preview(self, image: QImage) -> None:
         self.preview.set_frame(image)
@@ -698,6 +657,13 @@ class CalibrationPage(QWidget):
         self.save_callback = save_callback
         self.available_cameras: List[Dict[str, int]] = []
 
+        # ------------------------------------------------------------
+        # Zentrale persistente Kalibrierung
+        # ------------------------------------------------------------
+        self.calibration_storage = CalibrationStorage(
+            base_dir="data",
+        )
+
         self.title_label = QLabel("TripleOne – Kalibrierung")
         self.title_label.setStyleSheet("font-size: 28px; font-weight: bold;")
 
@@ -712,6 +678,9 @@ class CalibrationPage(QWidget):
         self.card_2 = CalibrationCard("Kalibrierung – Kamera 2", slot_index=1)
         self.card_3 = CalibrationCard("Kalibrierung – Kamera 3", slot_index=2)
         self.cards = [self.card_1, self.card_2, self.card_3]
+        if SINGLE_CAMERA_TEST_MODE:
+            self.card_2.setVisible(False)
+            self.card_3.setVisible(False)
 
         self.start_button = QPushButton("Livebilder starten / aktualisieren")
         self.stop_button = QPushButton("Alle Kameras stoppen")
@@ -726,6 +695,23 @@ class CalibrationPage(QWidget):
         self.global_info_label.setStyleSheet("font-size: 12px; color: #8effc9; font-weight: 700;")
 
         self._build_ui()
+
+        # ------------------------------------------------------------
+        # Falls bereits eine persistente Kalibrierung vorhanden ist,
+        # ist diese die bevorzugte Quelle.
+        # ------------------------------------------------------------
+        stored_records = self.calibration_storage.load_all_records()
+
+        if stored_records:
+            (
+                self.camera_config,
+                self.calibration_config,
+            ) = self.calibration_storage.apply_records_to_app_configs(
+                records=stored_records,
+                base_camera_config=self.camera_config,
+                base_calibration_config=self.calibration_config,
+            )
+
         self._load_all_data()
 
     # ------------------------------------------------------------
@@ -756,9 +742,13 @@ class CalibrationPage(QWidget):
 
         cards_layout = QHBoxLayout()
         cards_layout.setSpacing(14)
-        cards_layout.addWidget(self.card_1, 1)
-        cards_layout.addWidget(self.card_2, 1)
-        cards_layout.addWidget(self.card_3, 1)
+
+        if SINGLE_CAMERA_TEST_MODE:
+            cards_layout.addWidget(self.card_1, 1)
+        else:
+            cards_layout.addWidget(self.card_1, 1)
+            cards_layout.addWidget(self.card_2, 1)
+            cards_layout.addWidget(self.card_3, 1)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
@@ -815,13 +805,61 @@ class CalibrationPage(QWidget):
     # Aktionen
     # ------------------------------------------------------------
 
+    
     def apply_preview(self) -> None:
+        camera_configs = self.camera_config.get("cameras", [])
+
+        if SINGLE_CAMERA_TEST_MODE:
+            # --------------------------------------------------------
+            # Testmodus:
+            # Nur Kalibrierung Kamera 1 darf die physische Kamera öffnen.
+            # Kamera 2 und 3 werden garantiert gestoppt.
+            # --------------------------------------------------------
+            self.card_2.stop_worker()
+            self.card_3.stop_worker()
+
+            if len(camera_configs) > 0:
+                selected_device_id = int(
+                    self.card_1.device_combo.currentData()
+                )
+
+                camera_configs[0]["device_id"] = selected_device_id
+                camera_configs[0]["enabled"] = True
+
+                self.card_1.set_camera_config(
+                    camera_configs[0]
+                )
+
+            self.card_1.start_worker()
+            return
+
+        # ------------------------------------------------------------
+        # Normalbetrieb später wieder für 3 Kameras
+        # ------------------------------------------------------------
+        used_device_ids: set[int] = set()
+
         for idx, card in enumerate(self.cards):
-            if idx < len(self.camera_config.get("cameras", [])):
-                # Beim Start die aktuelle UI-Auswahl als device_id übernehmen
-                selected_device_id = int(card.device_combo.currentData())
-                self.camera_config["cameras"][idx]["device_id"] = selected_device_id
-                card.set_camera_config(self.camera_config["cameras"][idx])
+            if idx >= len(camera_configs):
+                continue
+
+            selected_device_id = int(
+                card.device_combo.currentData()
+            )
+
+            if selected_device_id >= 0:
+                if selected_device_id in used_device_ids:
+                    card.stop_worker()
+                    card.set_status(
+                        f"Gerät {selected_device_id} bereits verwendet"
+                    )
+                    continue
+
+                used_device_ids.add(selected_device_id)
+
+            camera_configs[idx]["device_id"] = selected_device_id
+            card.set_camera_config(
+                camera_configs[idx]
+            )
 
             card.start_worker()
 
@@ -830,11 +868,129 @@ class CalibrationPage(QWidget):
             card.stop_worker()
 
     def save_settings(self) -> None:
-        self.calibration_config = self.collect_calibration_config()
-        self.save_callback(self.calibration_config)
+        # ------------------------------------------------------------
+        # 1. Alle drei aktuellen Kalibrierungen aus der UI holen
+        # ------------------------------------------------------------
+        self.calibration_config = (
+            self.collect_calibration_config()
+        )
+
+        camera_list = self.camera_config.get(
+            "cameras",
+            [],
+        )
+
+        # ------------------------------------------------------------
+        # 2. Physische Kamera-Zuordnung pro Slot übernehmen
+        # ------------------------------------------------------------
+        for idx, card in enumerate(self.cards):
+            if idx >= len(camera_list):
+                continue
+
+            selected_device_id = int(
+                card.device_combo.currentData()
+            )
+
+            camera_list[idx]["device_id"] = (
+                selected_device_id
+            )
+
+            card.camera_config["device_id"] = (
+                selected_device_id
+            )
+
+        # ------------------------------------------------------------
+        # 3. Kontrollieren, dass keine physische Kamera doppelt
+        #    verwendet wird
+        # ------------------------------------------------------------
+        used_device_ids: set[int] = set()
+
+        for idx, camera_config in enumerate(camera_list):
+            if not bool(
+                camera_config.get("enabled", True)
+            ):
+                continue
+
+            device_id = int(
+                camera_config.get("device_id", -1)
+            )
+
+            if device_id < 0:
+                continue
+
+            if device_id in used_device_ids:
+                QMessageBox.warning(
+                    self,
+                    "Kamera doppelt vergeben",
+                    (
+                        f"Die physische Kamera mit Index "
+                        f"{device_id} wurde mehrfach ausgewählt.\n\n"
+                        f"Bitte jeder Kalibrierung eine eigene "
+                        f"Kamera zuweisen."
+                    ),
+                )
+                return
+
+            used_device_ids.add(device_id)
+
+        # ------------------------------------------------------------
+        # 4. ALLE drei Kalibrierungen persistent speichern
+        # ------------------------------------------------------------
+        records = (
+            self.calibration_storage
+            .sync_from_app_configs(
+                camera_config=self.camera_config,
+                calibration_config=self.calibration_config,
+            )
+        )
+
+        # ------------------------------------------------------------
+        # 5. Bestehenden MainWindow-/Runtime-Pfad aktualisieren
+        # ------------------------------------------------------------
+        self.save_callback(
+            deepcopy(self.calibration_config)
+        )
+
+        # ------------------------------------------------------------
+        # 6. Speicherdatei direkt wieder lesen
+        # ------------------------------------------------------------
+        stored_records = (
+            self.calibration_storage
+            .load_all_records()
+        )
+
+        if not stored_records:
+            QMessageBox.critical(
+                self,
+                "Speicherfehler",
+                (
+                    "Die Kalibrierungen konnten nicht "
+                    "aus calibration_store.json "
+                    "zurückgelesen werden."
+                ),
+            )
+            return
+
+        # ------------------------------------------------------------
+        # 7. Benutzerfreundliche Bestätigung
+        # ------------------------------------------------------------
+        saved_text: list[str] = []
+
+        for record in stored_records:
+            saved_text.append(
+                (
+                    f"Kamera {record.camera_index + 1}: "
+                    f"Device {record.device_id} | "
+                    f"4 Punkte gespeichert"
+                )
+            )
 
         QMessageBox.information(
             self,
-            "Gespeichert",
-            "Die Kalibrierung aller Kamera-Slots wurde gespeichert.",
+            "Kalibrierungen gespeichert",
+            (
+                "Alle Kamera-Kalibrierungen wurden "
+                "dauerhaft gespeichert.\n\n"
+                + "\n".join(saved_text)
+            ),
         )

@@ -1,0 +1,104 @@
+{
+  "version": 1,
+  "cameras": [
+    {
+      "camera_index": 0,
+      "name": "Kamera 1",
+      "enabled": true,
+      "device_id": 0,
+      "width": 1280,
+      "height": 720,
+      "fps": 30,
+      "rotation": 0,
+      "flip": false,
+      "overlay_alpha": 0.4,
+      "show_numbers": true,
+      "show_sector_lines": true,
+      "manual_points": [
+        {
+          "x_px": 914,
+          "y_px": 521
+        },
+        {
+          "x_px": 359,
+          "y_px": 481
+        },
+        {
+          "x_px": 504,
+          "y_px": 208
+        },
+        {
+          "x_px": 865,
+          "y_px": 223
+        }
+      ],
+      "empty_board_reference_path": "data\\references\\camera_1_empty_board.png"
+    },
+    {
+      "camera_index": 1,
+      "name": "Kamera 2",
+      "enabled": true,
+      "device_id": 1,
+      "width": 1280,
+      "height": 720,
+      "fps": 30,
+      "rotation": 0,
+      "flip": false,
+      "overlay_alpha": 0.4,
+      "show_numbers": true,
+      "show_sector_lines": true,
+      "manual_points": [
+        {
+          "x_px": 799,
+          "y_px": 532
+        },
+        {
+          "x_px": 266,
+          "y_px": 465
+        },
+        {
+          "x_px": 447,
+          "y_px": 213
+        },
+        {
+          "x_px": 801,
+          "y_px": 236
+        }
+      ],
+      "empty_board_reference_path": "data\\references\\camera_2_empty_board.png"
+    },
+    {
+      "camera_index": 2,
+      "name": "Kamera 3",
+      "enabled": true,
+      "device_id": 2,
+      "width": 1280,
+      "height": 720,
+      "fps": 30,
+      "rotation": 0,
+      "flip": false,
+      "overlay_alpha": 0.4,
+      "show_numbers": true,
+      "show_sector_lines": true,
+      "manual_points": [
+        {
+          "x_px": 409,
+          "y_px": 344
+        },
+        {
+          "x_px": 734,
+          "y_px": 243
+        },
+        {
+          "x_px": 1020,
+          "y_px": 425
+        },
+        {
+          "x_px": 640,
+          "y_px": 642
+        }
+      ],
+      "empty_board_reference_path": "data\\references\\camera_3_empty_board.png"
+    }
+  ]
+}

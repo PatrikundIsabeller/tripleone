@@ -1,5 +1,43 @@
-debug_output/
-**/debug_output/
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+.venv/
+.venv-yolo/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# PyTorch / YOLO Modelle
+models/*.pt
+models/*.pth
+
+# Ultralytics Output
+runs/
+
+# Logs / temporäre Dateien
+*.log
+data/logs/
+
+# Python test/debug cache
 .pytest_cache/
+
+
+tripleone/debug_output/
+
+tripleone/models/
+
+tripleone/.venv-yolo/
+
+tripleone/**/__pycache__/
+
+tripleone/**/*.pyc

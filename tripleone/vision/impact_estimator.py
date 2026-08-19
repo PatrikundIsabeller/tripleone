@@ -207,23 +207,23 @@ class ImpactEstimatorConfig:
     Konfiguration der Impact-Schätzung.
 
     LIVE-DEFAULTS:
-    Für echte Mehrkamera-Setups wird die Spitze relativ zum Boardzentrum gesucht,
-    nicht relativ zur Bildrichtung nach unten.
+    Für echte Mehrkamera-Setups priorisieren wir konturbasierte,
+    spitzennähere Punkte statt grober Achsen-Endpunkte.
     """
-    strategy: str = "centerward_tip_consensus"
+    strategy: str = "blend"
 
     use_candidate_default: bool = False
     use_lowest_contour_point: bool = False
     use_major_axis_lower_endpoint: bool = False
-    use_major_axis_centerward_endpoint: bool = True
+    use_major_axis_centerward_endpoint: bool = False
     use_centerward_contour_tip: bool = True
     use_directional_contour_tip: bool = False
 
     weight_candidate_default: float = 0.00
     weight_lowest_contour_point: float = 0.00
     weight_major_axis_lower_endpoint: float = 0.00
-    weight_major_axis_centerward_endpoint: float = 1.00
-    weight_centerward_contour_tip: float = 0.90
+    weight_major_axis_centerward_endpoint: float = 0.35
+    weight_centerward_contour_tip: float = 0.95
     weight_directional_contour_tip: float = 0.00
 
     min_major_axis_length_for_axis_based_methods: float = 10.0
@@ -233,11 +233,12 @@ class ImpactEstimatorConfig:
     directional_tip_band_fraction: float = 0.12
     directional_tip_top_k_points: int = 4
 
-    centerward_tip_top_k_points: int = 6
-    centerward_tip_distance_weight: float = 0.85
-    centerward_tip_forward_weight: float = 0.15
+    # Weniger Mittelung -> weniger Drift in Richtung Barrel/Körper
+    centerward_tip_top_k_points: int = 1
+    centerward_tip_distance_weight: float = 0.95
+    centerward_tip_forward_weight: float = 0.05
     centerward_tip_requires_axis_agreement: bool = True
-    centerward_tip_max_distance_from_centerward_axis_px: float = 20.0
+    centerward_tip_max_distance_from_centerward_axis_px: float = 10.0
 
     consistency_distance_scale_px: float = 12.0
     weight_source_candidate_confidence: float = 0.60
@@ -248,15 +249,16 @@ class ImpactEstimatorConfig:
 
     # --------------------------------------------------------------
     # Boardnahe Konturspitze für große Dartkonturen
-    # LIVE-DEFAULT: AN
+    # WICHTIG: jetzt wirklich aktiv
     # --------------------------------------------------------------
     use_board_near_contour_tip: bool = False
 
-    board_near_tip_top_k_points: int = 2
-    board_near_tip_distance_weight: float = 1.50
-    board_near_tip_forward_weight: float = 2.40
-    board_near_tip_max_distance_from_axis_px: float = 14.0
-    weight_board_near_contour_tip: float = 0.00
+    board_near_tip_top_k_points: int = 1
+    board_near_tip_distance_weight: float = 2.20
+    board_near_tip_forward_weight: float = 2.80
+    board_near_tip_max_distance_from_axis_px: float = 18.0
+    weight_board_near_contour_tip: float = 1.40
+
     # --------------------------------------------------------------
     # Live-Tuning
     # --------------------------------------------------------------
@@ -274,8 +276,9 @@ class ImpactEstimatorConfig:
     board_near_live_penalty: float = 0.30
     candidate_default_live_penalty: float = 0.45
 
+    # Blend soll tatsächlich zur spitzennahen Hypothese gezogen werden
     blend_tip_pull_enabled: bool = False
-    blend_tip_pull_strength: float = 0.72
+    blend_tip_pull_strength: float = 0.82
 
 
 # -----------------------------------------------------------------------------
@@ -1421,6 +1424,13 @@ class ImpactEstimator:
 
         weighted_point = np.average(points, axis=0, weights=weights)
         chosen_point = (float(weighted_point[0]), float(weighted_point[1]))
+
+        if self.config.blend_tip_pull_enabled:
+            chosen_point = self._pull_blend_towards_tip_reference(
+                candidate,
+                chosen_point,
+                active_hypotheses,
+            )
 
         aggregate_strength = float(np.mean(weights))
         spread_px = _compute_weighted_spread(chosen_point, active_hypotheses)

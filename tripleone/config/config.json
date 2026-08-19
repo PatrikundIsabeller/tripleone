@@ -8,16 +8,6 @@
     "cameras": [
         {
             "name": "Kamera 1",
-            "device_id": 0,
-            "width": 1280,
-            "height": 720,
-            "fps": 30,
-            "rotation": 0,
-            "flip": false,
-            "enabled": true
-        },
-        {
-            "name": "Kamera 2",
             "device_id": 1,
             "width": 1280,
             "height": 720,
@@ -27,14 +17,24 @@
             "enabled": true
         },
         {
-            "name": "Kamera 3",
-            "device_id": 2,
+            "name": "Kamera 2",
+            "device_id": -1,
             "width": 1280,
             "height": 720,
             "fps": 30,
             "rotation": 0,
             "flip": false,
-            "enabled": true
+            "enabled": false
+        },
+        {
+            "name": "Kamera 3",
+            "device_id": -1,
+            "width": 1280,
+            "height": 720,
+            "fps": 30,
+            "rotation": 0,
+            "flip": false,
+            "enabled": false
         }
     ]
 }

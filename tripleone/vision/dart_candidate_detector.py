@@ -105,6 +105,13 @@ class CandidateDetectorConfig:
     large_candidate_area_penalty_start: float = 900.0
     large_candidate_area_penalty_max: float = 0.30
 
+    # --------------------------------------------------------------
+    # Radiale Plausibilität relativ zum Boardzentrum
+    # --------------------------------------------------------------
+    require_radial_alignment_when_board_center_available: bool = True
+    min_radial_alignment: float = 0.42
+    weight_radial_alignment: float = 0.28
+
 
 # -----------------------------------------------------------------------------
 # Datenmodelle für Kandidaten und Ergebnisse
@@ -695,6 +702,20 @@ class DartCandidateDetector:
         if metrics.extent < self.config.min_extent or metrics.extent > self.config.max_extent:
             return None, f"extent_outside[{self.config.min_extent},{self.config.max_extent}]"
 
+        
+        radial_alignment = _compute_radial_alignment(
+            metrics,
+            board_center_image=board_center_image,
+        )
+
+        if (
+            board_center_image is not None
+            and self.config.require_radial_alignment_when_board_center_available
+            and radial_alignment is not None
+            and radial_alignment < float(self.config.min_radial_alignment)
+        ):
+            return None, f"radial_alignment<{self.config.min_radial_alignment:.2f}"
+
         impact_point = self._estimate_candidate_impact_point(
             metrics,
             board_center_image=board_center_image,
@@ -703,6 +724,7 @@ class DartCandidateDetector:
         confidence, confidence_debug = self._score_candidate(
             metrics,
             max_contour_area=max_contour_area,
+            radial_alignment=radial_alignment,
         )
 
         if confidence < self.config.min_confidence:
@@ -735,6 +757,7 @@ class DartCandidateDetector:
                 "contour_rightmost_point": metrics.contour_rightmost_point,
                 "major_axis_endpoint_a": metrics.major_axis_endpoint_a,
                 "major_axis_endpoint_b": metrics.major_axis_endpoint_b,
+                "radial_alignment": radial_alignment,
                 "confidence_parts": confidence_debug,
                 "impact_point_mode": self.config.impact_point_mode,
                 "impact_point_mode_effective": (
@@ -800,6 +823,7 @@ class DartCandidateDetector:
         metrics: ContourMetrics,
         *,
         max_contour_area: float,
+        radial_alignment: Optional[float] = None,
     ) -> tuple[float, dict[str, float]]:
         """
         Bewertet, wie plausibel eine Kontur als Dart-/Impact-Kandidat ist.
@@ -839,6 +863,13 @@ class DartCandidateDetector:
         non_round_score = _clip01(1.0 - min(metrics.circularity, 1.0))
         border_penalty = 0.20 if metrics.touches_image_border else 0.0
 
+        if radial_alignment is None:
+            radial_alignment_score = 0.50
+        else:
+            # 0.20 -> sehr schwach
+            # 1.00 -> sehr gut radial
+            radial_alignment_score = _clip01((float(radial_alignment) - 0.20) / 0.80)
+
         large_candidate_penalty = 0.0
         if self.config.penalize_very_large_candidates:
             start = float(self.config.large_candidate_area_penalty_start)
@@ -849,12 +880,15 @@ class DartCandidateDetector:
                 scale = max(start, 1.0)
                 large_candidate_penalty = min(max_penalty, (over / scale) * max_penalty)
 
+        radial_weight = float(self.config.weight_radial_alignment)
+
         weighted = (
-            0.20 * area_score
-            + 0.32 * aspect_score
-            + 0.18 * solidity_score
-            + 0.15 * extent_score
-            + 0.15 * non_round_score
+            0.16 * area_score
+            + 0.26 * aspect_score
+            + 0.15 * solidity_score
+            + 0.12 * extent_score
+            + 0.13 * non_round_score
+            + radial_weight * radial_alignment_score
         ) - border_penalty - large_candidate_penalty
 
         confidence = _clip01(weighted)
@@ -864,6 +898,8 @@ class DartCandidateDetector:
             "solidity_score": float(solidity_score),
             "extent_score": float(extent_score),
             "non_round_score": float(non_round_score),
+            "radial_alignment": None if radial_alignment is None else float(radial_alignment),
+            "radial_alignment_score": float(radial_alignment_score),
             "border_penalty": float(border_penalty),
             "large_candidate_penalty": float(large_candidate_penalty),
             "weighted_confidence": float(confidence),
@@ -1155,6 +1191,37 @@ def _compute_major_axis_endpoints(points: np.ndarray) -> tuple[PointF, PointF]:
         (float(point_a[0]), float(point_a[1])),
         (float(point_b[0]), float(point_b[1])),
     )
+
+def _compute_radial_alignment(
+    metrics: ContourMetrics,
+    board_center_image: Optional[PointF],
+) -> Optional[float]:
+    """
+    Misst, wie gut die Hauptachse der Kontur radial zum Boardzentrum ausgerichtet ist.
+
+    1.0 = sehr gut radial
+    0.0 = stark quer / unplausibel
+    """
+    if board_center_image is None:
+        return None
+
+    a = np.asarray(metrics.major_axis_endpoint_a, dtype=np.float64)
+    b = np.asarray(metrics.major_axis_endpoint_b, dtype=np.float64)
+    axis_vec = b - a
+    axis_norm = float(np.linalg.norm(axis_vec))
+    if axis_norm <= 1e-9:
+        return None
+    axis_unit = axis_vec / axis_norm
+
+    center = np.asarray(board_center_image, dtype=np.float64)
+    centroid = np.asarray(metrics.centroid, dtype=np.float64)
+    radial_vec = centroid - center
+    radial_norm = float(np.linalg.norm(radial_vec))
+    if radial_norm <= 1e-9:
+        return None
+    radial_unit = radial_vec / radial_norm
+
+    return float(abs(np.dot(axis_unit, radial_unit)))
 
 
 def _dataclass_to_dict(value: Any) -> dict[str, Any]:

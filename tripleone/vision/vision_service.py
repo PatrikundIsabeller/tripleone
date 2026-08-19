@@ -243,6 +243,27 @@ class VisionService:
     def set_default_detector(self, detector: SingleCamDetector) -> None:
         self._default_detector = detector
 
+    def _reset_detector_tracking(self, camera_id: int) -> None:
+        """
+        Setzt einen eventuell gelockten KI-TIP der Kamera zurück.
+
+        Absichtlich tolerant, damit auch ältere/Fake-Detectoren
+        ohne reset_tracking() weiterhin funktionieren.
+        """
+        detector = self._get_detector(int(camera_id))
+
+        if detector is None:
+            return
+
+        reset_method = getattr(
+            detector,
+            "reset_tracking",
+            None,
+        )
+
+        if callable(reset_method):
+            reset_method()
+
     def get_state(self, camera_id: int) -> CameraVisionState:
         return self._ensure_state(camera_id)
 
@@ -289,6 +310,9 @@ class VisionService:
         state.clear_board_consecutive_ok = 0
         state.last_status = STATUS_READY
         self._reset_pending_hit(state)
+
+        # Neue Leerboard-Referenz = alter Dart-Track ist ungültig.
+        self._reset_detector_tracking(camera_id)
 
         if self.config.auto_arm_on_reference_save:
             state.armed = True
@@ -412,6 +436,11 @@ class VisionService:
                 state.clear_board_consecutive_ok = 0
                 state.last_status = STATUS_READY
                 self._reset_pending_hit(state)
+
+                # Dart wurde entfernt:
+                # gelockte KI-Spitze freigeben.
+                self._reset_detector_tracking(camera_id)
+
                 return VisionServiceResult(
                     camera_id=camera_id,
                     timestamp=ts,
