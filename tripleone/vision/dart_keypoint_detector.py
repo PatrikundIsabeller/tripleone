@@ -59,9 +59,30 @@ class DartKeypointDetectorConfig:
     enforce_roi: bool = True
     use_board_crop: bool = True
     board_crop_margin_px: int = 120
-    require_local_change: bool = True
+    require_local_change: bool = False
     local_change_patch_radius_px: int = 16
     local_change_mean_absdiff_threshold: float = 5.0
+
+    # --------------------------------------------------------------
+    # Lokale Präzisierung der von YOLO geschätzten Dartspitze
+    # --------------------------------------------------------------
+    tip_refinement_enabled: bool = True
+
+    # Suchradius um den YOLO-TIP.
+    tip_refinement_radius_px: int = 32
+
+    # Mindestdifferenz zum Leerboard für einen veränderten Pixel.
+    tip_refinement_diff_threshold: int = 18
+
+    # Wie weit der korrigierte TIP maximal vom YOLO-TIP weg sein darf.
+    tip_refinement_max_shift_px: float = 26.0
+
+    # Breite des Suchkorridors entlang der Dartachse.
+    tip_refinement_axis_width_px: float = 14.0
+
+    # Mindestens so viele veränderte Pixel müssen vorhanden sein.
+    tip_refinement_min_pixels: int = 6
+
     keep_debug_images: bool = True
 
     # --------------------------------------------------------------
@@ -191,41 +212,100 @@ class TemporalTipTracker:
     ) -> Optional[PointF]:
 
         # ----------------------------------------------------------
-        # In diesem Frame wurde kein TIP erkannt
+        # 1. In diesem Frame wurde KEIN TIP erkannt
         # ----------------------------------------------------------
         if point is None:
             self._missing_frames += 1
 
-            if self._last_stable_point is not None:
+            # Kurze YOLO-Aussetzer überbrücken.
+            #
+            # Dadurch blinkt der Punkt nicht sofort,
+            # wenn YOLO für wenige Frames nichts erkennt.
+            if (
+                self._last_stable_point is not None
+                and self._missing_frames <= self.hold_missing_frames
+            ):
                 return self._last_stable_point
+
+            # ------------------------------------------------------
+            # Zu viele Frames ohne TIP:
+            # Dart gilt als verschwunden.
+            #
+            # Track vollständig zurücksetzen.
+            # ------------------------------------------------------
+            if self._missing_frames > self.hold_missing_frames:
+                self._points.clear()
+                self._last_stable_point = None
+                self._missing_frames = 0
 
             return None
 
+        # ----------------------------------------------------------
+        # 2. Ein aktueller TIP wurde erkannt
+        # ----------------------------------------------------------
         self._missing_frames = 0
-
-        # ----------------------------------------------------------
-        # Einmal stabil erkannt = Position einfrieren
-        # ----------------------------------------------------------
-        if self._last_stable_point is not None:
-            return self._last_stable_point
 
         clean_point = (
             float(point[0]),
             float(point[1]),
         )
 
+        # ----------------------------------------------------------
+        # 3. Falls bereits ein stabiler TIP existiert:
+        #
+        # Nicht sofort auf jede neue YOLO-Position springen.
+        # Kleine Bewegungen werden geglättet.
+        # ----------------------------------------------------------
+        if self._last_stable_point is not None:
+            distance = _point_distance(
+                clean_point,
+                self._last_stable_point,
+            )
+
+            # ------------------------------------------------------
+            # Kleine Abweichung:
+            # sehr sanft nachführen.
+            # ------------------------------------------------------
+            if distance <= self.max_distance_px:
+                alpha = 0.05
+
+                smoothed_point = (
+                    (1.0 - alpha) * self._last_stable_point[0]
+                    + alpha * clean_point[0],
+
+                    (1.0 - alpha) * self._last_stable_point[1]
+                    + alpha * clean_point[1],
+                )
+
+                self._last_stable_point = smoothed_point
+
+                return self._last_stable_point
+
+            # ------------------------------------------------------
+            # Großer Sprung:
+            # nicht sofort übernehmen.
+            #
+            # Könnte eine falsche Detection oder ein neuer Dart sein.
+            # Den bestehenden Lock vorerst halten.
+            # ------------------------------------------------------
+            return self._last_stable_point
+
+        # ----------------------------------------------------------
+        # 4. Noch kein stabiler TIP:
+        # aktuellen Punkt in zeitlichen Puffer aufnehmen.
+        # ----------------------------------------------------------
         self._points.append(clean_point)
 
-        # Nur die letzten N Erkennungen behalten
+        # Nur die letzten N Punkte behalten
         if len(self._points) > self.window_size:
             self._points = self._points[-self.window_size:]
 
-        # Noch nicht genug Punkte für eine stabile Entscheidung
+        # Noch nicht genug Beobachtungen
         if len(self._points) < self.min_stable_points:
             return None
 
         # ----------------------------------------------------------
-        # Größten räumlichen Cluster suchen
+        # 5. Größten räumlichen Cluster suchen
         # ----------------------------------------------------------
         best_cluster: list[PointF] = []
 
@@ -244,20 +324,22 @@ class TemporalTipTracker:
             if len(cluster) > len(best_cluster):
                 best_cluster = cluster
 
-        # Noch nicht genug übereinstimmende Punkte
+        # Noch nicht genügend zusammenpassende Punkte
         if len(best_cluster) < self.min_stable_points:
             return None
 
         # ----------------------------------------------------------
-        # Median ist robuster gegen einzelne Ausreißer
+        # 6. Stabilen TIP aus dem Cluster berechnen
+        #
+        # Median ist robust gegen einzelne Ausreißer.
         # ----------------------------------------------------------
         xs = np.asarray(
-            [point[0] for point in best_cluster],
+            [p[0] for p in best_cluster],
             dtype=np.float32,
         )
 
         ys = np.asarray(
-            [point[1] for point in best_cluster],
+            [p[1] for p in best_cluster],
             dtype=np.float32,
         )
 
@@ -267,25 +349,8 @@ class TemporalTipTracker:
         )
 
         # ----------------------------------------------------------
-        # Zusätzliche zeitliche Glättung.
-        #
-        # 0.20 bedeutet:
-        # - 80 % alter stabiler Punkt
-        # - 20 % neuer Median
-        #
-        # Dadurch bewegt sich der Marker deutlich ruhiger.
+        # 7. Stabilen TIP locken
         # ----------------------------------------------------------
-        if self._last_stable_point is not None:
-            alpha = 0.05
-
-            stable_point = (
-                (1.0 - alpha) * self._last_stable_point[0]
-                + alpha * stable_point[0],
-
-                (1.0 - alpha) * self._last_stable_point[1]
-                + alpha * stable_point[1],
-            )
-
         self._last_stable_point = stable_point
 
         return stable_point
@@ -466,10 +531,38 @@ class DartKeypointDetector:
         result = results[0]
 
         # --------------------------------------------------------------
+        # Debug:
+        # Hat YOLO im Crop überhaupt etwas erkannt?
+        # --------------------------------------------------------------
+        keypoints_obj = getattr(result, "keypoints", None)
+        boxes_obj = getattr(result, "boxes", None)
+
+        model_keypoint_count = 0
+        model_box_count = 0
+
+        if keypoints_obj is not None:
+            kp_xy = getattr(keypoints_obj, "xy", None)
+
+            if kp_xy is not None:
+                try:
+                    model_keypoint_count = int(kp_xy.shape[0])
+                except Exception:
+                    model_keypoint_count = 0
+
+        if boxes_obj is not None:
+            box_xyxy = getattr(boxes_obj, "xyxy", None)
+
+            if box_xyxy is not None:
+                try:
+                    model_box_count = int(box_xyxy.shape[0])
+                except Exception:
+                    model_box_count = 0
+
+        # --------------------------------------------------------------
         # Rohe YOLO-Erkennungen
         #
         # Achtung:
-        # _extract() arbeitet jetzt innerhalb des Crop-Bildes.
+        # _extract() arbeitet innerhalb des Crop-Bildes.
         # --------------------------------------------------------------
         detections = self._extract(
             result,
@@ -477,6 +570,8 @@ class DartKeypointDetector:
             inference_reference_frame,
             inference_roi_mask,
         )
+
+        
 
         # --------------------------------------------------------------
         # Crop-Koordinaten wieder auf das originale 1280x720-Bild
@@ -535,6 +630,7 @@ class DartKeypointDetector:
             reverse=True,
         )
 
+
         # --------------------------------------------------------------
         # Zeitliche TIP-Stabilisierung
         # --------------------------------------------------------------
@@ -586,6 +682,7 @@ class DartKeypointDetector:
             stable_tip = self._tip_tracker.update(
                 raw_tip
             )
+
 
             # ----------------------------------------------------------
             # Noch kein stabiler TIP
@@ -781,6 +878,63 @@ class DartKeypointDetector:
                 continue
             if not (0.0 <= x < frame.shape[1] and 0.0 <= y < frame.shape[0]):
                 continue
+            # ----------------------------------------------------------
+            # YOLO Bounding Box bereits hier bestimmen.
+            # Wird für die lokale TIP-Richtung benötigt.
+            # ----------------------------------------------------------
+            bbox: BBox = (0, 0, 0, 0)
+
+            if box_xyxy is not None and i < len(box_xyxy):
+                x1_box, y1_box, x2_box, y2_box = [
+                    float(v)
+                    for v in box_xyxy[i][:4]
+                ]
+
+                bbox = (
+                    int(round(x1_box)),
+                    int(round(y1_box)),
+                    max(
+                        0,
+                        int(round(x2_box - x1_box)),
+                    ),
+                    max(
+                        0,
+                        int(round(y2_box - y1_box)),
+                    ),
+                )
+
+            # ----------------------------------------------------------
+            # Lokale TIP-Verfeinerung
+            # ----------------------------------------------------------
+            raw_yolo_tip = (
+                float(x),
+                float(y),
+            )
+
+            if (
+                self.config.tip_refinement_enabled
+                and reference_frame is not None
+            ):
+                refined_tip = _refine_tip_from_reference(
+                    frame=frame,
+                    reference_frame=reference_frame,
+                    predicted_tip=raw_yolo_tip,
+                    bbox=bbox,
+                    radius_px=self.config.tip_refinement_radius_px,
+                    diff_threshold=self.config.tip_refinement_diff_threshold,
+                    max_shift_px=self.config.tip_refinement_max_shift_px,
+                    axis_width_px=self.config.tip_refinement_axis_width_px,
+                    min_pixels=self.config.tip_refinement_min_pixels,
+                )
+
+                x = float(
+                    refined_tip[0]
+                )
+
+                y = float(
+                    refined_tip[1]
+                )
+
             if self.config.enforce_roi and roi_mask is not None:
                 if not _inside_mask((x, y), roi_mask):
                     continue
@@ -812,15 +966,6 @@ class DartKeypointDetector:
                 if change_score < float(self.config.local_change_mean_absdiff_threshold):
                     continue
 
-            bbox: BBox = (0, 0, 0, 0)
-            if box_xyxy is not None and i < len(box_xyxy):
-                x1, y1, x2, y2 = [float(v) for v in box_xyxy[i][:4]]
-                bbox = (
-                    int(round(x1)), int(round(y1)),
-                    max(0, int(round(x2 - x1))),
-                    max(0, int(round(y2 - y1))),
-                )
-
             class_id = None
             class_name = None
             if box_cls is not None and i < len(box_cls):
@@ -840,7 +985,17 @@ class DartKeypointDetector:
                     bbox=bbox,
                     class_id=class_id,
                     class_name=class_name,
-                    debug={"local_change_score": change_score},
+                    debug={
+                        "local_change_score": change_score,
+                        "raw_yolo_tip": raw_yolo_tip,
+                        "refined_tip": (
+                            float(x),
+                            float(y),
+                        ),
+                        "tip_refinement_enabled": bool(
+                            self.config.tip_refinement_enabled
+                        ),
+                    },
                 )
             )
 
@@ -939,6 +1094,284 @@ def _point_distance(
         math.sqrt(
             dx * dx + dy * dy
         )
+    )
+
+def _refine_tip_from_reference(
+    *,
+    frame: np.ndarray,
+    reference_frame: Optional[np.ndarray],
+    predicted_tip: PointF,
+    bbox: BBox,
+    radius_px: int,
+    diff_threshold: int,
+    max_shift_px: float,
+    axis_width_px: float,
+    min_pixels: int,
+) -> PointF:
+    """
+    Verfeinert einen von YOLO geschätzten Dart-TIP anhand der
+    Bilddifferenz zum leeren Board.
+
+    YOLO liefert nur den ungefähren TIP.
+    Die lokale Bilddifferenz sucht anschließend den tatsächlichen
+    äußersten Dartpunkt entlang der Dartachse.
+
+    Falls keine sichere Verfeinerung möglich ist, wird unverändert
+    predicted_tip zurückgegeben.
+    """
+
+    if reference_frame is None:
+        return predicted_tip
+
+    if (
+        frame is None
+        or reference_frame is None
+        or frame.shape[:2] != reference_frame.shape[:2]
+    ):
+        return predicted_tip
+
+    height, width = frame.shape[:2]
+
+    tip_x = float(predicted_tip[0])
+    tip_y = float(predicted_tip[1])
+
+    radius = max(
+        6,
+        int(radius_px),
+    )
+
+    # ----------------------------------------------------------
+    # Lokale ROI um den YOLO-TIP
+    # ----------------------------------------------------------
+    x1 = max(
+        0,
+        int(round(tip_x)) - radius,
+    )
+
+    y1 = max(
+        0,
+        int(round(tip_y)) - radius,
+    )
+
+    x2 = min(
+        width,
+        int(round(tip_x)) + radius + 1,
+    )
+
+    y2 = min(
+        height,
+        int(round(tip_y)) + radius + 1,
+    )
+
+    if x2 <= x1 or y2 <= y1:
+        return predicted_tip
+
+    current_crop = frame[
+        y1:y2,
+        x1:x2,
+    ]
+
+    reference_crop = reference_frame[
+        y1:y2,
+        x1:x2,
+    ]
+
+    if (
+        current_crop.size == 0
+        or reference_crop.size == 0
+    ):
+        return predicted_tip
+
+    # ----------------------------------------------------------
+    # Graubilder erzeugen
+    # ----------------------------------------------------------
+    if current_crop.ndim == 3:
+        current_gray = cv2.cvtColor(
+            current_crop,
+            cv2.COLOR_BGR2GRAY,
+        )
+    else:
+        current_gray = current_crop
+
+    if reference_crop.ndim == 3:
+        reference_gray = cv2.cvtColor(
+            reference_crop,
+            cv2.COLOR_BGR2GRAY,
+        )
+    else:
+        reference_gray = reference_crop
+
+    # ----------------------------------------------------------
+    # Differenz zum leeren Board
+    # ----------------------------------------------------------
+    diff = cv2.absdiff(
+        current_gray,
+        reference_gray,
+    )
+
+    diff = cv2.GaussianBlur(
+        diff,
+        (3, 3),
+        0,
+    )
+
+    _, changed_mask = cv2.threshold(
+        diff,
+        int(diff_threshold),
+        255,
+        cv2.THRESH_BINARY,
+    )
+
+    # Kleine Einzelpixel entfernen.
+    kernel = np.ones(
+        (3, 3),
+        dtype=np.uint8,
+    )
+
+    changed_mask = cv2.morphologyEx(
+        changed_mask,
+        cv2.MORPH_OPEN,
+        kernel,
+    )
+
+    ys, xs = np.where(
+        changed_mask > 0
+    )
+
+    if len(xs) < int(min_pixels):
+        return predicted_tip
+
+    # Lokale Pixel -> Bildkoordinaten
+    candidate_x = (
+        xs.astype(np.float32)
+        + float(x1)
+    )
+
+    candidate_y = (
+        ys.astype(np.float32)
+        + float(y1)
+    )
+
+    # ----------------------------------------------------------
+    # Dartachse bestimmen.
+    #
+    # Richtung:
+    # Bounding-Box-Zentrum -> YOLO-TIP
+    #
+    # Damit funktioniert das unabhängig davon, von welcher Seite
+    # die Kamera auf das Board schaut.
+    # ----------------------------------------------------------
+    bx, by, bw, bh = bbox
+
+    if bw > 0 and bh > 0:
+        center_x = float(
+            bx + bw / 2.0
+        )
+
+        center_y = float(
+            by + bh / 2.0
+        )
+
+    else:
+        # Ohne brauchbare Bounding Box keine sichere Richtung.
+        return predicted_tip
+
+    direction_x = (
+        tip_x - center_x
+    )
+
+    direction_y = (
+        tip_y - center_y
+    )
+
+    direction_length = math.hypot(
+        direction_x,
+        direction_y,
+    )
+
+    if direction_length < 2.0:
+        return predicted_tip
+
+    direction_x /= direction_length
+    direction_y /= direction_length
+
+    # Senkrechte Achse zur Dartachse
+    normal_x = -direction_y
+    normal_y = direction_x
+
+    # ----------------------------------------------------------
+    # Kandidaten relativ zum ursprünglichen YOLO-TIP
+    # ----------------------------------------------------------
+    rel_x = candidate_x - tip_x
+    rel_y = candidate_y - tip_y
+
+    # Position entlang der Dartachse.
+    axial = (
+        rel_x * direction_x
+        + rel_y * direction_y
+    )
+
+    # Abstand seitlich zur Dartachse.
+    perpendicular = np.abs(
+        rel_x * normal_x
+        + rel_y * normal_y
+    )
+
+    # Euklidischer Abstand zum ursprünglichen TIP.
+    distance = np.sqrt(
+        rel_x * rel_x
+        + rel_y * rel_y
+    )
+
+    valid = (
+        (distance <= float(max_shift_px))
+        & (
+            perpendicular
+            <= float(axis_width_px)
+        )
+    )
+
+    if not np.any(valid):
+        return predicted_tip
+
+    valid_indices = np.where(
+        valid
+    )[0]
+
+    # ----------------------------------------------------------
+    # Äußersten veränderten Punkt in Dart-Richtung suchen.
+    #
+    # Größerer axial-Wert =
+    # weiter vom Dartkörper Richtung Spitze.
+    # ----------------------------------------------------------
+    best_index = valid_indices[
+        int(
+            np.argmax(
+                axial[valid_indices]
+            )
+        )
+    ]
+
+    refined_x = float(
+        candidate_x[best_index]
+    )
+
+    refined_y = float(
+        candidate_y[best_index]
+    )
+
+    # Sicherheitsprüfung
+    shift = math.hypot(
+        refined_x - tip_x,
+        refined_y - tip_y,
+    )
+
+    if shift > float(max_shift_px):
+        return predicted_tip
+
+    return (
+        refined_x,
+        refined_y,
     )
 
 def _compute_board_crop_rect(

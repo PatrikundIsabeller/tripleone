@@ -105,6 +105,11 @@ class VisionServiceConfig:
     # wieder als frei.
     clear_board_required_consecutive_frames: int = 2
 
+    # Für die neue Board-Clear-Logik:
+    # Erst wenn mehrere Frames hintereinander KEIN stabiler Dart-TIP
+    # mehr erkannt wird, gilt der Dart als entfernt.
+    clear_no_tip_required_consecutive_frames: int = 5
+
     # Soll die Board-Maske für die Board-clear-Prüfung verwendet werden?
     use_board_mask_for_clear_check: bool = True
 
@@ -417,56 +422,167 @@ class VisionService:
         # 1) Falls auf Board-clear gewartet wird: nur Clear-Logik
         # -------------------------------------------------------------
         if state.awaiting_clear_board and self.config.require_board_clear_after_hit:
+            # -------------------------------------------------------------
+            # BOARD-CLEAR-LOGIK
+            #
+            # Die alte Methode hat ausschließlich die Bilddifferenz zum
+            # Leerboard verwendet. Das ist bei drei Kameras mit verschiedenen
+            # Blickwinkeln, Belichtung und Auto-Exposure nicht robust genug.
+            #
+            # Neue Hauptentscheidung:
+            #
+            #     Dart-TIP vorhanden      -> Board NICHT frei
+            #     mehrere Frames kein TIP -> Dart wurde entfernt
+            #
+            # Die Diff-Ratio bleibt nur noch als Diagnosewert erhalten.
+            # -------------------------------------------------------------
+
+            # -------------------------------------------------------------
+            # 1. Diff-Ratio weiterhin berechnen – aber NICHT mehr als
+            #    alleinige Freigabeentscheidung verwenden.
+            # -------------------------------------------------------------
             board_changed_ratio = self._compute_board_changed_ratio(
                 current_frame=frame,
                 reference_frame=state.reference_frame,
-                board_mask=state.board_mask if self.config.use_board_mask_for_clear_check else None,
-            )
-            board_is_clear = (
-                board_changed_ratio <= float(self.config.clear_board_changed_ratio_threshold)
+                board_mask=(
+                    state.board_mask
+                    if self.config.use_board_mask_for_clear_check
+                    else None
+                ),
             )
 
-            if board_is_clear:
-                state.clear_board_consecutive_ok += 1
-            else:
+            # -------------------------------------------------------------
+            # 2. Detector auch während WAITING_FOR_CLEAR weiterlaufen lassen.
+            #
+            # Dadurch bekommt auch der TemporalTipTracker weiterhin Frames.
+            # Wenn der Dart entfernt wurde, läuft dessen Missing-Frame-
+            # Logik aus und der alte stabile TIP wird gelöscht.
+            # -------------------------------------------------------------
+            try:
+                clear_detection_result = detector.detect(
+                    frame=frame,
+                    reference_frame=state.reference_frame,
+                    board_mask=state.board_mask,
+                    board_polygon=None,
+                )
+
+            except Exception as exc:
+                # Bei einem Detector-Fehler niemals versehentlich das Board
+                # freigeben.
                 state.clear_board_consecutive_ok = 0
+                state.last_status = STATUS_WAITING_FOR_CLEAR
 
-            if state.clear_board_consecutive_ok >= int(self.config.clear_board_required_consecutive_frames):
+                return VisionServiceResult(
+                    camera_id=camera_id,
+                    timestamp=ts,
+                    status=STATUS_WAITING_FOR_CLEAR,
+                    message=(
+                        "Warte auf freies Board – "
+                        f"Clear-Detector-Fehler: {exc}"
+                    ),
+                    hit_event=state.last_hit_event,
+                    detection_result=state.last_detection_result,
+                    board_is_clear=False,
+                    board_changed_ratio=board_changed_ratio,
+                    debug={
+                        "awaiting_clear_board": True,
+                        "clear_detector_error": str(exc),
+                    },
+                )
+
+            # -------------------------------------------------------------
+            # 3. Prüfen, ob der Detector aktuell noch einen Dart sieht.
+            # -------------------------------------------------------------
+            clear_candidate_hit = self._build_candidate_hit_event(
+                camera_id=camera_id,
+                timestamp=ts,
+                detection_result=clear_detection_result,
+            )
+
+            dart_tip_present = clear_candidate_hit is not None
+
+            # -------------------------------------------------------------
+            # 4. Clear-Zähler
+            #
+            # Dart noch sichtbar:
+            #     -> sofort wieder auf 0
+            #
+            # Kein Dart sichtbar:
+            #     -> einen Frame Richtung "frei"
+            # -------------------------------------------------------------
+            if dart_tip_present:
+                state.clear_board_consecutive_ok = 0
+            else:
+                state.clear_board_consecutive_ok += 1
+
+            required_clear_frames = max(
+                1,
+                int(
+                    self.config.clear_no_tip_required_consecutive_frames
+                ),
+            )
+
+            # -------------------------------------------------------------
+            # 5. Genug Frames hintereinander ohne stabilen Dart:
+            #    vorherigen Wurf vollständig abschließen.
+            # -------------------------------------------------------------
+            if state.clear_board_consecutive_ok >= required_clear_frames:
                 state.awaiting_clear_board = False
                 state.clear_board_consecutive_ok = 0
                 state.last_status = STATUS_READY
+
+                # Alten Pending-State löschen
                 self._reset_pending_hit(state)
 
-                # Dart wurde entfernt:
-                # gelockte KI-Spitze freigeben.
+                # Alten bestätigten Treffer vollständig entfernen.
+                state.last_hit_event = None
+                state.last_detection_result = None
+                state.last_detection_timestamp = None
+
+                # Auch den KI-TIP / TemporalTracker vollständig zurücksetzen.
                 self._reset_detector_tracking(camera_id)
 
                 return VisionServiceResult(
                     camera_id=camera_id,
                     timestamp=ts,
                     status=STATUS_READY,
-                    message="Board ist wieder frei. Erkennung bereit.",
+                    message="Dart entfernt. Erkennung bereit.",
+                    hit_event=None,
+                    detection_result=None,
                     board_is_clear=True,
                     board_changed_ratio=board_changed_ratio,
                     debug={
                         "awaiting_clear_board": False,
+                        "clear_reason": "no_tip_consecutive_frames",
+                        "required_clear_frames": required_clear_frames,
                     },
                 )
 
+            # -------------------------------------------------------------
+            # 6. Noch nicht lange genug ohne Dart:
+            #    weiter auf Entfernung warten.
+            #
+            # WICHTIG:
+            # Für das Overlay verwenden wir jetzt das aktuelle Detector-
+            # Ergebnis und NICHT dauerhaft das alte DetectionResult.
+            # Dadurch kann der alte rote TIP bereits verschwinden.
+            # -------------------------------------------------------------
             state.last_status = STATUS_WAITING_FOR_CLEAR
+
             return VisionServiceResult(
                 camera_id=camera_id,
                 timestamp=ts,
                 status=STATUS_WAITING_FOR_CLEAR,
-                message="Warte darauf, dass das Board wieder frei ist.",
+                message="Warte darauf, dass der Dart entfernt wird.",
                 hit_event=state.last_hit_event,
-                detection_result=state.last_detection_result,
-                board_is_clear=board_is_clear,
+                detection_result=clear_detection_result,
+                board_is_clear=False,
                 board_changed_ratio=board_changed_ratio,
                 debug={
-                    "clear_board_consecutive_ok": state.clear_board_consecutive_ok,
-                    "required_consecutive_frames": int(self.config.clear_board_required_consecutive_frames),
-                    "last_hit_label": None if state.last_hit_event is None else state.last_hit_event.label,
+                    "awaiting_clear_board": True,
+                    "dart_tip_present": dart_tip_present,
+                    "clear_no_tip_count": state.clear_board_consecutive_ok,
+                    "required_clear_frames": required_clear_frames,
                 },
             )
 

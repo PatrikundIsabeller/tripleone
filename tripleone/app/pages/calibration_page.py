@@ -255,37 +255,67 @@ class CalibrationCard(QFrame):
     # ------------------------------------------------------------
 
     def set_available_cameras(self, cameras: List[Dict[str, int]]) -> None:
+        """
+        Befüllt die Kamera-Auswahl und stellt danach die für diesen
+        Kalibrierungs-Slot gespeicherte physische device_id wieder her.
+        """
         self.available_cameras = list(cameras)
-        previous_device_id = self.device_combo.currentData()
+
+        # WICHTIG:
+        # Nicht den alten Combobox-Zustand verwenden,
+        # sondern die gespeicherte Kamera dieses Slots.
+        desired_device_id = int(
+            self.camera_config.get("device_id", -1)
+        )
 
         self.device_combo.blockSignals(True)
+
         self.device_combo.clear()
-        self.device_combo.addItem("Keine Kamera", -1)
+        self.device_combo.addItem(
+            "Keine Kamera",
+            -1,
+        )
 
         for cam in cameras:
-            self.device_combo.addItem(f"{cam['name']} (Index {cam['index']})", cam["index"])
+            self.device_combo.addItem(
+                f"{cam['name']} (Index {cam['index']})",
+                int(cam["index"]),
+            )
 
-        found_index = self.device_combo.findData(previous_device_id)
-        if found_index >= 0:
-            self.device_combo.setCurrentIndex(found_index)
+        combo_index = self.device_combo.findData(
+            desired_device_id
+        )
+
+        if combo_index >= 0:
+            self.device_combo.setCurrentIndex(
+                combo_index
+            )
+        else:
+            self.device_combo.setCurrentIndex(0)
 
         self.device_combo.blockSignals(False)
 
-    def reset_runtime_state(self) -> None:
-        self.stop_worker()
-        self.last_frame_bgr = None
-        self.preview.clear_frame()
-        self.preview.clear_test_point()
-        self.detector.reset_detection()
-        self.test_result_label.setText("Testpunkt: noch keiner gesetzt")
-        self.auto_result_label.setText("Auto-Dart: noch keiner")
-        self.detector_status_label.setText("Detector: keine Referenz")
-        self.status_label.setText("Status: gestoppt")
-        self._update_debug_label()
+        print(
+            f"[CalibrationCard] slot={self.slot_index} "
+            f"configured_device={desired_device_id} "
+            f"combo_device={self.device_combo.currentData()}"
+        )
 
-    # ------------------------------------------------------------
-    # Daten / Overlay
-    # ------------------------------------------------------------
+        def reset_runtime_state(self) -> None:
+            self.stop_worker()
+            self.last_frame_bgr = None
+            self.preview.clear_frame()
+            self.preview.clear_test_point()
+            self.detector.reset_detection()
+            self.test_result_label.setText("Testpunkt: noch keiner gesetzt")
+            self.auto_result_label.setText("Auto-Dart: noch keiner")
+            self.detector_status_label.setText("Detector: keine Referenz")
+            self.status_label.setText("Status: gestoppt")
+            self._update_debug_label()
+
+        # ------------------------------------------------------------
+        # Daten / Overlay
+        # ------------------------------------------------------------
 
     def _default_manual_points(self) -> List[Dict[str, int]]:
         frame_width = self._get_frame_width()
@@ -599,10 +629,19 @@ class CalibrationCard(QFrame):
     def start_worker(self) -> None:
         self.stop_worker()
 
-        device_id = int(self.device_combo.currentData())
-        self.camera_config["device_id"] = device_id
+        device_id = int(
+            self.camera_config.get(
+                "device_id",
+                -1,
+            )
+        )
 
-        enabled = bool(self.camera_config.get("enabled", True))
+        enabled = bool(
+            self.camera_config.get(
+                "enabled",
+                True,
+            )
+        )
 
         if not enabled:
             self.preview.clear_frame()
@@ -805,64 +844,119 @@ class CalibrationPage(QWidget):
     # Aktionen
     # ------------------------------------------------------------
 
-    
     def apply_preview(self) -> None:
-        camera_configs = self.camera_config.get("cameras", [])
+        """
+        Startet die drei Kalibrierungskameras eindeutig.
 
-        if SINGLE_CAMERA_TEST_MODE:
-            # --------------------------------------------------------
-            # Testmodus:
-            # Nur Kalibrierung Kamera 1 darf die physische Kamera öffnen.
-            # Kamera 2 und 3 werden garantiert gestoppt.
-            # --------------------------------------------------------
-            self.card_2.stop_worker()
-            self.card_3.stop_worker()
+        Reihenfolge:
+        1. Auswahl aller drei Slots lesen
+        2. auf Doppelbelegung prüfen
+        3. Config aktualisieren
+        4. alte Worker stoppen
+        5. jeden Slot GENAU EINMAL starten
+        """
 
-            if len(camera_configs) > 0:
-                selected_device_id = int(
-                    self.card_1.device_combo.currentData()
-                )
+        camera_configs = self.camera_config.get(
+            "cameras",
+            [],
+        )
 
-                camera_configs[0]["device_id"] = selected_device_id
-                camera_configs[0]["enabled"] = True
-
-                self.card_1.set_camera_config(
-                    camera_configs[0]
-                )
-
-            self.card_1.start_worker()
+        if len(camera_configs) < 3:
+            QMessageBox.warning(
+                self,
+                "Kamera-Konfiguration",
+                "Es müssen drei Kamera-Slots vorhanden sein.",
+            )
             return
 
         # ------------------------------------------------------------
-        # Normalbetrieb später wieder für 3 Kameras
+        # 1. Aktuelle Auswahl aus allen drei Comboboxen lesen
         # ------------------------------------------------------------
-        used_device_ids: set[int] = set()
+        selected_devices: list[int] = []
 
         for idx, card in enumerate(self.cards):
-            if idx >= len(camera_configs):
-                continue
-
-            selected_device_id = int(
+            device_id = int(
                 card.device_combo.currentData()
             )
 
-            if selected_device_id >= 0:
-                if selected_device_id in used_device_ids:
-                    card.stop_worker()
-                    card.set_status(
-                        f"Gerät {selected_device_id} bereits verwendet"
-                    )
-                    continue
+            print(
+                f"[CALIBRATION SELECT] "
+                f"slot={idx} "
+                f"card_slot={card.slot_index} "
+                f"device={device_id}"
+            )
 
-                used_device_ids.add(selected_device_id)
+            if device_id < 0:
+                QMessageBox.warning(
+                    self,
+                    "Kamera fehlt",
+                    (
+                        f"Für Kamera {idx + 1} wurde "
+                        f"keine physische Kamera ausgewählt."
+                    ),
+                )
+                return
 
-            camera_configs[idx]["device_id"] = selected_device_id
-            card.set_camera_config(
+            selected_devices.append(
+                device_id
+            )
+
+        # ------------------------------------------------------------
+        # 2. Jede physische Kamera darf nur einmal vorkommen
+        # ------------------------------------------------------------
+        if len(set(selected_devices)) != 3:
+            QMessageBox.warning(
+                self,
+                "Kamera doppelt ausgewählt",
+                (
+                    "Jede der drei physischen Kameras muss "
+                    "genau einem Kamera-Slot zugeordnet sein."
+                ),
+            )
+            return
+
+        # ------------------------------------------------------------
+        # 3. Alle bestehenden Worker zuerst stoppen
+        # ------------------------------------------------------------
+        for card in self.cards:
+            card.stop_worker()
+
+        # ------------------------------------------------------------
+        # 4. Config pro Kamera aktualisieren
+        # ------------------------------------------------------------
+        for idx in range(3):
+            device_id = selected_devices[idx]
+
+            camera_configs[idx]["device_id"] = device_id
+            camera_configs[idx]["enabled"] = True
+
+            self.cards[idx].set_camera_config(
                 camera_configs[idx]
             )
 
-            card.start_worker()
+            print(
+                f"[CALIBRATION MAP] "
+                f"slot={idx} "
+                f"card_slot={self.cards[idx].slot_index} "
+                f"-> device={device_id}"
+            )
 
+        # ------------------------------------------------------------
+        # 5. WICHTIG:
+        # Jeden Worker EXPLIZIT genau einmal starten.
+        #
+        # Vorerst absichtlich ohne Schleife,
+        # damit wir einen falschen Listen-/Referenzpfad ausschließen.
+        # ------------------------------------------------------------
+        print("[CALIBRATION START] Kamera 1 / Slot 0")
+        self.card_1.start_worker()
+
+        print("[CALIBRATION START] Kamera 2 / Slot 1")
+        self.card_2.start_worker()
+
+        print("[CALIBRATION START] Kamera 3 / Slot 2")
+        self.card_3.start_worker()
+    
     def stop_all_cameras(self) -> None:
         for card in self.cards:
             card.stop_worker()

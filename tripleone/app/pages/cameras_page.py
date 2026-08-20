@@ -103,6 +103,12 @@ class VisionInferenceWorker(QObject):
             self.result_ready.emit(result)
 
         except Exception as exc:
+            print(
+                f"[VISION ERROR] "
+                f"K{self.camera_index + 1} "
+                f"{type(exc).__name__}: {exc}"
+            )
+
             self.error_occurred.emit(
                 f"{type(exc).__name__}: {exc}"
             )
@@ -190,7 +196,7 @@ class CameraCard(QFrame):
                 clear_board_changed_ratio_threshold=0.0045,
                 clear_board_blur_kernel_size=5,
                 clear_board_required_consecutive_frames=2,
-                use_board_mask_for_clear_check=False,
+                use_board_mask_for_clear_check=True,
                 keep_debug_images=True,
             ),
             default_detector=self.detector,
@@ -714,16 +720,6 @@ class CameraCard(QFrame):
         if result.hit_event is not None:
             hit = result.hit_event
 
-            print(
-                f"[MAPPING DEBUG K{self.camera_index + 1}] "
-                f"label={getattr(hit, 'label', None)} "
-                f"score={getattr(hit, 'score', None)} "
-                f"segment={getattr(hit, 'segment', None)} "
-                f"ring={getattr(hit, 'ring', None)} "
-                f"image={getattr(hit, 'image_point', None)} "
-                f"topdown={getattr(hit, 'topdown_point', None)}"
-            )
-
         with self._vision_lock:
             state = self.vision_service.get_state(
                 self.camera_index
@@ -804,8 +800,25 @@ class CameraCard(QFrame):
             )
 
         elif result.status == STATUS_WAITING_FOR_CLEAR:
+            ratio = getattr(
+                result,
+                "board_changed_ratio",
+                None,
+            )
+
+            if ratio is None:
+                ratio_text = "-"
+            else:
+                ratio_text = f"{float(ratio):.5f}"
+
+            # ----------------------------------------------------------
+            # Temporärer Debug:
+            # Nur Board-Clear-Ratio anzeigen
+            # ----------------------------------------------------------
+
             self.vision_status_label.setText(
-                "Vision: warte auf freies Board"
+                f"Vision: warte auf freies Board | "
+                f"Diff-Ratio: {ratio_text}"
             )
 
             self.hit_label.setText(
@@ -881,9 +894,34 @@ class CameraCard(QFrame):
                 )
             )
 
-    def stop_worker(self) -> None:
+    def stop_worker(self) -> bool:
+        """
+        Stoppt den Kamera-Worker sicher.
+
+        Der Worker wird erst vergessen, wenn sein Thread
+        tatsächlich beendet wurde.
+        """
+
         if self.worker is not None:
-            self.worker.stop()
+            worker = self.worker
+
+            stopped = worker.stop(
+                timeout_ms=5000
+            )
+
+            if not stopped:
+                self.set_status(
+                    "Fehler: Kamera-Thread konnte nicht beendet werden"
+                )
+
+                print(
+                    f"[CameraCard] STOP FEHLGESCHLAGEN "
+                    f"logical_camera={self.camera_index} "
+                    f"physical_device={worker.device_id}"
+                )
+
+                return False
+
             self.worker = None
 
         self._inference_busy = False
@@ -896,16 +934,37 @@ class CameraCard(QFrame):
         self._latched_fusion_observation = None
         self._last_image = None
 
-        self.clear_preview("Keine Vorschau")
-        self.set_status("gestoppt")
-        self.vision_status_label.setText("Vision: gestoppt")
-        self.hit_label.setText("Treffer: -")
+        self.clear_preview(
+            "Keine Vorschau"
+        )
 
-        if callable(self._fusion_update_callback):
+        self.set_status(
+            "gestoppt"
+        )
+
+        self.vision_status_label.setText(
+            "Vision: gestoppt"
+        )
+
+        self.hit_label.setText(
+            "Treffer: -"
+        )
+
+        if callable(
+            self._fusion_update_callback
+        ):
             self._fusion_update_callback()
 
+        return True
+
     def start_worker(self, config: Dict) -> None:
-        self.stop_worker()
+        if not self.stop_worker():
+            print(
+                f"[CameraCard] START ABGEBROCHEN "
+                f"logical_camera={self.camera_index}: "
+                f"alter Worker läuft noch."
+            )
+            return
 
         self._pending_inference_frame = None
         self._inference_busy = False
@@ -927,6 +986,12 @@ class CameraCard(QFrame):
             self.clear_preview("Keine Kamera ausgewählt")
             self.set_status("keine Kamera gewählt")
             return
+
+        print(
+            f"[CameraCard] START "
+            f"logical_camera={self.camera_index} "
+            f"physical_device={device_id}"
+        )
 
         self.worker = CameraWorker(
             device_id=device_id,
@@ -995,10 +1060,16 @@ class CamerasPage(QWidget):
         self.fusion_engine = MultiCamFusionEngine(
             MultiCamFusionConfig(
                 max_estimates_per_camera=1,
-                cluster_distance_px=46.0,
-                outlier_distance_px=42.0,
+
                 min_cameras_for_fusion=2,
-                allow_single_camera_fallback=False,
+
+                allow_single_camera_fallback=True,
+
+                confidence_floor=0.05,
+
+                spatial_outlier_distance_px=45.0,
+
+                single_camera_min_confidence=0.08,
             )
         )
 
@@ -1060,6 +1131,14 @@ class CamerasPage(QWidget):
         self.save_button.clicked.connect(self.save_settings)
 
         self._build_ui()
+        self.load_config_into_ui()
+
+    def update_camera_config(self, new_config: Dict) -> None:
+        """
+        Übernimmt die zentrale Kamera-Konfiguration aus MainWindow.
+        Startet dabei keine Kamera.
+        """
+        self.config_data = deepcopy(new_config)
         self.load_config_into_ui()
 
     def _build_ui(self) -> None:
@@ -1131,77 +1210,93 @@ class CamerasPage(QWidget):
     # - K2 = S19
     # - K3 = S17
     # => kein gemeinsamer Segment-Konsens, also kein finaler Fused-Hit.
-    def _filter_observations_to_majority_segment(
-        self,
-        observations_by_camera: dict,
-    ) -> tuple[dict, int | None]:
-        segment_groups: dict[int, list[int]] = {}
+    
+    def set_available_cameras(self, cameras: List[Dict[str, int]]) -> None:
+        """
+        Befüllt die Kamera-Auswahl für alle drei Slots.
 
-        for camera_idx, observation in observations_by_camera.items():
-            segment = getattr(observation, "best_segment", None)
-            if segment is None:
-                continue
+        Entscheidend:
+        Die gespeicherte device_id aus config_data ist die Quelle.
+        Nicht der zufällige vorherige Combobox-Zustand.
+        """
+        self.available_cameras = list(cameras)
 
-            try:
-                segment = int(segment)
-            except Exception:
-                continue
-
-            segment_groups.setdefault(segment, []).append(camera_idx)
-
-        if not segment_groups:
-            return {}, None
-
-        majority_segment, camera_indices = max(
-            segment_groups.items(),
-            key=lambda item: len(item[1]),
+        camera_configs = self.config_data.get(
+            "cameras",
+            [],
         )
 
-        if len(camera_indices) < 2:
-            return {}, None
+        for idx, card in enumerate(self.cards):
+            desired_device_id = -1
 
-        filtered = {
-            camera_idx: observations_by_camera[camera_idx]
-            for camera_idx in camera_indices
-        }
-        return filtered, int(majority_segment)
-
-    def set_available_cameras(self, cameras: List[Dict[str, int]]) -> None:
-        self.available_cameras = cameras
-
-        for card in self.cards:
-            previous_device_id = card.device_combo.currentData()
+            if idx < len(camera_configs):
+                desired_device_id = int(
+                    camera_configs[idx].get(
+                        "device_id",
+                        -1,
+                    )
+                )
 
             card.device_combo.blockSignals(True)
+
             card.device_combo.clear()
-            card.device_combo.addItem("Keine Kamera", -1)
+            card.device_combo.addItem(
+                "Keine Kamera",
+                -1,
+            )
 
             for cam in cameras:
-                card.device_combo.addItem(f"{cam['name']} (Index {cam['index']})", cam["index"])
+                card.device_combo.addItem(
+                    f"{cam['name']} (Index {cam['index']})",
+                    int(cam["index"]),
+                )
 
-            found_index = card.device_combo.findData(previous_device_id)
-            if found_index >= 0:
-                card.device_combo.setCurrentIndex(found_index)
+            combo_index = card.device_combo.findData(
+                desired_device_id
+            )
+
+            if combo_index >= 0:
+                card.device_combo.setCurrentIndex(
+                    combo_index
+                )
+            else:
+                card.device_combo.setCurrentIndex(0)
 
             card.device_combo.blockSignals(False)
 
-    def load_config_into_ui(self) -> None:
-        cameras_config = self.config_data.get("cameras", [])
-        if SINGLE_CAMERA_TEST_MODE:
-            # Nur Kamera 1 starten.
-            self.card_1.start_worker(
-                self.config_data["cameras"][0]
+            print(
+                f"[CamerasPage] slot={idx} "
+                f"configured_device={desired_device_id} "
+                f"combo_device={card.device_combo.currentData()}"
             )
 
-            # Andere Kameras garantiert stoppen.
-            self.card_2.stop_worker()
-            self.card_3.stop_worker()
+    def load_config_into_ui(self) -> None:
+        """
+        Lädt ausschließlich die gespeicherte Konfiguration in die UI.
 
-        else:
-            for index, card in enumerate(self.cards):
-                card.start_worker(
-                    self.config_data["cameras"][index]
-                )
+        Hier werden KEINE Kameras gestartet.
+        Gestartet wird ausschließlich über:
+        'Vorschau starten / aktualisieren'
+        """
+        cameras_config = self.config_data.get(
+            "cameras",
+            [],
+        )
+
+        for idx, card in enumerate(self.cards):
+            if idx >= len(cameras_config):
+                continue
+
+            config = cameras_config[idx]
+
+            card.set_config(config)
+
+            print(
+                f"[CAMERA CONFIG LOAD] "
+                f"slot={idx} "
+                f"device={config.get('device_id', -1)} "
+                f"enabled={config.get('enabled', True)}"
+            )
 
     def set_detectors(self, detectors: List[Optional[SingleCamDetector]]) -> None:
         self.detectors = list(detectors)
@@ -1269,36 +1364,98 @@ class CamerasPage(QWidget):
         )
 
     def _all_active_cameras_are_clear(self) -> bool:
-        clear_statuses = {
-            STATUS_READY,
-            STATUS_BOARD_NOT_REFERENCED,
-            STATUS_DISARMED,
-        }
+        """
+        Prüft, ob der vorherige Fused-Hit freigegeben werden darf.
+
+        WICHTIG:
+        Eine Kamera ohne eigenen gelatchten Treffer darf mit STATUS_NO_HIT
+        die Freigabe nicht blockieren.
+
+        Beispiel:
+            K1 vorher T19 -> danach READY
+            K2 hatte nie einen TIP -> STATUS_NO_HIT
+            K3 vorher T19 -> danach READY
+
+        Dann ist der alte T19-Wurf beendet und die Fusion muss für den
+        nächsten Dart wieder freigegeben werden.
+        """
 
         saw_active_camera = False
 
-        for card in self.cards:
+        for idx, card in enumerate(self.cards):
             if not self._camera_is_active_for_fusion(card):
                 continue
 
             saw_active_camera = True
-            status = getattr(card, "_last_result_status", None)
 
+            status = getattr(
+                card,
+                "_last_result_status",
+                None,
+            )
+
+            latched_observation = getattr(
+                card,
+                "_latched_fusion_observation",
+                None,
+            )
+
+            # --------------------------------------------------------
+            # Noch gar kein Status:
+            # noch nicht bereit zum globalen Clear.
+            # --------------------------------------------------------
             if status is None:
                 return False
 
-            if status not in clear_statuses:
-                return False
+            # --------------------------------------------------------
+            # Eindeutig freie Zustände
+            # --------------------------------------------------------
+            if status in {
+                STATUS_READY,
+                STATUS_BOARD_NOT_REFERENCED,
+                STATUS_DISARMED,
+            }:
+                continue
+
+            # --------------------------------------------------------
+            # WICHTIG:
+            #
+            # STATUS_NO_HIT ist ebenfalls neutral/frei,
+            # ABER nur wenn diese Kamera keinen alten gelatchten
+            # Treffer mehr besitzt.
+            #
+            # Dadurch blockiert eine Kamera, die den Dart überhaupt
+            # nicht gesehen hat, den nächsten Wurf nicht.
+            # --------------------------------------------------------
+            if (
+                status == STATUS_NO_HIT
+                and latched_observation is None
+            ):
+                continue
+
+            # --------------------------------------------------------
+            # Alles andere bedeutet:
+            # - alter Treffer noch vorhanden
+            # - waiting_for_clear
+            # - cooldown
+            # usw.
+            # --------------------------------------------------------
+            return False
+
+        print(
+            "[FUSION CLEAR] "
+            "alle aktiven Kameras für neuen Wurf freigegeben"
+        )
 
         return saw_active_camera
 
     def _any_camera_has_latched_hit(self) -> bool:
-        for card in self.cards:
-            if not self._camera_is_active_for_fusion(card):
-                continue
-            if getattr(card, "_latched_fusion_observation", None) is not None:
-                return True
-        return False
+            for card in self.cards:
+                if not self._camera_is_active_for_fusion(card):
+                    continue
+                if getattr(card, "_latched_fusion_observation", None) is not None:
+                    return True
+            return False
 
     # Diese Hilfsmethode formatiert einen vorläufigen Einzelkamera-Kandidaten.
     # Er wird angezeigt, aber noch nicht als finaler Fused-Hit gelockt.
@@ -1345,146 +1502,221 @@ class CamerasPage(QWidget):
     # Diese Methode verarbeitet die gelatchten Kamera-Treffer für die Mehrkamera-Fusion.
     # Final gelockt wird nur noch, wenn mindestens 2 Kameras wirklich zum Fusion-Ergebnis beitragen.
     def update_fused_result(self) -> None:
+        # --------------------------------------------------------------
+        # 1. Falls ein alter Fused-Hit noch gelockt ist:
+        #    erst freigeben, wenn der vorige Wurf wirklich beendet ist.
+        # --------------------------------------------------------------
         if self._fused_hit_locked:
             if self._all_active_cameras_are_clear():
                 self._reset_fused_hit_state()
             else:
                 return
 
+        # --------------------------------------------------------------
+        # 2. Gibt es überhaupt aktuell gelatchte Treffer?
+        # --------------------------------------------------------------
         if not self._any_camera_has_latched_hit():
             if self._last_fused_result is None:
-                self.fused_result_label.setText("Fused Hit: -")
+                self.fused_result_label.setText(
+                    "Fused Hit: -"
+                )
             return
 
         detectors_by_camera = {}
         observations_by_camera = {}
 
+        # --------------------------------------------------------------
+        # 3. Nur verwertbare Kamera-Beobachtungen einsammeln
+        # --------------------------------------------------------------
         for idx, card in enumerate(self.cards):
-            observation = getattr(card, "_latched_fusion_observation", None)
+            observation = getattr(
+                card,
+                "_latched_fusion_observation",
+                None,
+            )
 
-            if card.detector is None or observation is None:
+            if card.detector is None:
                 continue
 
-            if not self._camera_status_allows_fusion_input(card):
+            if observation is None:
                 continue
 
-            if not self._observation_is_usable_for_fusion(observation):
+            if not self._camera_status_allows_fusion_input(
+                card
+            ):
+                continue
+
+            if not self._observation_is_usable_for_fusion(
+                observation
+            ):
                 continue
 
             detectors_by_camera[idx] = card.detector
             observations_by_camera[idx] = observation
 
-        print(
-            "[FUSION INPUT] cameras=",
-            sorted(observations_by_camera.keys()),
-            "statuses=",
-            {
-                idx: getattr(self.cards[idx], "_last_result_status", None)
-                for idx in range(len(self.cards))
-            },
-            "labels=",
-            {
-                idx: getattr(getattr(self.cards[idx], "_latched_fusion_observation", None), "best_label", None)
-                for idx in range(len(self.cards))
-            },
-            "topdown=",
-            {
-                idx: getattr(getattr(self.cards[idx], "_latched_fusion_observation", None), "best_topdown_point", None)
-                for idx in range(len(self.cards))
-            },
-        )
 
-        if not detectors_by_camera or not observations_by_camera:
-            self.fused_result_label.setText("Fused Hit: -")
+        # --------------------------------------------------------------
+        # 5. Keine brauchbare Observation
+        # --------------------------------------------------------------
+        if (
+            not detectors_by_camera
+            or not observations_by_camera
+        ):
+            self.fused_result_label.setText(
+                "Fused Hit: -"
+            )
             return
 
-        # Nur eine Kamera liefert etwas:
-        # anzeigen ja, aber NICHT final locken.
+        # --------------------------------------------------------------
+        # 6. Nur eine Kamera:
+        #    anzeigen, aber NICHT final locken.
+        #
+        #    Kein Segment-Filter mehr.
+        # --------------------------------------------------------------
         if len(observations_by_camera) == 1:
-            cam_idx, observation = next(iter(observations_by_camera.items()))
+            cam_idx, observation = next(
+                iter(observations_by_camera.items())
+            )
+
             self._last_fused_result = None
             self._fused_hit_locked = False
 
-            camera_debug = self._build_camera_hit_debug_text()
+            camera_debug = (
+                self._build_camera_hit_debug_text()
+            )
+
             self.fused_result_label.setText(
                 f"{self._format_single_camera_candidate(cam_idx, observation)}\n"
                 f"{camera_debug}"
             )
             return
-        # Vor der geometrischen Fusion muss mindestens ein Segment-Konsens
-        # zwischen zwei Kameras existieren.
-        if len(observations_by_camera) >= 2:
-            filtered_observations, majority_segment = self._filter_observations_to_majority_segment(
-                observations_by_camera
-            )
 
-            if len(filtered_observations) < 2:
-                primary_idx, primary_observation = self._get_primary_camera_observation()
-
-                if primary_observation is not None:
-                    self._show_primary_camera_fallback(primary_idx, primary_observation)
-                    return
-
-                self._last_fused_result = None
-                self._fused_hit_locked = False
-
-                camera_debug = self._build_camera_hit_debug_text()
-                self.fused_result_label.setText(
-                    "Fused Hit: kein Segment-Konsens zwischen Kameras\n"
-                    f"{camera_debug}"
-                )
-                return
-
-            observations_by_camera = filtered_observations
-            detectors_by_camera = {
-                camera_idx: detectors_by_camera[camera_idx]
-                for camera_idx in observations_by_camera.keys()
-            }
-
+        # --------------------------------------------------------------
+        # 7. Ab zwei Kameras entscheidet ausschließlich
+        #    MultiCamFusionEngine.
+        #
+        #    KEIN vorgeschalteter Segment-Konsens mehr.
+        #
+        #    Dadurch funktionieren auch:
+        #
+        #    DBULL + DBULL
+        #    SBULL + SBULL
+        #
+        #    obwohl segment=None ist.
+        # --------------------------------------------------------------
         try:
             fused = self.fusion_engine.fuse(
-                observations_by_camera=observations_by_camera,
-                detectors_by_camera=detectors_by_camera,
+                observations_by_camera=(
+                    observations_by_camera
+                ),
+                detectors_by_camera=(
+                    detectors_by_camera
+                ),
             )
+
         except Exception as exc:
-            self.fused_result_label.setText(f"Fused Hit: Fehler – {exc}")
+            self._last_fused_result = None
+            self._fused_hit_locked = False
+
+            self.fused_result_label.setText(
+                f"Fused Hit: Fehler – {exc}"
+            )
             return
 
+        # --------------------------------------------------------------
+        # 8. Keine gültige Mehrheitsentscheidung
+        # --------------------------------------------------------------
         if fused is None:
             self._last_fused_result = None
             self._fused_hit_locked = False
-            self.fused_result_label.setText("Fused Hit: warte auf übereinstimmende Kameras ...")
+
+            camera_debug = (
+                self._build_camera_hit_debug_text()
+            )
+
+            self.fused_result_label.setText(
+                "Fused Hit: warte auf übereinstimmende Kameras ...\n"
+                f"{camera_debug}"
+            )
             return
 
-        used_camera_indices = sorted({obs.camera_index for obs in fused.observations_used})
-        used_camera_count = len(used_camera_indices)
+        # --------------------------------------------------------------
+        # 9. Welche Kameras wurden tatsächlich verwendet?
+        # --------------------------------------------------------------
+        used_camera_indices = sorted(
+            {
+                int(obs.camera_index)
+                for obs in fused.observations_used
+            }
+        )
 
-        # Falls die Fusion intern doch nur auf einer Kamera basiert,
-        # ebenfalls NICHT final locken.
+        used_camera_count = len(
+            used_camera_indices
+        )
+
+        # --------------------------------------------------------------
+        # 10. Sicherheitsnetz:
+        #     Falls die Fusion intern doch nur eine Kamera benutzt,
+        #     nicht final locken.
+        # --------------------------------------------------------------
         if used_camera_count < 2:
-            cam_idx = used_camera_indices[0] if used_camera_indices else next(iter(observations_by_camera.keys()))
-            observation = observations_by_camera.get(cam_idx)
+            if used_camera_indices:
+                cam_idx = used_camera_indices[0]
+            else:
+                cam_idx = next(
+                    iter(
+                        observations_by_camera.keys()
+                    )
+                )
+
+            observation = (
+                observations_by_camera.get(
+                    cam_idx
+                )
+            )
+
+            self._last_fused_result = None
+            self._fused_hit_locked = False
 
             if observation is not None:
-                self._last_fused_result = None
-                self._fused_hit_locked = False
+                camera_debug = (
+                    self._build_camera_hit_debug_text()
+                )
 
-                camera_debug = self._build_camera_hit_debug_text()
                 self.fused_result_label.setText(
                     f"{self._format_single_camera_candidate(cam_idx, observation)}\n"
                     f"{camera_debug}"
                 )
             else:
-                self.fused_result_label.setText("Fused Hit: warte auf 2. Kamera ...")
+                self.fused_result_label.setText(
+                    "Fused Hit: warte auf 2. Kamera ..."
+                )
+
             return
 
-        cam_list = [cam_idx + 1 for cam_idx in used_camera_indices]
-        cam_text = ", ".join(str(cam) for cam in cam_list) if cam_list else "-"
+        # --------------------------------------------------------------
+        # 11. Final bestätigter Mehrkamera-Treffer
+        # --------------------------------------------------------------
+        cam_list = [
+            cam_idx + 1
+            for cam_idx in used_camera_indices
+        ]
+
+        cam_text = (
+            ", ".join(
+                str(cam)
+                for cam in cam_list
+            )
+            if cam_list
+            else "-"
+        )
 
         self._last_fused_result = fused
         self._fused_hit_locked = True
 
-        camera_debug = self._build_camera_hit_debug_text()
+        camera_debug = (
+            self._build_camera_hit_debug_text()
+        )
 
         self.fused_result_label.setText(
             f"Fused Hit: {fused.label} | "
@@ -1494,6 +1726,19 @@ class CamerasPage(QWidget):
             f"Kameras: {cam_text} | "
             f"Conf: {fused.confidence:.2f}\n"
             f"{camera_debug}"
+        )
+
+        # --------------------------------------------------------------
+        # 12. Terminal-Debug für finalen Treffer
+        # --------------------------------------------------------------
+        print(
+            "[FUSION RESULT]",
+            f"label={fused.label}",
+            f"score={fused.score}",
+            f"ring={fused.ring}",
+            f"segment={fused.segment}",
+            f"cameras={used_camera_indices}",
+            f"confidence={fused.confidence:.3f}",
         )
 
     def apply_config_to_ui_device_selection(self) -> None:
@@ -1541,22 +1786,92 @@ class CamerasPage(QWidget):
         return True, ""
 
     def apply_preview(self) -> None:
+        """
+        Startet die drei Kameras eindeutig und genau einmal.
+
+        Ablauf:
+        1. aktuelle UI-Auswahl lesen
+        2. Doppelbelegung prüfen
+        3. Config aktualisieren
+        4. alle alten Worker stoppen
+        5. jeden Kamera-Slot genau einmal starten
+        """
+
+        # ------------------------------------------------------------
+        # 1. UI-Konfiguration einsammeln
+        # ------------------------------------------------------------
         new_config = self.collect_ui_config()
 
-        is_valid, error_text = self.validate_camera_config(
-            new_config
+        cameras_config = new_config.get(
+            "cameras",
+            [],
         )
 
-        if not is_valid:
+        if len(cameras_config) < 3:
             QMessageBox.warning(
                 self,
-                "Ungültige Kamera-Auswahl",
-                error_text,
+                "Kamera-Konfiguration",
+                "Es müssen drei Kamera-Slots konfiguriert sein.",
             )
             return
 
+        # ------------------------------------------------------------
+        # 2. Aktive Geräte prüfen
+        # ------------------------------------------------------------
+        used_device_ids: set[int] = set()
+
+        for idx, config in enumerate(cameras_config):
+            enabled = bool(
+                config.get(
+                    "enabled",
+                    True,
+                )
+            )
+
+            if not enabled:
+                continue
+
+            device_id = int(
+                config.get(
+                    "device_id",
+                    -1,
+                )
+            )
+
+            if device_id < 0:
+                QMessageBox.warning(
+                    self,
+                    "Kamera fehlt",
+                    (
+                        f"Für Kamera {idx + 1} wurde "
+                        f"keine physische Kamera ausgewählt."
+                    ),
+                )
+                return
+
+            if device_id in used_device_ids:
+                QMessageBox.warning(
+                    self,
+                    "Kamera doppelt ausgewählt",
+                    (
+                        f"Die physische Kamera {device_id} "
+                        f"wurde mehrfach vergeben."
+                    ),
+                )
+                return
+
+            used_device_ids.add(
+                device_id
+            )
+
+        # ------------------------------------------------------------
+        # 3. Konfiguration übernehmen
+        # ------------------------------------------------------------
         self.config_data = new_config
 
+        # ------------------------------------------------------------
+        # 4. Fusion zurücksetzen
+        # ------------------------------------------------------------
         self._fused_hit_locked = False
         self._last_fused_result = None
 
@@ -1564,10 +1879,43 @@ class CamerasPage(QWidget):
             "Fused Hit: warte auf Kameradaten ..."
         )
 
-        for index, card in enumerate(self.cards):
-            card.start_worker(
-                self.config_data["cameras"][index]
+        # ------------------------------------------------------------
+        # 5. ALLE alten Worker zuerst stoppen
+        # ------------------------------------------------------------
+        for card in self.cards:
+            card.stop_worker()
+
+        # ------------------------------------------------------------
+        # 6. Mapping ausgeben
+        # ------------------------------------------------------------
+        for idx in range(3):
+            config = self.config_data["cameras"][idx]
+
+            print(
+                f"[CAMERA MAP] "
+                f"slot={idx} "
+                f"card_index={self.cards[idx].camera_index} "
+                f"-> device={config.get('device_id')} "
+                f"enabled={config.get('enabled')}"
             )
+
+        # ------------------------------------------------------------
+        # 7. Jeder Slot wird EXPLIZIT genau einmal gestartet.
+        # ------------------------------------------------------------
+        print("[CAMERA START] Slot 0")
+        self.card_1.start_worker(
+            self.config_data["cameras"][0]
+        )
+
+        print("[CAMERA START] Slot 1")
+        self.card_2.start_worker(
+            self.config_data["cameras"][1]
+        )
+
+        print("[CAMERA START] Slot 2")
+        self.card_3.start_worker(
+            self.config_data["cameras"][2]
+        )
 
     def save_settings(self) -> None:
         new_config = self.collect_ui_config()
@@ -1591,3 +1939,18 @@ class CamerasPage(QWidget):
         for card in self.cards:
             card.stop_worker()
         self._reset_fused_hit_state()
+
+    def shutdown(self) -> None:
+        """
+        Beendet die Kameraseite vollständig.
+
+        Wichtig beim Programmende:
+        - CameraWorker stoppen
+        - Vision-Inference-Timer stoppen
+        - Vision-QThreads sauber beenden
+        """
+
+        self._reset_fused_hit_state()
+
+        for card in self.cards:
+            card.shutdown()

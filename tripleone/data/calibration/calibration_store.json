@@ -16,20 +16,20 @@
       "show_sector_lines": true,
       "manual_points": [
         {
-          "x_px": 914,
-          "y_px": 521
+          "x_px": 938,
+          "y_px": 528
         },
         {
-          "x_px": 359,
-          "y_px": 481
+          "x_px": 387,
+          "y_px": 470
         },
         {
-          "x_px": 504,
-          "y_px": 208
+          "x_px": 536,
+          "y_px": 204
         },
         {
-          "x_px": 865,
-          "y_px": 223
+          "x_px": 899,
+          "y_px": 226
         }
       ],
       "empty_board_reference_path": "data\\references\\camera_1_empty_board.png"
@@ -49,20 +49,20 @@
       "show_sector_lines": true,
       "manual_points": [
         {
-          "x_px": 799,
-          "y_px": 532
+          "x_px": 859,
+          "y_px": 219
         },
         {
-          "x_px": 266,
-          "y_px": 465
+          "x_px": 921,
+          "y_px": 506
         },
         {
-          "x_px": 447,
-          "y_px": 213
+          "x_px": 374,
+          "y_px": 464
         },
         {
-          "x_px": 801,
-          "y_px": 236
+          "x_px": 498,
+          "y_px": 203
         }
       ],
       "empty_board_reference_path": "data\\references\\camera_2_empty_board.png"
@@ -82,20 +82,20 @@
       "show_sector_lines": true,
       "manual_points": [
         {
-          "x_px": 409,
-          "y_px": 344
+          "x_px": 395,
+          "y_px": 303
         },
         {
-          "x_px": 734,
-          "y_px": 243
+          "x_px": 720,
+          "y_px": 207
         },
         {
-          "x_px": 1020,
-          "y_px": 425
+          "x_px": 983,
+          "y_px": 380
         },
         {
-          "x_px": 640,
-          "y_px": 642
+          "x_px": 589,
+          "y_px": 574
         }
       ],
       "empty_board_reference_path": "data\\references\\camera_3_empty_board.png"

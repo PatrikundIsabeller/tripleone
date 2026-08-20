@@ -159,10 +159,40 @@ class CameraWorker(QThread):
         self._cap: Optional[cv2.VideoCapture] = None
         self._active_backend: Optional[int] = None
 
-    def stop(self) -> None:
-        """Beendet den Kamera-Thread sauber."""
+    def stop(self, timeout_ms: int = 5000) -> bool:
+        """
+        Stoppt den Kamera-Thread kontrolliert.
+
+        True:
+            Thread wurde vollständig beendet.
+
+        False:
+            Thread läuft nach dem Timeout noch.
+            In diesem Fall darf NICHT sofort ein neuer CameraWorker
+            für dasselbe Gerät gestartet werden.
+        """
         self._running = False
-        self.wait(2000)
+
+        if not self.isRunning():
+            return True
+
+        stopped = self.wait(
+            max(100, int(timeout_ms))
+        )
+
+        if not stopped:
+            print(
+                f"[CameraWorker] WARNUNG: "
+                f"Gerät {self.device_id} konnte innerhalb von "
+                f"{timeout_ms} ms nicht beendet werden."
+            )
+            return False
+
+        print(
+            f"[CameraWorker] Gerät {self.device_id} sauber beendet."
+        )
+
+        return True
 
     def _apply_transformations(self, frame: np.ndarray) -> np.ndarray:
         """Wendet Rotation und Spiegelung auf das Kamerabild an."""
