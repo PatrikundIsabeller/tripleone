@@ -119,6 +119,19 @@ class VisionServiceConfig:
     # Falls kein Timestamp übergeben wird, time.monotonic() verwenden
     use_monotonic_time_when_missing: bool = True
 
+    # Radius des lokalen Ausschnitts um den bestätigten Treffer.
+    clear_hit_patch_radius_px: int = 42
+
+    # Pixel gilt als verändert, wenn Grauwertdifferenz darüber liegt.
+    clear_hit_patch_diff_threshold: int = 18
+
+    # Mindestanteil veränderter Pixel:
+    # erst dann gilt der Dart als tatsächlich entfernt.
+    clear_hit_patch_changed_ratio_threshold: float = 0.06
+
+    # Mehrere aufeinanderfolgende Frames müssen die Entfernung bestätigen.
+    clear_hit_patch_required_consecutive_frames: int = 3
+
 
 # -----------------------------------------------------------------------------
 # Events / Rückgabeobjekte
@@ -200,6 +213,11 @@ class CameraVisionState:
     last_detection_timestamp: Optional[float] = None
     last_status: str = STATUS_BOARD_NOT_REFERENCED
     clear_board_consecutive_ok: int = 0
+    # Referenz des Bildbereichs MIT steckendem Dart.
+    # Wird nach einem bestätigten Treffer gespeichert und ausschließlich
+    # verwendet, um das spätere Herausziehen des Darts zu erkennen.
+    confirmed_hit_patch: Optional[np.ndarray] = None
+    confirmed_hit_patch_rect: Optional[tuple[int, int, int, int]] = None
 
     # --------------------------------------------------------------
     # NEU: Pending-/Confirming-State
@@ -422,53 +440,58 @@ class VisionService:
         # 1) Falls auf Board-clear gewartet wird: nur Clear-Logik
         # -------------------------------------------------------------
         if state.awaiting_clear_board and self.config.require_board_clear_after_hit:
-            # -------------------------------------------------------------
-            # BOARD-CLEAR-LOGIK
+            # ---------------------------------------------------------
+            # Neuer Clear-Mechanismus:
             #
-            # Die alte Methode hat ausschließlich die Bilddifferenz zum
-            # Leerboard verwendet. Das ist bei drei Kameras mit verschiedenen
-            # Blickwinkeln, Belichtung und Auto-Exposure nicht robust genug.
+            # Nach bestätigtem Treffer läuft YOLO NICHT weiter.
+            # Der gelatchte Treffer bleibt unverändert sichtbar.
             #
-            # Neue Hauptentscheidung:
+            # Stattdessen vergleichen wir nur einen kleinen Bildbereich
+            # um den Einschlagpunkt mit dem Bildbereich, der direkt nach
+            # dem bestätigten Treffer gespeichert wurde.
             #
-            #     Dart-TIP vorhanden      -> Board NICHT frei
-            #     mehrere Frames kein TIP -> Dart wurde entfernt
+            # Dart steckt noch:
+            #   Patch sieht fast gleich aus.
             #
-            # Die Diff-Ratio bleibt nur noch als Diagnosewert erhalten.
-            # -------------------------------------------------------------
+            # Dart herausgezogen:
+            #   Patch verändert sich deutlich.
+            # ---------------------------------------------------------
 
-            # -------------------------------------------------------------
-            # 1. Diff-Ratio weiterhin berechnen – aber NICHT mehr als
-            #    alleinige Freigabeentscheidung verwenden.
-            # -------------------------------------------------------------
-            board_changed_ratio = self._compute_board_changed_ratio(
-                current_frame=frame,
-                reference_frame=state.reference_frame,
-                board_mask=(
-                    state.board_mask
-                    if self.config.use_board_mask_for_clear_check
-                    else None
-                ),
-            )
+            patch = state.confirmed_hit_patch
+            rect = state.confirmed_hit_patch_rect
 
-            # -------------------------------------------------------------
-            # 2. Detector auch während WAITING_FOR_CLEAR weiterlaufen lassen.
-            #
-            # Dadurch bekommt auch der TemporalTipTracker weiterhin Frames.
-            # Wenn der Dart entfernt wurde, läuft dessen Missing-Frame-
-            # Logik aus und der alte stabile TIP wird gelöscht.
-            # -------------------------------------------------------------
-            try:
-                clear_detection_result = detector.detect(
-                    frame=frame,
-                    reference_frame=state.reference_frame,
-                    board_mask=state.board_mask,
-                    board_polygon=None,
+            if patch is None or rect is None:
+                # Sicherheitsfallback:
+                # Ohne gespeicherten Hit-Patch niemals automatisch freigeben.
+                state.last_status = STATUS_WAITING_FOR_CLEAR
+
+                return VisionServiceResult(
+                    camera_id=camera_id,
+                    timestamp=ts,
+                    status=STATUS_WAITING_FOR_CLEAR,
+                    message="Treffer gelockt – warte auf Entfernung des Darts.",
+                    hit_event=state.last_hit_event,
+                    detection_result=state.last_detection_result,
+                    board_is_clear=False,
+                    board_changed_ratio=None,
+                    debug={
+                        "awaiting_clear_board": True,
+                        "clear_mode": "latched_hit_patch",
+                        "hit_patch_available": False,
+                    },
                 )
 
-            except Exception as exc:
-                # Bei einem Detector-Fehler niemals versehentlich das Board
-                # freigeben.
+            x0, y0, x1, y1 = rect
+
+            current_patch = frame[
+                y0:y1,
+                x0:x1,
+            ]
+
+            if (
+                current_patch.size == 0
+                or current_patch.shape[:2] != patch.shape[:2]
+            ):
                 state.clear_board_consecutive_ok = 0
                 state.last_status = STATUS_WAITING_FOR_CLEAR
 
@@ -476,71 +499,96 @@ class VisionService:
                     camera_id=camera_id,
                     timestamp=ts,
                     status=STATUS_WAITING_FOR_CLEAR,
-                    message=(
-                        "Warte auf freies Board – "
-                        f"Clear-Detector-Fehler: {exc}"
-                    ),
+                    message="Treffer gelockt – Clear-Patch ungültig.",
                     hit_event=state.last_hit_event,
                     detection_result=state.last_detection_result,
                     board_is_clear=False,
-                    board_changed_ratio=board_changed_ratio,
                     debug={
                         "awaiting_clear_board": True,
-                        "clear_detector_error": str(exc),
+                        "clear_mode": "latched_hit_patch",
+                        "invalid_patch": True,
                     },
                 )
 
-            # -------------------------------------------------------------
-            # 3. Prüfen, ob der Detector aktuell noch einen Dart sieht.
-            # -------------------------------------------------------------
-            clear_candidate_hit = self._build_candidate_hit_event(
-                camera_id=camera_id,
-                timestamp=ts,
-                detection_result=clear_detection_result,
+            # ---------------------------------------------------------
+            # Graubilder
+            # ---------------------------------------------------------
+            current_gray = cv2.cvtColor(
+                current_patch,
+                cv2.COLOR_BGR2GRAY,
             )
 
-            dart_tip_present = clear_candidate_hit is not None
+            hit_gray = cv2.cvtColor(
+                patch,
+                cv2.COLOR_BGR2GRAY,
+            )
 
-            # -------------------------------------------------------------
-            # 4. Clear-Zähler
-            #
-            # Dart noch sichtbar:
-            #     -> sofort wieder auf 0
-            #
-            # Kein Dart sichtbar:
-            #     -> einen Frame Richtung "frei"
-            # -------------------------------------------------------------
-            if dart_tip_present:
-                state.clear_board_consecutive_ok = 0
-            else:
+            # Kleine Kamerarauschschwankungen reduzieren.
+            current_gray = cv2.GaussianBlur(
+                current_gray,
+                (5, 5),
+                0,
+            )
+
+            hit_gray = cv2.GaussianBlur(
+                hit_gray,
+                (5, 5),
+                0,
+            )
+
+            diff = cv2.absdiff(
+                current_gray,
+                hit_gray,
+            )
+
+            changed = (
+                diff
+                >= int(self.config.clear_hit_patch_diff_threshold)
+            )
+
+            patch_changed_ratio = float(
+                np.count_nonzero(changed)
+            ) / float(changed.size)
+
+            dart_removed_candidate = (
+                patch_changed_ratio
+                >= float(
+                    self.config.clear_hit_patch_changed_ratio_threshold
+                )
+            )
+
+            # ---------------------------------------------------------
+            # Mehrere Frames müssen Entfernung bestätigen.
+            # ---------------------------------------------------------
+            if dart_removed_candidate:
                 state.clear_board_consecutive_ok += 1
+            else:
+                state.clear_board_consecutive_ok = 0
 
-            required_clear_frames = max(
+            required_frames = max(
                 1,
                 int(
-                    self.config.clear_no_tip_required_consecutive_frames
+                    self.config.clear_hit_patch_required_consecutive_frames
                 ),
             )
 
-            # -------------------------------------------------------------
-            # 5. Genug Frames hintereinander ohne stabilen Dart:
-            #    vorherigen Wurf vollständig abschließen.
-            # -------------------------------------------------------------
-            if state.clear_board_consecutive_ok >= required_clear_frames:
+            # ---------------------------------------------------------
+            # Dart wirklich entfernt
+            # ---------------------------------------------------------
+            if state.clear_board_consecutive_ok >= required_frames:
                 state.awaiting_clear_board = False
                 state.clear_board_consecutive_ok = 0
                 state.last_status = STATUS_READY
 
-                # Alten Pending-State löschen
                 self._reset_pending_hit(state)
+                self._reset_detector_tracking(camera_id)
 
-                # Alten bestätigten Treffer vollständig entfernen.
                 state.last_hit_event = None
                 state.last_detection_result = None
                 state.last_detection_timestamp = None
 
-                # Auch den KI-TIP / TemporalTracker vollständig zurücksetzen.
-                self._reset_detector_tracking(camera_id)
+                state.confirmed_hit_patch = None
+                state.confirmed_hit_patch_rect = None
 
                 return VisionServiceResult(
                     camera_id=camera_id,
@@ -550,39 +598,46 @@ class VisionService:
                     hit_event=None,
                     detection_result=None,
                     board_is_clear=True,
-                    board_changed_ratio=board_changed_ratio,
+
+                    # Wir verwenden dieses bestehende Feld für die Anzeige
+                    # der lokalen Patch-Differenz.
+                    board_changed_ratio=patch_changed_ratio,
+
                     debug={
                         "awaiting_clear_board": False,
-                        "clear_reason": "no_tip_consecutive_frames",
-                        "required_clear_frames": required_clear_frames,
+                        "clear_mode": "latched_hit_patch",
+                        "clear_reason": "hit_patch_changed",
+                        "patch_changed_ratio": patch_changed_ratio,
                     },
                 )
 
-            # -------------------------------------------------------------
-            # 6. Noch nicht lange genug ohne Dart:
-            #    weiter auf Entfernung warten.
+            # ---------------------------------------------------------
+            # Dart steckt weiterhin.
             #
             # WICHTIG:
-            # Für das Overlay verwenden wir jetzt das aktuelle Detector-
-            # Ergebnis und NICHT dauerhaft das alte DetectionResult.
-            # Dadurch kann der alte rote TIP bereits verschwinden.
-            # -------------------------------------------------------------
+            # immer den GELATCHTEN Treffer und das GELATCHTE
+            # DetectionResult zurückgeben.
+            #
+            # Dadurch verschwinden Treffer und roter TIP nicht mehr,
+            # nur weil YOLO den Dart temporär nicht erkennt.
+            # ---------------------------------------------------------
             state.last_status = STATUS_WAITING_FOR_CLEAR
 
             return VisionServiceResult(
                 camera_id=camera_id,
                 timestamp=ts,
                 status=STATUS_WAITING_FOR_CLEAR,
-                message="Warte darauf, dass der Dart entfernt wird.",
+                message="Treffer gelockt – warte auf Entfernung des Darts.",
                 hit_event=state.last_hit_event,
-                detection_result=clear_detection_result,
+                detection_result=state.last_detection_result,
                 board_is_clear=False,
-                board_changed_ratio=board_changed_ratio,
+                board_changed_ratio=patch_changed_ratio,
                 debug={
                     "awaiting_clear_board": True,
-                    "dart_tip_present": dart_tip_present,
-                    "clear_no_tip_count": state.clear_board_consecutive_ok,
-                    "required_clear_frames": required_clear_frames,
+                    "clear_mode": "latched_hit_patch",
+                    "patch_changed_ratio": patch_changed_ratio,
+                    "clear_confirmation_count": state.clear_board_consecutive_ok,
+                    "required_clear_frames": required_frames,
                 },
             )
 
@@ -729,6 +784,51 @@ class VisionService:
             state.last_hit_event = confirmed_hit
             state.last_detection_result = state.pending_detection_result
             state.last_detection_timestamp = ts
+
+            # ---------------------------------------------------------
+            # Lokalen Bildbereich MIT steckendem Dart speichern.
+            #
+            # Später vergleichen wir ausschließlich gegen diesen Patch,
+            # um das Herausziehen des Darts festzustellen.
+            # ---------------------------------------------------------
+            if confirmed_hit.image_point is not None:
+                hit_x = int(round(confirmed_hit.image_point[0]))
+                hit_y = int(round(confirmed_hit.image_point[1]))
+
+                radius = max(
+                    10,
+                    int(self.config.clear_hit_patch_radius_px),
+                )
+
+                frame_h, frame_w = frame.shape[:2]
+
+                x0 = max(0, hit_x - radius)
+                y0 = max(0, hit_y - radius)
+                x1 = min(frame_w, hit_x + radius + 1)
+                y1 = min(frame_h, hit_y + radius + 1)
+
+                hit_patch = frame[
+                    y0:y1,
+                    x0:x1,
+                ]
+
+                if hit_patch.size > 0:
+                    state.confirmed_hit_patch = hit_patch.copy()
+
+                    state.confirmed_hit_patch_rect = (
+                        int(x0),
+                        int(y0),
+                        int(x1),
+                        int(y1),
+                    )
+                else:
+                    state.confirmed_hit_patch = None
+                    state.confirmed_hit_patch_rect = None
+
+            else:
+                state.confirmed_hit_patch = None
+                state.confirmed_hit_patch_rect = None
+
             state.last_status = STATUS_HIT_DETECTED
             self._reset_pending_hit(state)
 

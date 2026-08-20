@@ -100,7 +100,7 @@ class DartKeypointDetectorConfig:
     temporal_max_distance_px: float = 12.0
 
     # Kurze YOLO-Aussetzer dürfen den stabilen Punkt nicht sofort löschen.
-    temporal_hold_missing_frames: int = 4
+    temporal_hold_missing_frames: int = 12
 
 
 
